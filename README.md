@@ -1,0 +1,68 @@
+# CS:GO Legacy BetterBots Server
+
+这是一个 Windows 下的 **CS:GO Legacy（不是 CS2）** 一键部署仓库。
+
+仓库通过 SteamCMD 安装 Dedicated Server App `740`，再从 GitHub Release 下载 BetterBots、SourceMod、MetaMod、BOT 聊天、RankMe、皮肤、贴纸、手套和探员插件覆盖包。
+
+## 一键安装
+
+以 PowerShell 打开仓库目录并运行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\install_server.ps1
+```
+
+默认安装到仓库内的 `server` 目录。首次安装需要下载约 35 GB 的 Valve 游戏文件和约 2 GB 的 MOD 资源，请预留至少 60 GB 空间。
+
+安装完成后运行：
+
+```text
+start_server.bat
+```
+
+客户端使用 CS:GO Legacy，并在控制台连接：
+
+```text
+connect 服务器IP:27016
+```
+
+同一台机器测试通常使用：
+
+```text
+connect 192.168.x.x:27016
+```
+
+## 更新
+
+```powershell
+.\update_server.ps1
+```
+
+更新脚本会验证 App 740，然后重新应用当前 Release 的 MOD 覆盖包。
+
+## 配置
+
+- 主配置：[config/server.cfg](config/server.cfg)
+- 启动参数：[start_server.bat](start_server.bat)
+- 默认游戏端口：`27016`
+- 独立 client port：`27006`
+- 默认地图：`de_mirage`
+- 默认模式：经典竞技
+- `sv_lan 1`
+- `-insecure`
+
+部署前务必修改 `config/server.cfg` 中的 `rcon_password`。
+
+## 数据范围
+
+Release 覆盖包包含当前 SQLite 玩家数据，可在其他机器继续使用已有 RankMe、皮肤、贴纸、手套和客户端偏好数据。
+
+不会上传：
+
+- Valve 的基础游戏文件（由 SteamCMD 安装）
+- 服务器日志和崩溃转储
+- 管理员名单
+- 私有数据库密码
+
+MOD 资源归各自作者所有，本仓库不改变第三方插件的原始授权。

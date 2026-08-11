@@ -1,0 +1,9 @@
+/server/
+/steamcmd/
+/.cache/
+/packages/
+*.log
+*.pid
+*.etl
+*.dmp
+*.mdmp

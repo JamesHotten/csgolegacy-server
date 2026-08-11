@@ -1,0 +1,9 @@
+{
+  "tag": "v1.0.0",
+  "asset": "csgolegacy-mod-overlay.zip",
+  "size_bytes": 833120689,
+  "sha256": "0F09BA44B7EE3F9EB07CB91BEE9D7B340B05B30F70AB026DBA5649350BD12D14",
+  "includes_sqlite_snapshot": true,
+  "steamcmd_app_id": 740,
+  "legacy_patch_version": "1.38.8.1"
+}
