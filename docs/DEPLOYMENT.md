@@ -139,6 +139,8 @@ server\csgo\addons\sourcemod\data\sqlite
 
 启动脚本已经执行 `chcp 65001`。终端字体仍需支持中文。
 
-### 计分板没有 LAN 真人行
+### LAN 真人身份或 MOD 数据异常
 
-发行包包含实验性的 `lan_player_scoreboard.smx`。若它导致异常，可把该文件从 `addons\sourcemod\plugins` 移到插件目录之外并重启。
+部署脚本会安装 `000_lan_player_identity.smx`，并统一 RankMe、段位、武器皮肤、贴纸、手套、探员、喷漆和音乐盒的 LAN 身份。修改或升级前必须停止服务器；脚本会把第三方原始 SMX 备份到 `addons\sourcemod\plugins\disabled\lan-identity-originals`。
+
+`James_Hotten` 的旧 `STEAM_ID_LAN` 数据会迁移到 `STEAM_1:0:959533336`。其他 LAN 玩家按“IP＋昵称”生成自己的身份。若需回退，应同时恢复该目录中的原始 SMX、移除 `000_lan_player_identity.smx` 并恢复迁移前的 SQLite 备份，不能只移除身份插件，否则被改过绑定的 MOD 会因缺少 Native 而无法加载。
