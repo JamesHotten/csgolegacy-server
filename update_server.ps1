@@ -32,6 +32,7 @@ if ($actualModSha256 -ne $expectedModSha256) {
     throw "MOD overlay checksum mismatch. Expected $expectedModSha256, got $actualModSha256"
 }
 Expand-Archive -LiteralPath $modZip -DestinationPath (Join-Path $serverDir "csgo") -Force
+& (Join-Path $PSScriptRoot "install_custom_plugins.ps1") -ServerDir $serverDir
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "config\server.cfg") -Destination (Join-Path $serverDir "csgo\cfg\server.cfg") -Force
 Set-Content -LiteralPath (Join-Path $serverDir "steam_appid.txt") -Value "740" -Encoding Ascii
 
