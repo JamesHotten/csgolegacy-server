@@ -23,3 +23,7 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $plugin)) {
 }
 
 Write-Host "Installed LAN scoreboard reconnect support."
+
+$agentsPlugin = Join-Path $ServerDir "csgo\addons\sourcemod\plugins\csgo_agentschooser.smx"
+$agentsBackup = Join-Path $ServerDir "csgo\addons\sourcemod\plugins\disabled\csgo_agentschooser.mysql-original.smx"
+& (Join-Path $PSScriptRoot "mods\patch_agents_database.ps1") -PluginPath $agentsPlugin -BackupPath $agentsBackup
