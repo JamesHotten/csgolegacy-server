@@ -26,4 +26,29 @@ Write-Host "Installed LAN scoreboard reconnect support."
 
 $agentsPlugin = Join-Path $ServerDir "csgo\addons\sourcemod\plugins\csgo_agentschooser.smx"
 $agentsBackup = Join-Path $ServerDir "csgo\addons\sourcemod\plugins\disabled\csgo_agentschooser.mysql-original.smx"
-& (Join-Path $PSScriptRoot "mods\patch_agents_database.ps1") -PluginPath $agentsPlugin -BackupPath $agentsBackup
+$databaseConfigPath = Join-Path $ServerDir "csgo\addons\sourcemod\configs\databases.cfg"
+$databaseConfig = Get-Content -LiteralPath $databaseConfigPath -Raw
+$agentsBlock = [regex]::Match($databaseConfig, '(?ms)"agents"\s*\{(?<body>.*?)\}')
+if (-not $agentsBlock.Success) {
+    throw "The agents database entry was not found in '$databaseConfigPath'."
+}
+
+$driverMatch = [regex]::Match($agentsBlock.Groups['body'].Value, '(?m)"driver"\s*"(?<driver>[^"]+)"')
+if (-not $driverMatch.Success) {
+    throw "The agents database driver was not found in '$databaseConfigPath'."
+}
+
+$agentsDriver = $driverMatch.Groups['driver'].Value.ToLowerInvariant()
+if ($agentsDriver -eq "default") {
+    $defaultDriver = [regex]::Match($databaseConfig, '(?m)"driver_default"\s*"(?<driver>[^"]+)"')
+    if (-not $defaultDriver.Success) {
+        throw "driver_default was not found in '$databaseConfigPath'."
+    }
+    $agentsDriver = $defaultDriver.Groups['driver'].Value.ToLowerInvariant()
+}
+
+if ($agentsDriver -notin @("sqlite", "mysql")) {
+    throw "Unsupported agents database driver: '$agentsDriver'"
+}
+
+& (Join-Path $PSScriptRoot "mods\patch_agents_database.ps1") -PluginPath $agentsPlugin -BackupPath $agentsBackup -DatabaseDriver $agentsDriver

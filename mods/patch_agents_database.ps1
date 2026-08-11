@@ -2,7 +2,10 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$PluginPath,
-    [string]$BackupPath
+    [string]$BackupPath,
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("sqlite", "mysql")]
+    [string]$DatabaseDriver
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,6 +79,26 @@ if ($compression -eq 0) {
     throw "Unsupported SMX compression type: $compression"
 }
 
+if ($BackupPath) {
+    $BackupPath = [System.IO.Path]::GetFullPath($BackupPath)
+}
+
+if ($DatabaseDriver -eq "mysql") {
+    $imageText = [System.Text.Encoding]::ASCII.GetString($image)
+    if ($imageText.Contains($oldCreate) -and $imageText.Contains($oldSave)) {
+        Write-Host "Agents Chooser retains its original MySQL SQL."
+        return
+    }
+
+    if ($BackupPath -and (Test-Path -LiteralPath $BackupPath)) {
+        Copy-Item -LiteralPath $BackupPath -Destination $PluginPath -Force
+        Write-Host "Restored the original MySQL Agents Chooser plugin."
+        return
+    }
+
+    throw "The plugin is SQLite-patched and no original MySQL backup is available."
+}
+
 $changed = (Replace-SmString -Image $image -OldValue $oldCreate -NewValue $newCreate)
 $changed = (Replace-SmString -Image $image -OldValue $oldSave -NewValue $newSave) -or $changed
 
@@ -85,7 +108,6 @@ if (-not $changed) {
 }
 
 if ($BackupPath) {
-    $BackupPath = [System.IO.Path]::GetFullPath($BackupPath)
     $backupDir = Split-Path -Parent $BackupPath
     New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
     if (-not (Test-Path -LiteralPath $BackupPath)) {
