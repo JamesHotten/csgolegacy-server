@@ -19,6 +19,7 @@
 
 bool g_bIdentityPatched[MAXPLAYERS + 1];
 char g_sIdentityKey[MAXPLAYERS + 1][128];
+int g_iAccountId[MAXPLAYERS + 1];
 StringMap g_mScoreCache;
 
 public Plugin myinfo =
@@ -32,6 +33,12 @@ public Plugin myinfo =
 public void OnPluginStart()
 {
 	g_mScoreCache = new StringMap();
+
+	for (int client = 1; client <= MaxClients; client++)
+	{
+		if (IsClientInGame(client) && !IsFakeClient(client))
+			PrepareClient(client);
+	}
 }
 
 public void OnMapStart()
@@ -42,10 +49,15 @@ public void OnMapStart()
 public void OnClientPostAdminCheck(int client)
 {
 	if (!IsFakeClient(client))
-	{
-		BuildIdentityKey(client, g_sIdentityKey[client], sizeof(g_sIdentityKey[]));
-		CreateTimer(1.0, Timer_PatchLanIdentity, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
-	}
+		PrepareClient(client);
+}
+
+void PrepareClient(int client)
+{
+	char baseIdentity[128];
+	BuildBaseIdentityKey(client, baseIdentity, sizeof(baseIdentity));
+	ResolveIdentityKey(client, baseIdentity, g_sIdentityKey[client], sizeof(g_sIdentityKey[]));
+	CreateTimer(1.0, Timer_PatchLanIdentity, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
 }
 
 public void OnClientDisconnect(int client)
@@ -63,6 +75,7 @@ public void OnClientDisconnect(int client)
 
 	g_bIdentityPatched[client] = false;
 	g_sIdentityKey[client][0] = '\0';
+	g_iAccountId[client] = 0;
 }
 
 public Action Timer_PatchLanIdentity(Handle timer, int userId)
@@ -87,10 +100,15 @@ public Action Timer_PatchLanIdentity(Handle timer, int userId)
 		return Plugin_Stop;
 
 	if (g_sIdentityKey[client][0] == '\0')
-		BuildIdentityKey(client, g_sIdentityKey[client], sizeof(g_sIdentityKey[]));
+	{
+		char baseIdentity[128];
+		BuildBaseIdentityKey(client, baseIdentity, sizeof(baseIdentity));
+		ResolveIdentityKey(client, baseIdentity, g_sIdentityKey[client], sizeof(g_sIdentityKey[]));
+	}
 
-	// Stable across reconnects for the same LAN IP and nickname.
-	int accountId = BuildAccountId(g_sIdentityKey[client]);
+	// Stable across reconnects while remaining unique among connected players.
+	int accountId = BuildUniqueAccountId(client, g_sIdentityKey[client]);
+	g_iAccountId[client] = accountId;
 	int steamIdHighNetworkOrder = 16781313;
 
 	userInfo[PLAYER_INFO_XUID] = steamIdHighNetworkOrder;
@@ -117,13 +135,89 @@ public Action Timer_PatchLanIdentity(Handle timer, int userId)
 	return Plugin_Stop;
 }
 
-void BuildIdentityKey(int client, char[] key, int maxLength)
+void BuildBaseIdentityKey(int client, char[] key, int maxLength)
 {
 	char ip[64];
 	char name[MAX_NAME_LENGTH];
 	GetClientIP(client, ip, sizeof(ip), true);
 	GetClientName(client, name, sizeof(name));
 	Format(key, maxLength, "%s|%s", ip, name);
+}
+
+void ResolveIdentityKey(int client, const char[] baseIdentity, char[] identity, int maxLength)
+{
+	char candidate[128];
+	char firstAvailable[128];
+	int cachedScore[SCORE_FIELD_COUNT];
+	firstAvailable[0] = '\0';
+
+	for (int suffix = 0; suffix <= MaxClients; suffix++)
+	{
+		if (suffix == 0)
+			strcopy(candidate, sizeof(candidate), baseIdentity);
+		else
+			Format(candidate, sizeof(candidate), "%s#%d", baseIdentity, suffix);
+
+		if (IsIdentityKeyActive(client, candidate))
+			continue;
+
+		if (firstAvailable[0] == '\0')
+			strcopy(firstAvailable, sizeof(firstAvailable), candidate);
+
+		if (g_mScoreCache.GetArray(candidate, cachedScore, sizeof(cachedScore)))
+		{
+			strcopy(identity, maxLength, candidate);
+			return;
+		}
+	}
+
+	strcopy(identity, maxLength, firstAvailable);
+}
+
+bool IsIdentityKeyActive(int client, const char[] identity)
+{
+	for (int other = 1; other <= MaxClients; other++)
+	{
+		if (other != client && g_sIdentityKey[other][0] != '\0' && StrEqual(g_sIdentityKey[other], identity))
+			return true;
+	}
+
+	return false;
+}
+
+int BuildUniqueAccountId(int client, const char[] identity)
+{
+	char saltedIdentity[160];
+	for (int salt = 0; salt <= MaxClients; salt++)
+	{
+		if (salt == 0)
+			strcopy(saltedIdentity, sizeof(saltedIdentity), identity);
+		else
+			Format(saltedIdentity, sizeof(saltedIdentity), "%s|account:%d", identity, salt);
+
+		int accountId = BuildAccountId(saltedIdentity);
+		if (!IsAccountIdActive(client, accountId))
+			return accountId;
+	}
+
+	for (int accountId = 1900000001; accountId <= 1900000000 + MaxClients; accountId++)
+	{
+		if (!IsAccountIdActive(client, accountId))
+			return accountId;
+	}
+
+	return 1900000000 + client;
+}
+
+bool IsAccountIdActive(int client, int accountId)
+{
+	for (int other = 1; other <= MaxClients; other++)
+	{
+		if (other != client && g_iAccountId[other] == accountId)
+			return true;
+	}
+
+	return false;
 }
 
 int BuildAccountId(const char[] key)
