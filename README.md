@@ -21,6 +21,17 @@ Set-ExecutionPolicy -Scope Process Bypass
 start_server.bat
 ```
 
+## 已经安装了全新的 App 740 服务器
+
+如果已经通过 SteamCMD 下载好了 CS:GO Legacy Dedicated Server，只需把 MOD、配置和 SQLite 数据应用到现有服务器：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\apply_mods.ps1 -ServerDir "D:\GameServers\CSGOLegacy"
+```
+
+`ServerDir` 必须是同时包含 `srcds.exe` 和 `csgo` 目录的服务器根目录。执行前先关闭该服务器；此流程不会重新下载 Valve 基础游戏文件。完成后直接运行目标目录中新生成的 `start_server.bat`。
+
 客户端使用 CS:GO Legacy，并在控制台连接：
 
 ```text
@@ -57,6 +68,8 @@ connect 192.168.x.x:27016
 ## 数据范围
 
 Release 覆盖包包含当前 SQLite 玩家数据，可在其他机器继续使用已有 RankMe、皮肤、贴纸、手套和客户端偏好数据。
+
+部署时只校验下载的固定发行压缩包。日志、缓存、崩溃转储以及服务器启动后持续变化的玩家数据等运行期文件，不做逐文件校验。
 
 不会上传：
 

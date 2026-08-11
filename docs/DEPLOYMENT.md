@@ -45,6 +45,26 @@ Set-ExecutionPolicy -Scope Process Bypass
 5. 应用仓库中的 `config/server.cfg`。
 6. 写入运行所需的 AppID 文件。
 
+### 对已经安装好的 App 740 服务器应用 MOD
+
+若全新服务器已经通过 SteamCMD 安装完成，例如：
+
+```text
+D:\GameServers\CSGOLegacy\srcds.exe
+D:\GameServers\CSGOLegacy\csgo\
+```
+
+先关闭该服务器，然后在本仓库目录运行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\apply_mods.ps1 -ServerDir "D:\GameServers\CSGOLegacy"
+```
+
+脚本会验证目标目录和发行包校验值，将完整 MOD、当前配置及 SQLite 快照写入 `csgo`，并生成 AppID `740` 所需文件和适用于该目标目录的 `start_server.bat`。它不会重新下载或校验 Valve 基础游戏文件。
+
+这里的校验仅针对下载的固定发行压缩包，不会对日志、缓存、崩溃转储或服务器启动后持续变化的 SQLite/玩家数据做逐文件校验。如果目标服务器已经运行过同类插件，请先备份原有 `addons\sourcemod\data\sqlite`，因为首次套用发行包会写入随包提供的 SQLite 快照。
+
 ## 5. 启动
 
 双击或在终端运行：
