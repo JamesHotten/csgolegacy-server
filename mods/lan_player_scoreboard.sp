@@ -18,6 +18,10 @@
 #define SCORE_ASSISTS 2
 #define SCORE_MVPS 3
 #define SCORE_CONTRIBUTION 4
+#define ECONOMY_FIELD_COUNT 3
+#define ECONOMY_MONEY 0
+#define ECONOMY_TEAM 1
+#define ECONOMY_SKIP_ROUND 2
 #define LEGACY_OWNER_ACCOUNT_ID 1919066672
 #define STEAMID64_HIGH 17825793
 
@@ -32,10 +36,19 @@ int g_iRestoreCycles[MAXPLAYERS + 1];
 int g_iLastScore[MAXPLAYERS + 1][SCORE_FIELD_COUNT];
 bool g_bLastScoreValid[MAXPLAYERS + 1];
 StringMap g_mScoreCache;
+int g_iLastMoney[MAXPLAYERS + 1];
+int g_iLastEconomyTeam[MAXPLAYERS + 1];
+int g_iCachedMoney[MAXPLAYERS + 1];
+int g_iCachedEconomyTeam[MAXPLAYERS + 1];
+bool g_bLastEconomyValid[MAXPLAYERS + 1];
+bool g_bEconomyRestorePending[MAXPLAYERS + 1];
+bool g_bEconomyRestoreScheduled[MAXPLAYERS + 1];
+StringMap g_mEconomyCache;
 StringMap g_mCookieNames;
 StringMap g_mCookieHandles;
 Database g_hLanPrefs;
 ConVar g_cvSvLan;
+bool g_bRoundActive;
 
 public Plugin myinfo =
 {
@@ -62,9 +75,13 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorLe
 public void OnPluginStart()
 {
 	g_mScoreCache = new StringMap();
+	g_mEconomyCache = new StringMap();
 	g_mCookieNames = new StringMap();
 	g_mCookieHandles = new StringMap();
 	g_cvSvLan = FindConVar("sv_lan");
+	HookEvent("round_start", Event_EconomyRoundStart, EventHookMode_PostNoCopy);
+	HookEvent("round_end", Event_EconomyRoundEnd, EventHookMode_Post);
+	HookEvent("announce_phase_end", Event_EconomyPhaseEnd, EventHookMode_PostNoCopy);
 
 	char error[256];
 	g_hLanPrefs = SQLite_UseDatabase("lan_identity", error, sizeof(error));
@@ -95,11 +112,14 @@ public void OnPluginStart()
 public void OnMapStart()
 {
 	g_mScoreCache.Clear();
+	g_mEconomyCache.Clear();
+	g_bRoundActive = false;
 	for (int client = 1; client <= MaxClients; client++)
 	{
 		if (IsClientConnected(client) && !IsFakeClient(client))
 		{
 			g_bIdentityPatched[client] = false;
+			ResetEconomyState(client);
 			PrepareClient(client);
 		}
 	}
@@ -133,9 +153,32 @@ void PrepareClient(int client)
 
 public void OnClientDisconnect(int client)
 {
+	bool aliveAtDisconnect = false;
+	if (g_bIdentityPatched[client] && IsClientInGame(client))
+	{
+		int team = GetClientTeam(client);
+		if (team == CS_TEAM_T || team == CS_TEAM_CT)
+		{
+			g_iLastMoney[client] = GetEntProp(client, Prop_Send, "m_iAccount");
+			g_iLastEconomyTeam[client] = team;
+			g_bLastEconomyValid[client] = true;
+			aliveAtDisconnect = g_bRoundActive && IsPlayerAlive(client);
+		}
+	}
+
 	if (g_bIdentityPatched[client] && g_sIdentityKey[client][0] != '\0' && g_bLastScoreValid[client])
 	{
 		g_mScoreCache.SetArray(g_sIdentityKey[client], g_iLastScore[client], sizeof(g_iLastScore[]));
+	}
+	if (g_bIdentityPatched[client] && g_sIdentityKey[client][0] != '\0' && g_bLastEconomyValid[client])
+	{
+		int economy[ECONOMY_FIELD_COUNT];
+		economy[ECONOMY_MONEY] = g_iLastMoney[client];
+		economy[ECONOMY_TEAM] = g_iLastEconomyTeam[client];
+		economy[ECONOMY_SKIP_ROUND] = aliveAtDisconnect ? 1 : 0;
+		g_mEconomyCache.SetArray(g_sIdentityKey[client], economy, sizeof(economy));
+		LogMessage("LAN_ECONOMY_CACHE|identity=%s|money=%d|team=%d|skip_round=%d",
+			g_sIdentityKey[client], economy[ECONOMY_MONEY], economy[ECONOMY_TEAM], economy[ECONOMY_SKIP_ROUND]);
 	}
 
 	ResetClientState(client);
@@ -152,6 +195,18 @@ void ResetClientState(int client)
 	g_iPatchCycles[client] = 0;
 	g_iRestoreCycles[client] = 0;
 	g_bLastScoreValid[client] = false;
+	ResetEconomyState(client);
+}
+
+void ResetEconomyState(int client)
+{
+	g_iLastMoney[client] = 0;
+	g_iLastEconomyTeam[client] = CS_TEAM_NONE;
+	g_iCachedMoney[client] = 0;
+	g_iCachedEconomyTeam[client] = CS_TEAM_NONE;
+	g_bLastEconomyValid[client] = false;
+	g_bEconomyRestorePending[client] = false;
+	g_bEconomyRestoreScheduled[client] = false;
 }
 
 public Action Timer_PatchLanIdentity(Handle timer, int userId)
@@ -192,7 +247,10 @@ public Action Timer_PatchLanIdentity(Handle timer, int userId)
 
 	g_iPatchCycles[client]++;
 	if (g_bIdentityPatched[client])
+	{
 		MaintainScoreState(client);
+		MaintainEconomyState(client);
+	}
 	// Re-broadcast rapidly while the client's loading screen builds its first
 	// scoreboard, then keep a low-frequency self-healing refresh.
 	if (g_bIdentityPatched[client] && g_iPatchCycles[client] > 10 && (g_iPatchCycles[client] % 20) != 0)
@@ -246,7 +304,16 @@ public Action Timer_PatchLanIdentity(Handle timer, int userId)
 		int cachedScore[SCORE_FIELD_COUNT];
 		if (g_mScoreCache.GetArray(g_sIdentityKey[client], cachedScore, sizeof(cachedScore)))
 			g_iRestoreCycles[client] = 10;
+
+		int cachedEconomy[ECONOMY_FIELD_COUNT];
+		if (g_mEconomyCache.GetArray(g_sIdentityKey[client], cachedEconomy, sizeof(cachedEconomy)))
+		{
+			g_iCachedMoney[client] = cachedEconomy[ECONOMY_MONEY];
+			g_iCachedEconomyTeam[client] = cachedEconomy[ECONOMY_TEAM];
+			g_bEconomyRestorePending[client] = true;
+		}
 		MaintainScoreState(client);
+		MaintainEconomyState(client);
 	}
 	return Plugin_Continue;
 }
@@ -837,6 +904,233 @@ void MaintainScoreState(int client)
 	g_iLastScore[client][SCORE_MVPS] = CS_GetMVPCount(client);
 	g_iLastScore[client][SCORE_CONTRIBUTION] = CS_GetClientContributionScore(client);
 	g_bLastScoreValid[client] = true;
+}
+
+void MaintainEconomyState(int client)
+{
+	if (!IsClientInGame(client))
+		return;
+
+	int team = GetClientTeam(client);
+	if (g_bEconomyRestorePending[client])
+	{
+		if (team != CS_TEAM_T && team != CS_TEAM_CT)
+			return;
+
+		// Official competitive economy does not carry money across a side change.
+		// Wait until team initialization has finished, then restore exactly once.
+		if (team != g_iCachedEconomyTeam[client])
+		{
+			g_bEconomyRestorePending[client] = false;
+			g_mEconomyCache.Remove(g_sIdentityKey[client]);
+		}
+		else if (!g_bEconomyRestoreScheduled[client])
+		{
+			g_bEconomyRestoreScheduled[client] = true;
+			CreateTimer(0.2, Timer_RestoreEconomy, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+			return;
+		}
+	}
+
+	if (team == CS_TEAM_T || team == CS_TEAM_CT)
+	{
+		g_iLastMoney[client] = GetEntProp(client, Prop_Send, "m_iAccount");
+		g_iLastEconomyTeam[client] = team;
+		g_bLastEconomyValid[client] = true;
+	}
+	else
+	{
+		g_bLastEconomyValid[client] = false;
+	}
+}
+
+public Action Timer_RestoreEconomy(Handle timer, int userId)
+{
+	int client = GetClientOfUserId(userId);
+	if (client == 0 || !IsClientInGame(client) || IsFakeClient(client))
+		return Plugin_Stop;
+
+	g_bEconomyRestoreScheduled[client] = false;
+	if (!g_bEconomyRestorePending[client])
+		return Plugin_Stop;
+
+	int team = GetClientTeam(client);
+	if (team != g_iCachedEconomyTeam[client] || (team != CS_TEAM_T && team != CS_TEAM_CT))
+		return Plugin_Stop;
+
+	int money = g_iCachedMoney[client];
+	ConVar maxMoney = FindConVar("mp_maxmoney");
+	if (money < 0)
+		money = 0;
+	if (maxMoney != null && money > maxMoney.IntValue)
+		money = maxMoney.IntValue;
+
+	SetEntProp(client, Prop_Send, "m_iAccount", money);
+	g_iLastMoney[client] = money;
+	g_iLastEconomyTeam[client] = team;
+	g_bLastEconomyValid[client] = true;
+	g_bEconomyRestorePending[client] = false;
+	g_mEconomyCache.Remove(g_sIdentityKey[client]);
+	LogMessage("LAN_ECONOMY_RESTORE|identity=%s|money=%d|team=%d",
+		g_sIdentityKey[client], money, team);
+	return Plugin_Stop;
+}
+
+public void Event_EconomyRoundStart(Event event, const char[] name, bool dontBroadcast)
+{
+	g_bRoundActive = !view_as<bool>(GameRules_GetProp("m_bWarmupPeriod"));
+}
+
+public void Event_EconomyRoundEnd(Event event, const char[] name, bool dontBroadcast)
+{
+	g_bRoundActive = false;
+	// The round_end event serializes legacy reasons as 1-based values, while
+	// SourceMod's CSRoundEndReason enum used by CS_OnTerminateRound is 0-based.
+	CSRoundEndReason reason = view_as<CSRoundEndReason>(event.GetInt("reason") - 1);
+	StringMapSnapshot snapshot = g_mEconomyCache.Snapshot();
+	if (snapshot.Length > 0)
+	{
+		LogMessage("LAN_ECONOMY_ROUND|raw_winner=%d|reason=%d|warmup=%d|cached=%d",
+			event.GetInt("winner"), reason, GameRules_GetProp("m_bWarmupPeriod"), snapshot.Length);
+	}
+	if (reason == CSRoundEnd_GameStart)
+	{
+		delete snapshot;
+		ClearEconomyPhaseState();
+		return;
+	}
+
+	int winner = event.GetInt("winner");
+	if (reason != CSRoundEnd_Draw && winner != CS_TEAM_T && winner != CS_TEAM_CT)
+		winner = GetWinnerFromReason(reason);
+	if (reason != CSRoundEnd_Draw && winner != CS_TEAM_T && winner != CS_TEAM_CT)
+	{
+		delete snapshot;
+		return;
+	}
+
+	char identity[128];
+	int economy[ECONOMY_FIELD_COUNT];
+	int maxMoney = GetCashConVar("mp_maxmoney");
+	for (int index = 0; index < snapshot.Length; index++)
+	{
+		snapshot.GetKey(index, identity, sizeof(identity));
+		if (!g_mEconomyCache.GetArray(identity, economy, sizeof(economy)))
+			continue;
+
+		if (economy[ECONOMY_SKIP_ROUND] != 0)
+		{
+			economy[ECONOMY_SKIP_ROUND] = 0;
+			g_mEconomyCache.SetArray(identity, economy, sizeof(economy));
+			LogMessage("LAN_ECONOMY_SKIP|identity=%s|reason=%d|team=%d",
+				identity, reason, economy[ECONOMY_TEAM]);
+			continue;
+		}
+		if (reason == CSRoundEnd_Draw)
+			continue;
+
+		int award = GetOfflineTeamAward(economy[ECONOMY_TEAM], winner, reason);
+		if (award <= 0)
+			continue;
+
+		economy[ECONOMY_MONEY] += award;
+		if (maxMoney > 0 && economy[ECONOMY_MONEY] > maxMoney)
+			economy[ECONOMY_MONEY] = maxMoney;
+		g_mEconomyCache.SetArray(identity, economy, sizeof(economy));
+		LogMessage("LAN_ECONOMY_AWARD|identity=%s|reason=%d|team=%d|award=%d|balance=%d",
+			identity, reason, economy[ECONOMY_TEAM], award, economy[ECONOMY_MONEY]);
+	}
+	delete snapshot;
+}
+
+int GetWinnerFromReason(CSRoundEndReason reason)
+{
+	switch (reason)
+	{
+		case CSRoundEnd_TargetBombed, CSRoundEnd_VIPKilled, CSRoundEnd_TerroristsEscaped,
+			CSRoundEnd_TerroristWin, CSRoundEnd_HostagesNotRescued, CSRoundEnd_CTSurrender,
+			CSRoundEnd_TerroristsPlanted:
+			return CS_TEAM_T;
+
+		case CSRoundEnd_VIPEscaped, CSRoundEnd_CTStoppedEscape, CSRoundEnd_TerroristsStopped,
+			CSRoundEnd_BombDefused, CSRoundEnd_CTWin, CSRoundEnd_HostagesRescued,
+			CSRoundEnd_TargetSaved, CSRoundEnd_TerroristsNotEscaped,
+			CSRoundEnd_TerroristsSurrender, CSRoundEnd_CTsReachedHostage:
+			return CS_TEAM_CT;
+	}
+	return CS_TEAM_NONE;
+}
+
+public void Event_EconomyPhaseEnd(Event event, const char[] name, bool dontBroadcast)
+{
+	// Halftime, overtime side switches and match end use the engine's reset
+	// economy rather than carrying an offline balance across phases.
+	ClearEconomyPhaseState();
+}
+
+void ClearEconomyPhaseState()
+{
+	g_mEconomyCache.Clear();
+	for (int client = 1; client <= MaxClients; client++)
+	{
+		g_iCachedMoney[client] = 0;
+		g_iCachedEconomyTeam[client] = CS_TEAM_NONE;
+		g_bEconomyRestorePending[client] = false;
+		g_bEconomyRestoreScheduled[client] = false;
+	}
+}
+
+int GetOfflineTeamAward(int team, int winner, CSRoundEndReason reason)
+{
+	if (team != CS_TEAM_T && team != CS_TEAM_CT)
+		return 0;
+
+	if (team != winner)
+	{
+		int consecutiveLosses = GameRules_GetProp(team == CS_TEAM_CT ?
+			"m_iNumConsecutiveCTLoses" : "m_iNumConsecutiveTerroristLoses");
+		int lossTier = consecutiveLosses - 1;
+		if (lossTier < 0)
+			lossTier = 0;
+		int maxTier = GetCashConVar("mp_consecutive_loss_max");
+		if (maxTier >= 0 && lossTier > maxTier)
+			lossTier = maxTier;
+
+		int award = GetCashConVar("cash_team_loser_bonus") +
+			(lossTier * GetCashConVar("cash_team_loser_bonus_consecutive_rounds"));
+		if (team == CS_TEAM_T && reason == CSRoundEnd_BombDefused)
+			award += GetCashConVar("cash_team_planted_bomb_but_defused");
+		return award;
+	}
+
+	switch (reason)
+	{
+		case CSRoundEnd_TargetBombed:
+			return GetCashConVar("cash_team_terrorist_win_bomb");
+		case CSRoundEnd_BombDefused:
+			return GetCashConVar("cash_team_win_by_defusing_bomb");
+		case CSRoundEnd_TargetSaved:
+			return GetCashConVar("cash_team_win_by_time_running_out_bomb");
+		case CSRoundEnd_HostagesRescued:
+			return GetCashConVar("cash_team_win_by_hostage_rescue");
+		case CSRoundEnd_HostagesNotRescued:
+			return GetCashConVar("cash_team_win_by_time_running_out_hostage");
+		case CSRoundEnd_CTWin, CSRoundEnd_TerroristWin,
+			CSRoundEnd_TerroristsSurrender, CSRoundEnd_CTSurrender:
+		{
+			if (view_as<bool>(GameRules_GetProp("m_bMapHasBombTarget")))
+				return GetCashConVar("cash_team_elimination_bomb_map");
+			return GetCashConVar(team == CS_TEAM_CT ?
+				"cash_team_elimination_hostage_map_ct" : "cash_team_elimination_hostage_map_t");
+		}
+	}
+	return 0;
+}
+
+int GetCashConVar(const char[] name)
+{
+	ConVar convar = FindConVar(name);
+	return convar == null ? 0 : convar.IntValue;
 }
 
 bool IsCurrentScoreEmpty(int client)
