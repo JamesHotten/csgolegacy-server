@@ -28,6 +28,9 @@ bool g_bIdentityFailed[MAXPLAYERS + 1];
 char g_sIdentityKey[MAXPLAYERS + 1][128];
 int g_iAccountId[MAXPLAYERS + 1];
 int g_iPatchCycles[MAXPLAYERS + 1];
+int g_iRestoreCycles[MAXPLAYERS + 1];
+int g_iLastScore[MAXPLAYERS + 1][SCORE_FIELD_COUNT];
+bool g_bLastScoreValid[MAXPLAYERS + 1];
 StringMap g_mScoreCache;
 StringMap g_mCookieNames;
 StringMap g_mCookieHandles;
@@ -130,15 +133,9 @@ void PrepareClient(int client)
 
 public void OnClientDisconnect(int client)
 {
-	if (g_bIdentityPatched[client] && g_sIdentityKey[client][0] != '\0' && IsClientInGame(client))
+	if (g_bIdentityPatched[client] && g_sIdentityKey[client][0] != '\0' && g_bLastScoreValid[client])
 	{
-		int score[SCORE_FIELD_COUNT];
-		score[SCORE_KILLS] = GetClientFrags(client);
-		score[SCORE_DEATHS] = GetClientDeaths(client);
-		score[SCORE_ASSISTS] = CS_GetClientAssists(client);
-		score[SCORE_MVPS] = CS_GetMVPCount(client);
-		score[SCORE_CONTRIBUTION] = CS_GetClientContributionScore(client);
-		g_mScoreCache.SetArray(g_sIdentityKey[client], score, sizeof(score));
+		g_mScoreCache.SetArray(g_sIdentityKey[client], g_iLastScore[client], sizeof(g_iLastScore[]));
 	}
 
 	ResetClientState(client);
@@ -153,6 +150,8 @@ void ResetClientState(int client)
 	g_sIdentityKey[client][0] = '\0';
 	g_iAccountId[client] = 0;
 	g_iPatchCycles[client] = 0;
+	g_iRestoreCycles[client] = 0;
+	g_bLastScoreValid[client] = false;
 }
 
 public Action Timer_PatchLanIdentity(Handle timer, int userId)
@@ -192,6 +191,8 @@ public Action Timer_PatchLanIdentity(Handle timer, int userId)
 		return Plugin_Continue;
 
 	g_iPatchCycles[client]++;
+	if (g_bIdentityPatched[client])
+		MaintainScoreState(client);
 	// Re-broadcast rapidly while the client's loading screen builds its first
 	// scoreboard, then keep a low-frequency self-healing refresh.
 	if (g_bIdentityPatched[client] && g_iPatchCycles[client] > 10 && (g_iPatchCycles[client] % 20) != 0)
@@ -241,7 +242,12 @@ public Action Timer_PatchLanIdentity(Handle timer, int userId)
 	bool firstSuccessfulPatch = !g_bIdentityPatched[client];
 	g_bIdentityPatched[client] = true;
 	if (firstSuccessfulPatch)
-		RestoreScore(client);
+	{
+		int cachedScore[SCORE_FIELD_COUNT];
+		if (g_mScoreCache.GetArray(g_sIdentityKey[client], cachedScore, sizeof(cachedScore)))
+			g_iRestoreCycles[client] = 10;
+		MaintainScoreState(client);
+	}
 	return Plugin_Continue;
 }
 
@@ -811,4 +817,33 @@ void RestoreScore(int client)
 	CS_SetClientAssists(client, score[SCORE_ASSISTS]);
 	CS_SetMVPCount(client, score[SCORE_MVPS]);
 	CS_SetClientContributionScore(client, score[SCORE_CONTRIBUTION]);
+}
+
+void MaintainScoreState(int client)
+{
+	if (!IsClientInGame(client))
+		return;
+
+	if (g_iRestoreCycles[client] > 0)
+	{
+		if (IsCurrentScoreEmpty(client))
+			RestoreScore(client);
+		g_iRestoreCycles[client]--;
+	}
+
+	g_iLastScore[client][SCORE_KILLS] = GetClientFrags(client);
+	g_iLastScore[client][SCORE_DEATHS] = GetClientDeaths(client);
+	g_iLastScore[client][SCORE_ASSISTS] = CS_GetClientAssists(client);
+	g_iLastScore[client][SCORE_MVPS] = CS_GetMVPCount(client);
+	g_iLastScore[client][SCORE_CONTRIBUTION] = CS_GetClientContributionScore(client);
+	g_bLastScoreValid[client] = true;
+}
+
+bool IsCurrentScoreEmpty(int client)
+{
+	return GetClientFrags(client) == 0 &&
+		GetClientDeaths(client) == 0 &&
+		CS_GetClientAssists(client) == 0 &&
+		CS_GetMVPCount(client) == 0 &&
+		CS_GetClientContributionScore(client) == 0;
 }
