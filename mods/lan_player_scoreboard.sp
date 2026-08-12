@@ -8,6 +8,7 @@
 
 #define PLAYER_INFO_LEN 344
 #define PLAYER_INFO_XUID 8
+#define PLAYER_INFO_USERID 144
 #define PLAYER_INFO_STEAMID 148
 #define PLAYER_INFO_ACCOUNTID 184
 
@@ -18,14 +19,20 @@
 #define SCORE_MVPS 3
 #define SCORE_CONTRIBUTION 4
 #define LEGACY_OWNER_ACCOUNT_ID 1919066672
+#define STEAMID64_HIGH 17825793
 
 bool g_bIdentityPatched[MAXPLAYERS + 1];
 bool g_bLanClient[MAXPLAYERS + 1];
+bool g_bPatchPending[MAXPLAYERS + 1];
+bool g_bIdentityFailed[MAXPLAYERS + 1];
 char g_sIdentityKey[MAXPLAYERS + 1][128];
 int g_iAccountId[MAXPLAYERS + 1];
+int g_iPatchCycles[MAXPLAYERS + 1];
 StringMap g_mScoreCache;
 StringMap g_mCookieNames;
+StringMap g_mCookieHandles;
 Database g_hLanPrefs;
+ConVar g_cvSvLan;
 
 public Plugin myinfo =
 {
@@ -53,6 +60,8 @@ public void OnPluginStart()
 {
 	g_mScoreCache = new StringMap();
 	g_mCookieNames = new StringMap();
+	g_mCookieHandles = new StringMap();
+	g_cvSvLan = FindConVar("sv_lan");
 
 	char error[256];
 	g_hLanPrefs = SQLite_UseDatabase("lan_identity", error, sizeof(error));
@@ -66,6 +75,13 @@ public void OnPluginStart()
 		SetFailState("LAN identity cookie table init failed: %s", error);
 	}
 
+	if (!SQL_FastQuery(g_hLanPrefs,
+		"CREATE TABLE IF NOT EXISTS lan_identity_accounts (identity_key TEXT NOT NULL PRIMARY KEY, account_id INTEGER NOT NULL UNIQUE, updated_at INTEGER NOT NULL DEFAULT 0);"))
+	{
+		SQL_GetError(g_hLanPrefs, error, sizeof(error));
+		SetFailState("LAN identity account table init failed: %s", error);
+	}
+
 	for (int client = 1; client <= MaxClients; client++)
 	{
 		if (IsClientInGame(client) && !IsFakeClient(client))
@@ -76,6 +92,14 @@ public void OnPluginStart()
 public void OnMapStart()
 {
 	g_mScoreCache.Clear();
+	for (int client = 1; client <= MaxClients; client++)
+	{
+		if (IsClientConnected(client) && !IsFakeClient(client))
+		{
+			g_bIdentityPatched[client] = false;
+			PrepareClient(client);
+		}
+	}
 }
 
 public void OnClientPostAdminCheck(int client)
@@ -84,30 +108,24 @@ public void OnClientPostAdminCheck(int client)
 		PrepareClient(client);
 }
 
+public void OnClientConnected(int client)
+{
+	ResetClientState(client);
+}
+
+public void OnClientPutInServer(int client)
+{
+	if (!IsFakeClient(client))
+		PrepareClient(client);
+}
+
 void PrepareClient(int client)
 {
-	if (g_sIdentityKey[client][0] != '\0' || !IsClientConnected(client) || IsFakeClient(client))
+	if (g_bIdentityPatched[client] || g_bPatchPending[client] || !IsClientConnected(client) || IsFakeClient(client))
 		return;
 
-	char authId[64];
-	if (!GetClientAuthId(client, AuthId_Steam2, authId, sizeof(authId)))
-		return;
-
-	if (!StrEqual(authId, "STEAM_ID_LAN", false))
-		return;
-
-	g_bLanClient[client] = true;
-	char baseIdentity[128];
-	BuildBaseIdentityKey(client, baseIdentity, sizeof(baseIdentity));
-	ResolveIdentityKey(client, baseIdentity, g_sIdentityKey[client], sizeof(g_sIdentityKey[]));
-	if (IsLegacyOwner(client) && !IsAccountIdActive(client, LEGACY_OWNER_ACCOUNT_ID))
-		g_iAccountId[client] = LEGACY_OWNER_ACCOUNT_ID;
-	else
-		g_iAccountId[client] = BuildUniqueAccountId(client, g_sIdentityKey[client]);
-
-	if (!MigrateLegacyOwnerData(client))
-		SetFailState("LAN identity migration failed; stop the server, check SourceMod errors, and restart to retry safely.");
-	CreateTimer(1.0, Timer_PatchLanIdentity, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+	g_bPatchPending[client] = true;
+	CreateTimer(0.5, Timer_PatchLanIdentity, GetClientUserId(client), TIMER_REPEAT);
 }
 
 public void OnClientDisconnect(int client)
@@ -123,32 +141,65 @@ public void OnClientDisconnect(int client)
 		g_mScoreCache.SetArray(g_sIdentityKey[client], score, sizeof(score));
 	}
 
+	ResetClientState(client);
+}
+
+void ResetClientState(int client)
+{
 	g_bIdentityPatched[client] = false;
 	g_bLanClient[client] = false;
+	g_bPatchPending[client] = false;
+	g_bIdentityFailed[client] = false;
 	g_sIdentityKey[client][0] = '\0';
 	g_iAccountId[client] = 0;
+	g_iPatchCycles[client] = 0;
 }
 
 public Action Timer_PatchLanIdentity(Handle timer, int userId)
 {
 	int client = GetClientOfUserId(userId);
-	if (client == 0 || !IsClientInGame(client) || IsFakeClient(client) || g_bIdentityPatched[client])
+	if (client == 0)
 		return Plugin_Stop;
 
-	char authId[32];
-	if (GetClientAuthId(client, AuthId_Steam2, authId, sizeof(authId)) &&
-		!StrEqual(authId, "STEAM_ID_LAN", false))
+	if (!IsClientConnected(client) || IsFakeClient(client))
 	{
+		g_bPatchPending[client] = false;
 		return Plugin_Stop;
 	}
 
-	int table = FindStringTable("userinfo");
-	if (table == INVALID_STRING_TABLE)
+	if (!IsClientInGame(client))
+		return Plugin_Continue;
+
+	char authId[32];
+	bool hasAuth = GetClientAuthId(client, AuthId_Steam2, authId, sizeof(authId));
+	if (hasAuth && !StrEqual(authId, "STEAM_ID_LAN", false))
+	{
+		g_bPatchPending[client] = false;
+		return Plugin_Stop;
+	}
+	if (!hasAuth && (g_cvSvLan == null || !g_cvSvLan.BoolValue))
+		return Plugin_Continue;
+
+	if (!InitializeLanIdentity(client))
 		return Plugin_Stop;
 
+	int table = FindStringTable("userinfo");
+	if (table == INVALID_STRING_TABLE)
+		return Plugin_Continue;
+
+	int userInfoIndex = FindClientUserInfoIndex(table, client);
+	if (userInfoIndex == INVALID_STRING_INDEX)
+		return Plugin_Continue;
+
+	g_iPatchCycles[client]++;
+	// Re-broadcast rapidly while the client's loading screen builds its first
+	// scoreboard, then keep a low-frequency self-healing refresh.
+	if (g_bIdentityPatched[client] && g_iPatchCycles[client] > 10 && (g_iPatchCycles[client] % 20) != 0)
+		return Plugin_Continue;
+
 	char userInfo[PLAYER_INFO_LEN];
-	if (!GetStringTableData(table, client - 1, userInfo, sizeof(userInfo)))
-		return Plugin_Stop;
+	if (!GetStringTableData(table, userInfoIndex, userInfo, sizeof(userInfo)))
+		return Plugin_Continue;
 
 	if (g_sIdentityKey[client][0] == '\0')
 	{
@@ -162,30 +213,85 @@ public Action Timer_PatchLanIdentity(Handle timer, int userId)
 	if (accountId == 0)
 		accountId = BuildUniqueAccountId(client, g_sIdentityKey[client]);
 	g_iAccountId[client] = accountId;
-	int steamIdHighNetworkOrder = 16781313;
-
-	userInfo[PLAYER_INFO_XUID] = steamIdHighNetworkOrder;
-	userInfo[PLAYER_INFO_XUID + 1] = steamIdHighNetworkOrder >> 8;
-	userInfo[PLAYER_INFO_XUID + 2] = steamIdHighNetworkOrder >> 16;
-	userInfo[PLAYER_INFO_XUID + 3] = steamIdHighNetworkOrder >> 24;
-	userInfo[PLAYER_INFO_XUID + 7] = accountId;
-	userInfo[PLAYER_INFO_XUID + 6] = accountId >> 8;
-	userInfo[PLAYER_INFO_XUID + 5] = accountId >> 16;
-	userInfo[PLAYER_INFO_XUID + 4] = accountId >> 24;
+	// The userinfo string table serializes XUID in network byte order,
+	// while the standalone AccountID field below is little-endian.
+	// SteamID64 = 0x0110000100000000 + AccountID.
+	WriteInt32BE(userInfo, PLAYER_INFO_XUID, STEAMID64_HIGH);
+	WriteInt32BE(userInfo, PLAYER_INFO_XUID + 4, accountId);
 
 	Format(userInfo[PLAYER_INFO_STEAMID], 33, "STEAM_1:%d:%d", accountId & 1, accountId / 2);
-	userInfo[PLAYER_INFO_ACCOUNTID] = accountId;
-	userInfo[PLAYER_INFO_ACCOUNTID + 1] = accountId >> 8;
-	userInfo[PLAYER_INFO_ACCOUNTID + 2] = accountId >> 16;
-	userInfo[PLAYER_INFO_ACCOUNTID + 3] = accountId >> 24;
+	WriteInt32LE(userInfo, PLAYER_INFO_ACCOUNTID, accountId);
 
+	// The client can miss an update sent while its loading screen is still
+	// constructing the scoreboard. Re-broadcast the complete player_info entry
+	// throughout the connection; SetStringTableData is cheap at this cadence and
+	// also self-heals if the engine or another plugin later overwrites it.
 	bool wasLocked = LockStringTables(false);
-	SetStringTableData(table, client - 1, userInfo, sizeof(userInfo));
+	SetStringTableData(table, userInfoIndex, userInfo, sizeof(userInfo));
 	LockStringTables(wasLocked);
+	char verifiedInfo[PLAYER_INFO_LEN];
+	if (!GetStringTableData(table, userInfoIndex, verifiedInfo, sizeof(verifiedInfo)) ||
+		ReadInt32BE(verifiedInfo, PLAYER_INFO_XUID) != STEAMID64_HIGH ||
+		ReadInt32BE(verifiedInfo, PLAYER_INFO_XUID + 4) != accountId ||
+		ReadInt32LE(verifiedInfo, PLAYER_INFO_ACCOUNTID) != accountId)
+	{
+		return Plugin_Continue;
+	}
 
+	bool firstSuccessfulPatch = !g_bIdentityPatched[client];
 	g_bIdentityPatched[client] = true;
-	RestoreScore(client);
-	return Plugin_Stop;
+	if (firstSuccessfulPatch)
+		RestoreScore(client);
+	return Plugin_Continue;
+}
+
+int FindClientUserInfoIndex(int table, int client)
+{
+	int userId = GetClientUserId(client);
+	int count = GetStringTableNumStrings(table);
+	char userInfo[PLAYER_INFO_LEN];
+	for (int index = 0; index < count; index++)
+	{
+		if (GetStringTableData(table, index, userInfo, sizeof(userInfo)) &&
+			ReadInt32BE(userInfo, PLAYER_INFO_USERID) == userId)
+		{
+			return index;
+		}
+	}
+
+	return INVALID_STRING_INDEX;
+}
+
+void WriteInt32LE(char[] data, int offset, int value)
+{
+	data[offset] = value;
+	data[offset + 1] = value >> 8;
+	data[offset + 2] = value >> 16;
+	data[offset + 3] = value >> 24;
+}
+
+void WriteInt32BE(char[] data, int offset, int value)
+{
+	data[offset] = value >> 24;
+	data[offset + 1] = value >> 16;
+	data[offset + 2] = value >> 8;
+	data[offset + 3] = value;
+}
+
+int ReadInt32LE(const char[] data, int offset)
+{
+	return (data[offset] & 0xFF) |
+		((data[offset + 1] & 0xFF) << 8) |
+		((data[offset + 2] & 0xFF) << 16) |
+		((data[offset + 3] & 0xFF) << 24);
+}
+
+int ReadInt32BE(const char[] data, int offset)
+{
+	return ((data[offset] & 0xFF) << 24) |
+		((data[offset + 1] & 0xFF) << 16) |
+		((data[offset + 2] & 0xFF) << 8) |
+		(data[offset + 3] & 0xFF);
 }
 
 void BuildBaseIdentityKey(int client, char[] key, int maxLength)
@@ -240,6 +346,10 @@ bool IsIdentityKeyActive(int client, const char[] identity)
 
 int BuildUniqueAccountId(int client, const char[] identity)
 {
+	int mappedAccountId = GetMappedAccountId(identity);
+	if (mappedAccountId > 0 && mappedAccountId != LEGACY_OWNER_ACCOUNT_ID && !IsAccountIdActive(client, mappedAccountId))
+		return mappedAccountId;
+
 	char saltedIdentity[160];
 	for (int salt = 0; salt <= MaxClients; salt++)
 	{
@@ -251,17 +361,62 @@ int BuildUniqueAccountId(int client, const char[] identity)
 		int accountId = BuildAccountId(saltedIdentity);
 		if (accountId == LEGACY_OWNER_ACCOUNT_ID)
 			continue;
-		if (!IsAccountIdActive(client, accountId))
+		if (!IsAccountIdActive(client, accountId) && !IsAccountIdPersistentlyUsed(accountId) && StoreIdentityAccount(identity, accountId))
 			return accountId;
 	}
 
 	for (int accountId = 1900000001; accountId <= 1900000000 + MaxClients; accountId++)
 	{
-		if (!IsAccountIdActive(client, accountId))
+		if (accountId != LEGACY_OWNER_ACCOUNT_ID && !IsAccountIdActive(client, accountId) &&
+			!IsAccountIdPersistentlyUsed(accountId) && StoreIdentityAccount(identity, accountId))
 			return accountId;
 	}
 
-	return 1900000000 + client;
+	LogError("Could not allocate a durable LAN account for identity '%s'.", identity);
+	return 0;
+}
+
+int GetMappedAccountId(const char[] identity)
+{
+	char escapedIdentity[257];
+	char query[384];
+	SQL_EscapeString(g_hLanPrefs, identity, escapedIdentity, sizeof(escapedIdentity));
+	Format(query, sizeof(query), "SELECT account_id FROM lan_identity_accounts WHERE identity_key='%s' LIMIT 1;", escapedIdentity);
+
+	DBResultSet results = SQL_Query(g_hLanPrefs, query);
+	if (results == null)
+		return 0;
+
+	int accountId = 0;
+	if (results.FetchRow())
+		accountId = results.FetchInt(0);
+	delete results;
+	return accountId;
+}
+
+bool IsAccountIdPersistentlyUsed(int accountId)
+{
+	char query[160];
+	Format(query, sizeof(query), "SELECT 1 FROM lan_identity_accounts WHERE account_id=%d LIMIT 1;", accountId);
+	DBResultSet results = SQL_Query(g_hLanPrefs, query);
+	if (results == null)
+		return true;
+
+	bool used = results.FetchRow();
+	delete results;
+	return used;
+}
+
+bool StoreIdentityAccount(const char[] identity, int accountId)
+{
+	char escapedIdentity[257];
+	char query[512];
+	SQL_EscapeString(g_hLanPrefs, identity, escapedIdentity, sizeof(escapedIdentity));
+	Format(query, sizeof(query), "INSERT OR IGNORE INTO lan_identity_accounts (identity_key, account_id, updated_at) VALUES ('%s',%d,%d);", escapedIdentity, accountId, GetTime());
+	if (!SQL_FastQuery(g_hLanPrefs, query))
+		return false;
+
+	return GetMappedAccountId(identity) == accountId;
 }
 
 bool IsAccountIdActive(int client, int accountId)
@@ -289,12 +444,59 @@ bool EnsureLanIdentity(int client)
 {
 	if (client < 1 || client > MaxClients || !IsClientConnected(client) || IsFakeClient(client))
 		return false;
+	if (g_bIdentityFailed[client])
+		return false;
 
 	if (g_bLanClient[client])
 		return true;
 
+	char authId[32];
+	bool hasAuth = GetClientAuthId(client, AuthId_Steam2, authId, sizeof(authId));
+	bool isLanServer = g_cvSvLan != null && g_cvSvLan.BoolValue;
+	if ((hasAuth && StrEqual(authId, "STEAM_ID_LAN", false)) || (!hasAuth && isLanServer))
+	{
+		if (!InitializeLanIdentity(client))
+			return false;
+
+		// Persistent-data plugins call this native from their own connection
+		// callbacks. Establish the database identity synchronously so their
+		// first query never falls back to the shared STEAM_ID_LAN row; the
+		// userinfo scoreboard patch can still retry asynchronously.
+		PrepareClient(client);
+		return true;
+	}
+
 	PrepareClient(client);
-	return g_bLanClient[client];
+	return false;
+}
+
+bool InitializeLanIdentity(int client)
+{
+	if (g_bLanClient[client])
+		return true;
+
+	g_bLanClient[client] = true;
+	char baseIdentity[128];
+	BuildBaseIdentityKey(client, baseIdentity, sizeof(baseIdentity));
+	ResolveIdentityKey(client, baseIdentity, g_sIdentityKey[client], sizeof(g_sIdentityKey[]));
+	if (IsLegacyOwner(client) && !IsAccountIdActive(client, LEGACY_OWNER_ACCOUNT_ID))
+		g_iAccountId[client] = LEGACY_OWNER_ACCOUNT_ID;
+	else
+		g_iAccountId[client] = BuildUniqueAccountId(client, g_sIdentityKey[client]);
+	if (g_iAccountId[client] <= 0)
+	{
+		LogError("LAN identity account allocation failed for client %d; refusing shared AccountID 0.", client);
+		KickClient(client, "LAN identity allocation failed. Please reconnect after the server database is repaired.");
+		ResetClientState(client);
+		g_bIdentityFailed[client] = true;
+		return false;
+	}
+
+	if (MigrateLegacyOwnerData(client))
+		return true;
+
+	SetFailState("LAN identity migration failed; stop the server, check SourceMod errors, and restart to retry safely.");
+	return false;
 }
 
 void GetSyntheticSteamId(int client, char[] authId, int maxLength)
@@ -311,6 +513,9 @@ public any Native_LANClientAuthId(Handle plugin, int numParams)
 
 	if (!EnsureLanIdentity(client))
 	{
+		if (client >= 1 && client <= MaxClients && g_bIdentityFailed[client])
+			return ThrowNativeError(SP_ERROR_NATIVE, "LAN identity initialization failed for client %d; shared STEAM_ID_LAN is blocked.", client);
+
 		char realAuth[64];
 		bool found = GetClientAuthId(client, authType, realAuth, sizeof(realAuth), validate);
 		if (found)
@@ -330,31 +535,35 @@ public any Native_LANSteamAccountID(Handle plugin, int numParams)
 	bool validate = numParams >= 2 ? view_as<bool>(GetNativeCell(2)) : true;
 	if (EnsureLanIdentity(client))
 		return g_iAccountId[client];
+	if (client >= 1 && client <= MaxClients && g_bIdentityFailed[client])
+		return ThrowNativeError(SP_ERROR_NATIVE, "LAN identity initialization failed for client %d; AccountID 0 is blocked.", client);
 	return GetSteamAccountID(client, validate);
 }
 
 public any Native_LanCookieMake(Handle plugin, int numParams)
 {
-	return RegisterLanCookie(1, 2, view_as<CookieAccess>(GetNativeCell(3)));
+	return RegisterLanCookie(plugin, 1, 2, view_as<CookieAccess>(GetNativeCell(3)));
 }
 
 public any Native_LegacyCookieMake(Handle plugin, int numParams)
 {
-	return RegisterLanCookie(1, 2, view_as<CookieAccess>(GetNativeCell(3)));
+	return RegisterLanCookie(plugin, 1, 2, view_as<CookieAccess>(GetNativeCell(3)));
 }
 
-int RegisterLanCookie(int nameParam, int descriptionParam, CookieAccess access)
+int RegisterLanCookie(Handle owner, int nameParam, int descriptionParam, CookieAccess access)
 {
 	char name[COOKIE_MAX_NAME_LENGTH];
 	char description[256];
 	GetNativeString(nameParam, name, sizeof(name));
 	GetNativeString(descriptionParam, description, sizeof(description));
-	Cookie cookie = RegClientCookie(name, description, access);
+	Cookie internalCookie = RegClientCookie(name, description, access);
+	Cookie callerCookie = view_as<Cookie>(CloneHandle(internalCookie, owner));
 
 	char handleKey[16];
-	IntToString(view_as<int>(cookie), handleKey, sizeof(handleKey));
+	IntToString(view_as<int>(callerCookie), handleKey, sizeof(handleKey));
 	g_mCookieNames.SetString(handleKey, name);
-	return view_as<int>(cookie);
+	g_mCookieHandles.SetValue(handleKey, view_as<int>(internalCookie));
+	return view_as<int>(callerCookie);
 }
 
 public any Native_LanCookieGet(Handle plugin, int numParams)
@@ -388,12 +597,38 @@ bool GetLanCookieName(Cookie cookie, char[] name, int maxLength)
 	return g_mCookieNames.GetString(handleKey, name, maxLength);
 }
 
+bool GetInternalCookie(Cookie callerCookie, Cookie &internalCookie)
+{
+	char handleKey[16];
+	int handleValue;
+	IntToString(view_as<int>(callerCookie), handleKey, sizeof(handleKey));
+	if (!g_mCookieHandles.GetValue(handleKey, handleValue))
+		return false;
+
+	internalCookie = view_as<Cookie>(handleValue);
+	return true;
+}
+
 void ReadLanCookie(int client, Cookie cookie, int outputParam, int maxLength)
 {
+	Cookie internalCookie;
+	if (!GetInternalCookie(cookie, internalCookie))
+	{
+		char empty[1];
+		SetNativeString(outputParam, empty, maxLength, true);
+		return;
+	}
+
 	if (!EnsureLanIdentity(client))
 	{
 		char value[256];
-		GetClientCookie(client, cookie, value, sizeof(value));
+		value[0] = '\0';
+		if (client >= 1 && client <= MaxClients && g_bIdentityFailed[client])
+		{
+			SetNativeString(outputParam, value, maxLength, true);
+			return;
+		}
+		GetClientCookie(client, internalCookie, value, sizeof(value));
 		SetNativeString(outputParam, value, maxLength, true);
 		return;
 	}
@@ -428,7 +663,7 @@ void ReadLanCookie(int client, Cookie cookie, int outputParam, int maxLength)
 	// The old shared LAN cookie data belongs to the explicitly retained profile.
 	if (value[0] == '\0' && IsLegacyOwnerProfile(client))
 	{
-		GetClientCookie(client, cookie, value, sizeof(value));
+		GetClientCookie(client, internalCookie, value, sizeof(value));
 		if (value[0] != '\0')
 			SaveLanCookie(identity, cookieName, value);
 	}
@@ -441,9 +676,15 @@ void WriteLanCookie(int client, Cookie cookie, int valueParam)
 	char value[256];
 	GetNativeString(valueParam, value, sizeof(value));
 
+	Cookie internalCookie;
+	if (!GetInternalCookie(cookie, internalCookie))
+		return;
+
 	if (!EnsureLanIdentity(client))
 	{
-		SetClientCookie(client, cookie, value);
+		if (client >= 1 && client <= MaxClients && g_bIdentityFailed[client])
+			return;
+		SetClientCookie(client, internalCookie, value);
 		return;
 	}
 
@@ -489,16 +730,16 @@ bool MigrateLegacyOwnerData(int client)
 	char identity[32];
 	GetSyntheticSteamId(client, identity, sizeof(identity));
 	bool success = true;
-	success = MigrateDatabaseKey("rankme", "UPDATE rankme SET steam='%s' WHERE steam='STEAM_ID_LAN' AND name='James_Hotten';", identity) && success;
-	success = MigrateDatabaseKey("weapons", "UPDATE weapons SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity) && success;
-	success = MigrateDatabaseKey("weapons", "UPDATE weapons_timestamps SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity) && success;
-	success = MigrateDatabaseKey("gloves", "UPDATE gloves SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity) && success;
-	success = MigrateDatabaseKey("csgo_weaponstickers", "UPDATE csgo_weaponstickers SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity) && success;
-	success = MigrateDatabaseKey("agents", "UPDATE csgo_agentschooser SET steam_id='%s' WHERE steam_id='STEAM_ID_LAN';", identity) && success;
+	success = MigrateDatabaseKey("rankme", "rankme", "steam", " AND name='James_Hotten'", "target.name=rankme.name", identity) && success;
+	success = MigrateDatabaseKey("weapons", "weapons", "steamid", "", "1=1", identity) && success;
+	success = MigrateDatabaseKey("weapons", "weapons_timestamps", "steamid", "", "1=1", identity) && success;
+	success = MigrateDatabaseKey("gloves", "gloves", "steamid", "", "1=1", identity) && success;
+	success = MigrateDatabaseKey("csgo_weaponstickers", "csgo_weaponstickers", "steamid", "", "target.weaponindex=csgo_weaponstickers.weaponindex AND target.team=csgo_weaponstickers.team", identity) && success;
+	success = MigrateDatabaseKey("agents", "csgo_agentschooser", "steam_id", "", "1=1", identity) && success;
 	return success;
 }
 
-bool MigrateDatabaseKey(const char[] databaseName, const char[] queryTemplate, const char[] identity)
+bool MigrateDatabaseKey(const char[] databaseName, const char[] tableName, const char[] keyColumn, const char[] sourceFilter, const char[] conflictMatch, const char[] identity)
 {
 	char error[256];
 	Database database = SQL_Connect(databaseName, true, error, sizeof(error));
@@ -509,14 +750,49 @@ bool MigrateDatabaseKey(const char[] databaseName, const char[] queryTemplate, c
 	}
 
 	char escapedIdentity[65];
-	char query[512];
+	char query[1024];
 	SQL_EscapeString(database, identity, escapedIdentity, sizeof(escapedIdentity));
-	Format(query, sizeof(query), queryTemplate, escapedIdentity);
+
+	char driver[16];
+	char beginQuery[32];
+	SQL_GetDriverIdent(SQL_ReadDriver(database), driver, sizeof(driver));
+	if (StrEqual(driver, "sqlite", false))
+		strcopy(beginQuery, sizeof(beginQuery), "BEGIN IMMEDIATE;");
+	else
+		strcopy(beginQuery, sizeof(beginQuery), "START TRANSACTION;");
+	if (!SQL_FastQuery(database, beginQuery))
+	{
+		SQL_GetError(database, error, sizeof(error));
+		LogError("LAN identity migration could not start a transaction for %s: %s", databaseName, error);
+		delete database;
+		return false;
+	}
+
+	Format(query, sizeof(query), "DELETE FROM %s WHERE %s='STEAM_ID_LAN'%s AND EXISTS (SELECT 1 FROM %s AS target WHERE target.%s='%s' AND %s);", tableName, keyColumn, sourceFilter, tableName, keyColumn, escapedIdentity, conflictMatch);
 
 	if (!SQL_FastQuery(database, query))
 	{
 		SQL_GetError(database, error, sizeof(error));
 		LogError("LAN identity migration failed for %s: %s", databaseName, error);
+		SQL_FastQuery(database, "ROLLBACK;");
+		delete database;
+		return false;
+	}
+
+	Format(query, sizeof(query), "UPDATE %s SET %s='%s' WHERE %s='STEAM_ID_LAN'%s;", tableName, keyColumn, escapedIdentity, keyColumn, sourceFilter);
+	if (!SQL_FastQuery(database, query))
+	{
+		SQL_GetError(database, error, sizeof(error));
+		LogError("LAN identity migration failed for %s: %s", databaseName, error);
+		SQL_FastQuery(database, "ROLLBACK;");
+		delete database;
+		return false;
+	}
+	if (!SQL_FastQuery(database, "COMMIT;"))
+	{
+		SQL_GetError(database, error, sizeof(error));
+		LogError("LAN identity migration commit failed for %s: %s", databaseName, error);
+		SQL_FastQuery(database, "ROLLBACK;");
 		delete database;
 		return false;
 	}
