@@ -75,6 +75,8 @@ LAN 真人以“IP＋昵称”生成稳定的合成 Steam2 身份。RankMe、计
 
 旧共享数据明确保留给 `James_Hotten`，该昵称固定使用 `STEAM_1:0:959533336`，换 IP 或换机器也不改变；部署后旧数据迁移到此身份。部署脚本会备份被绑定替换的第三方 SMX；详细行为和回退方式见 [docs/MODS.md](docs/MODS.md) 与 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
+BOT 队伍的完整指令名称、Logo 代码和选手阵容见 [docs/TEAMS.md](docs/TEAMS.md)。
+
 不会上传：
 
 - Valve 的基础游戏文件（由 SteamCMD 安装）
