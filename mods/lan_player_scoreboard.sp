@@ -17,6 +17,7 @@
 #define SCORE_ASSISTS 2
 #define SCORE_MVPS 3
 #define SCORE_CONTRIBUTION 4
+#define LEGACY_OWNER_ACCOUNT_ID 1919066672
 
 bool g_bIdentityPatched[MAXPLAYERS + 1];
 bool g_bLanClient[MAXPLAYERS + 1];
@@ -99,8 +100,13 @@ void PrepareClient(int client)
 	char baseIdentity[128];
 	BuildBaseIdentityKey(client, baseIdentity, sizeof(baseIdentity));
 	ResolveIdentityKey(client, baseIdentity, g_sIdentityKey[client], sizeof(g_sIdentityKey[]));
-	g_iAccountId[client] = BuildUniqueAccountId(client, g_sIdentityKey[client]);
-	MigrateLegacyOwnerData(client);
+	if (IsLegacyOwner(client) && !IsAccountIdActive(client, LEGACY_OWNER_ACCOUNT_ID))
+		g_iAccountId[client] = LEGACY_OWNER_ACCOUNT_ID;
+	else
+		g_iAccountId[client] = BuildUniqueAccountId(client, g_sIdentityKey[client]);
+
+	if (!MigrateLegacyOwnerData(client))
+		SetFailState("LAN identity migration failed; stop the server, check SourceMod errors, and restart to retry safely.");
 	CreateTimer(1.0, Timer_PatchLanIdentity, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
 }
 
@@ -243,6 +249,8 @@ int BuildUniqueAccountId(int client, const char[] identity)
 			Format(saltedIdentity, sizeof(saltedIdentity), "%s|account:%d", identity, salt);
 
 		int accountId = BuildAccountId(saltedIdentity);
+		if (accountId == LEGACY_OWNER_ACCOUNT_ID)
+			continue;
 		if (!IsAccountIdActive(client, accountId))
 			return accountId;
 	}
@@ -418,7 +426,7 @@ void ReadLanCookie(int client, Cookie cookie, int outputParam, int maxLength)
 	}
 
 	// The old shared LAN cookie data belongs to the explicitly retained profile.
-	if (value[0] == '\0' && IsLegacyOwner(client))
+	if (value[0] == '\0' && IsLegacyOwnerProfile(client))
 	{
 		GetClientCookie(client, cookie, value, sizeof(value));
 		if (value[0] != '\0')
@@ -468,29 +476,36 @@ bool IsLegacyOwner(int client)
 	return StrEqual(name, "James_Hotten", true);
 }
 
-void MigrateLegacyOwnerData(int client)
+bool IsLegacyOwnerProfile(int client)
 {
-	if (!IsLegacyOwner(client))
-		return;
+	return IsLegacyOwner(client) && g_iAccountId[client] == LEGACY_OWNER_ACCOUNT_ID;
+}
+
+bool MigrateLegacyOwnerData(int client)
+{
+	if (!IsLegacyOwnerProfile(client))
+		return true;
 
 	char identity[32];
 	GetSyntheticSteamId(client, identity, sizeof(identity));
-	MigrateDatabaseKey("rankme", "UPDATE rankme SET steam='%s' WHERE steam='STEAM_ID_LAN' AND name='James_Hotten';", identity);
-	MigrateDatabaseKey("weapons", "UPDATE weapons SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity);
-	MigrateDatabaseKey("weapons", "UPDATE weapons_timestamps SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity);
-	MigrateDatabaseKey("gloves", "UPDATE gloves SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity);
-	MigrateDatabaseKey("csgo_weaponstickers", "UPDATE csgo_weaponstickers SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity);
-	MigrateDatabaseKey("agents", "UPDATE csgo_agentschooser SET steam_id='%s' WHERE steam_id='STEAM_ID_LAN';", identity);
+	bool success = true;
+	success = MigrateDatabaseKey("rankme", "UPDATE rankme SET steam='%s' WHERE steam='STEAM_ID_LAN' AND name='James_Hotten';", identity) && success;
+	success = MigrateDatabaseKey("weapons", "UPDATE weapons SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity) && success;
+	success = MigrateDatabaseKey("weapons", "UPDATE weapons_timestamps SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity) && success;
+	success = MigrateDatabaseKey("gloves", "UPDATE gloves SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity) && success;
+	success = MigrateDatabaseKey("csgo_weaponstickers", "UPDATE csgo_weaponstickers SET steamid='%s' WHERE steamid='STEAM_ID_LAN';", identity) && success;
+	success = MigrateDatabaseKey("agents", "UPDATE csgo_agentschooser SET steam_id='%s' WHERE steam_id='STEAM_ID_LAN';", identity) && success;
+	return success;
 }
 
-void MigrateDatabaseKey(const char[] databaseName, const char[] queryTemplate, const char[] identity)
+bool MigrateDatabaseKey(const char[] databaseName, const char[] queryTemplate, const char[] identity)
 {
 	char error[256];
 	Database database = SQL_Connect(databaseName, true, error, sizeof(error));
 	if (database == null)
 	{
 		LogError("LAN identity migration could not connect to %s: %s", databaseName, error);
-		return;
+		return false;
 	}
 
 	char escapedIdentity[65];
@@ -502,8 +517,11 @@ void MigrateDatabaseKey(const char[] databaseName, const char[] queryTemplate, c
 	{
 		SQL_GetError(database, error, sizeof(error));
 		LogError("LAN identity migration failed for %s: %s", databaseName, error);
+		delete database;
+		return false;
 	}
 	delete database;
+	return true;
 }
 
 void RestoreScore(int client)

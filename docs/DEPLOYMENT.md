@@ -143,4 +143,4 @@ server\csgo\addons\sourcemod\data\sqlite
 
 部署脚本会安装 `000_lan_player_identity.smx`，并统一 RankMe、段位、武器皮肤、贴纸、手套、探员、喷漆和音乐盒的 LAN 身份。修改或升级前必须停止服务器；脚本会把第三方原始 SMX 备份到 `addons\sourcemod\plugins\disabled\lan-identity-originals`。
 
-`James_Hotten` 的旧 `STEAM_ID_LAN` 数据会迁移到 `STEAM_1:0:959533336`。其他 LAN 玩家按“IP＋昵称”生成自己的身份。若需回退，应同时恢复该目录中的原始 SMX、移除 `000_lan_player_identity.smx` 并恢复迁移前的 SQLite 备份，不能只移除身份插件，否则被改过绑定的 MOD 会因缺少 Native 而无法加载。
+`James_Hotten` 固定使用 `STEAM_1:0:959533336`，旧 `STEAM_ID_LAN` 数据会迁移到该身份，换 IP 或换机器后仍可读取。其他 LAN 玩家按“IP＋昵称”生成自己的身份。迁移失败会写入 SourceMod 错误日志并停止身份插件；修复数据库问题后重启即可幂等重试。若需回退，应同时恢复该目录中的原始 SMX、移除 `000_lan_player_identity.smx` 并恢复迁移前的 SQLite 备份，不能只移除身份插件，否则被改过绑定的 MOD 会因缺少 Native 而无法加载。
