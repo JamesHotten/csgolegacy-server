@@ -35,9 +35,11 @@ Release 覆盖包来自当前已运行的服务器，而不是只保存下载链
 - LAN 真人在同一张地图中断线重连后，恢复击杀、死亡、助攻、MVP、贡献分和官方竞技规则下累计的离线现金
 - 离线账户按实际 `round_end` 结果、胜负原因、引擎维护的队伍连败档位和当前 `cash_team_*` 设置累计团队回合奖励；存活时断线的当前回合跳过，之后完整缺席的回合照常结算，击杀、下包、拆包等个人行为奖励不补发
 - 现金仅在玩家重新加入断线前的同一阵营后恢复一次，随后交回游戏原生经济系统继续结算；换边、加时阶段切换和换图不携带旧经济，且始终受 `mp_maxmoney` 限制
+- 经济奖励策略与身份/计分板状态机分离：`sm_lan_economy_ruleset 0` 保持原有/CS:GO Legacy 行为，`1` 使用当前 CS2 策略；CS2 策略额外按每名被消灭的 T 向每名 CT 发放 `sm_lan_economy_cs2_ct_kill_bonus`（默认 `$50`）
+- 在线和断线 CT 使用同一份 CS2 团队补助；模式切换会清空尚未恢复的局内经济缓存，避免同一账户混用两套规则，但不会触碰计分板战绩、合成身份、SQLite、皮肤、贴纸、手套、探员或 Cookie
 - 保留 SQLite 存储模式，并在 Release 中包含打包时的玩家数据库快照
 
-`lan_player_scoreboard.sp` 源码位于仓库的 `mods` 目录。部署脚本会将其编译为最先加载的 `000_lan_player_identity.smx`，并把第三方插件的认证 Native 绑定改到统一身份服务。原 SMX 会备份到 `plugins/disabled/lan-identity-originals`。
+`lan_player_scoreboard.sp` 源码位于仓库的 `mods` 目录；两套独立奖励策略分别位于 `lan_economy_csgo.inc` 和 `lan_economy_cs2.inc`。部署脚本会把三者一起编译为最先加载的 `000_lan_player_identity.smx`，从而继续共享同一套经过验证的身份、断线缓存和恢复时序，并把第三方插件的认证 Native 绑定改到统一身份服务。原 SMX 会备份到 `plugins/disabled/lan-identity-originals`。
 
 现有共享 `STEAM_ID_LAN` 数据明确归属 `James_Hotten`：该昵称固定使用 `STEAM_1:0:959533336`，换 IP 或换机器也不会改变。首次使用新版部署脚本后，该昵称连接时会自动迁移旧的 RankMe、皮肤、手套、贴纸和探员数据；Cookie 只为该昵称继承旧共享值。其他新玩家从空白独立配置开始。每张表的冲突旧行删除与其余旧行更新在同一事务中执行，会一起提交或一起回滚；所有迁移操作均可安全重试。任一数据库失败会让身份插件明确停止加载，修复数据库问题并重启后会重试，不会静默以部分迁移状态继续提供 MOD 身份。
 

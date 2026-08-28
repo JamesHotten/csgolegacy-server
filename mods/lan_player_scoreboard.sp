@@ -6,6 +6,9 @@
 #include <cstrike>
 #include <clientprefs>
 
+#include "lan_economy_csgo.inc"
+#include "lan_economy_cs2.inc"
+
 #define PLAYER_INFO_LEN 344
 #define PLAYER_INFO_XUID 8
 #define PLAYER_INFO_USERID 144
@@ -24,6 +27,12 @@
 #define ECONOMY_SKIP_ROUND 2
 #define LEGACY_OWNER_ACCOUNT_ID 1919066672
 #define STEAMID64_HIGH 17825793
+
+enum LanEconomyRuleset
+{
+	LanEconomy_CsgoLegacy = 0,
+	LanEconomy_Cs2Current
+};
 
 bool g_bIdentityPatched[MAXPLAYERS + 1];
 bool g_bLanClient[MAXPLAYERS + 1];
@@ -48,7 +57,13 @@ StringMap g_mCookieNames;
 StringMap g_mCookieHandles;
 Database g_hLanPrefs;
 ConVar g_cvSvLan;
+ConVar g_cvEconomyRuleset;
+ConVar g_cvCs2CtEliminationBonus;
+LanEconomyRuleset g_eEconomyRuleset;
 bool g_bRoundActive;
+bool g_bCs2TEliminated[MAXPLAYERS + 1];
+bool g_bCs2RoundSettled;
+int g_iCs2TEliminations;
 
 public Plugin myinfo =
 {
@@ -79,9 +94,19 @@ public void OnPluginStart()
 	g_mCookieNames = new StringMap();
 	g_mCookieHandles = new StringMap();
 	g_cvSvLan = FindConVar("sv_lan");
+	g_cvEconomyRuleset = CreateConVar("sm_lan_economy_ruleset", "0",
+		"LAN reconnect economy: 0=CS:GO Legacy, 1=current CS2", FCVAR_NOTIFY, true, 0.0, true, 1.0);
+	g_cvCs2CtEliminationBonus = CreateConVar("sm_lan_economy_cs2_ct_kill_bonus", "50",
+		"CS2 ruleset team award per eliminated Terrorist", FCVAR_NOTIFY, true, 0.0);
+	g_eEconomyRuleset = view_as<LanEconomyRuleset>(g_cvEconomyRuleset.IntValue);
+	g_cvEconomyRuleset.AddChangeHook(OnEconomyRulesetChanged);
+	LogMessage("LAN economy ruleset initialized: %s (CS2 CT elimination bonus: $%d).",
+		g_eEconomyRuleset == LanEconomy_Cs2Current ? "CS2" : "original/CS:GO Legacy",
+		g_cvCs2CtEliminationBonus.IntValue);
 	HookEvent("round_start", Event_EconomyRoundStart, EventHookMode_PostNoCopy);
 	HookEvent("round_end", Event_EconomyRoundEnd, EventHookMode_Post);
 	HookEvent("announce_phase_end", Event_EconomyPhaseEnd, EventHookMode_PostNoCopy);
+	HookEvent("player_death", Event_EconomyPlayerDeath, EventHookMode_Post);
 
 	char error[256];
 	g_hLanPrefs = SQLite_UseDatabase("lan_identity", error, sizeof(error));
@@ -114,6 +139,7 @@ public void OnMapStart()
 	g_mScoreCache.Clear();
 	g_mEconomyCache.Clear();
 	g_bRoundActive = false;
+	ResetCs2RoundState();
 	for (int client = 1; client <= MaxClients; client++)
 	{
 		if (IsClientConnected(client) && !IsFakeClient(client))
@@ -134,6 +160,7 @@ public void OnClientPostAdminCheck(int client)
 public void OnClientConnected(int client)
 {
 	ResetClientState(client);
+	g_bCs2TEliminated[client] = false;
 }
 
 public void OnClientPutInServer(int client)
@@ -159,6 +186,8 @@ public void OnClientDisconnect(int client)
 		int team = GetClientTeam(client);
 		if (team == CS_TEAM_T || team == CS_TEAM_CT)
 		{
+			if (team == CS_TEAM_T && g_bRoundActive && IsPlayerAlive(client))
+				TrackCs2TElimination(client);
 			g_iLastMoney[client] = GetEntProp(client, Prop_Send, "m_iAccount");
 			g_iLastEconomyTeam[client] = team;
 			g_bLastEconomyValid[client] = true;
@@ -979,6 +1008,17 @@ public Action Timer_RestoreEconomy(Handle timer, int userId)
 public void Event_EconomyRoundStart(Event event, const char[] name, bool dontBroadcast)
 {
 	g_bRoundActive = !view_as<bool>(GameRules_GetProp("m_bWarmupPeriod"));
+	ResetCs2RoundState();
+}
+
+public void Event_EconomyPlayerDeath(Event event, const char[] name, bool dontBroadcast)
+{
+	if (g_eEconomyRuleset != LanEconomy_Cs2Current || !g_bRoundActive)
+		return;
+
+	int victim = GetClientOfUserId(event.GetInt("userid"));
+	if (victim > 0 && GetClientTeam(victim) == CS_TEAM_T)
+		TrackCs2TElimination(victim);
 }
 
 public void Event_EconomyRoundEnd(Event event, const char[] name, bool dontBroadcast)
@@ -1012,6 +1052,7 @@ public void Event_EconomyRoundEnd(Event event, const char[] name, bool dontBroad
 	char identity[128];
 	int economy[ECONOMY_FIELD_COUNT];
 	int maxMoney = GetCashConVar("mp_maxmoney");
+	int cs2CtBonus = reason == CSRoundEnd_Draw ? 0 : GetCs2CtRoundBonus();
 	for (int index = 0; index < snapshot.Length; index++)
 	{
 		snapshot.GetKey(index, identity, sizeof(identity));
@@ -1029,7 +1070,7 @@ public void Event_EconomyRoundEnd(Event event, const char[] name, bool dontBroad
 		if (reason == CSRoundEnd_Draw)
 			continue;
 
-		int award = GetOfflineTeamAward(economy[ECONOMY_TEAM], winner, reason);
+		int award = GetOfflineTeamAward(economy[ECONOMY_TEAM], winner, reason, cs2CtBonus);
 		if (award <= 0)
 			continue;
 
@@ -1041,6 +1082,8 @@ public void Event_EconomyRoundEnd(Event event, const char[] name, bool dontBroad
 			identity, reason, economy[ECONOMY_TEAM], award, economy[ECONOMY_MONEY]);
 	}
 	delete snapshot;
+	ApplyConnectedCs2CtBonus(cs2CtBonus);
+	g_bCs2RoundSettled = true;
 }
 
 int GetWinnerFromReason(CSRoundEndReason reason)
@@ -1071,6 +1114,7 @@ public void Event_EconomyPhaseEnd(Event event, const char[] name, bool dontBroad
 void ClearEconomyPhaseState()
 {
 	g_mEconomyCache.Clear();
+	ResetCs2RoundState();
 	for (int client = 1; client <= MaxClients; client++)
 	{
 		g_iCachedMoney[client] = 0;
@@ -1080,51 +1124,75 @@ void ClearEconomyPhaseState()
 	}
 }
 
-int GetOfflineTeamAward(int team, int winner, CSRoundEndReason reason)
+int GetOfflineTeamAward(int team, int winner, CSRoundEndReason reason, int cs2CtBonus)
 {
-	if (team != CS_TEAM_T && team != CS_TEAM_CT)
+	if (g_eEconomyRuleset == LanEconomy_Cs2Current)
+		return LanEconomyCs2_GetOfflineTeamAward(team, winner, reason, cs2CtBonus);
+	return LanEconomyCsgo_GetOfflineTeamAward(team, winner, reason);
+}
+
+int GetCs2CtRoundBonus()
+{
+	if (g_eEconomyRuleset != LanEconomy_Cs2Current || g_bCs2RoundSettled)
 		return 0;
+	return LanEconomyCs2_GetCtEliminationBonus(CS_TEAM_CT, g_iCs2TEliminations,
+		g_cvCs2CtEliminationBonus.IntValue);
+}
 
-	if (team != winner)
+void ApplyConnectedCs2CtBonus(int bonus)
+{
+	if (bonus <= 0)
+		return;
+
+	int maxMoney = GetCashConVar("mp_maxmoney");
+	for (int client = 1; client <= MaxClients; client++)
 	{
-		int consecutiveLosses = GameRules_GetProp(team == CS_TEAM_CT ?
-			"m_iNumConsecutiveCTLoses" : "m_iNumConsecutiveTerroristLoses");
-		int lossTier = consecutiveLosses - 1;
-		if (lossTier < 0)
-			lossTier = 0;
-		int maxTier = GetCashConVar("mp_consecutive_loss_max");
-		if (maxTier >= 0 && lossTier > maxTier)
-			lossTier = maxTier;
+		if (!IsClientInGame(client) || GetClientTeam(client) != CS_TEAM_CT)
+			continue;
 
-		int award = GetCashConVar("cash_team_loser_bonus") +
-			(lossTier * GetCashConVar("cash_team_loser_bonus_consecutive_rounds"));
-		if (team == CS_TEAM_T && reason == CSRoundEnd_BombDefused)
-			award += GetCashConVar("cash_team_planted_bomb_but_defused");
-		return award;
-	}
-
-	switch (reason)
-	{
-		case CSRoundEnd_TargetBombed:
-			return GetCashConVar("cash_team_terrorist_win_bomb");
-		case CSRoundEnd_BombDefused:
-			return GetCashConVar("cash_team_win_by_defusing_bomb");
-		case CSRoundEnd_TargetSaved:
-			return GetCashConVar("cash_team_win_by_time_running_out_bomb");
-		case CSRoundEnd_HostagesRescued:
-			return GetCashConVar("cash_team_win_by_hostage_rescue");
-		case CSRoundEnd_HostagesNotRescued:
-			return GetCashConVar("cash_team_win_by_time_running_out_hostage");
-		case CSRoundEnd_CTWin, CSRoundEnd_TerroristWin,
-			CSRoundEnd_TerroristsSurrender, CSRoundEnd_CTSurrender:
+		int money = GetEntProp(client, Prop_Send, "m_iAccount") + bonus;
+		if (maxMoney > 0 && money > maxMoney)
+			money = maxMoney;
+		SetEntProp(client, Prop_Send, "m_iAccount", money);
+		if (!IsFakeClient(client) && g_bIdentityPatched[client])
 		{
-			if (view_as<bool>(GameRules_GetProp("m_bMapHasBombTarget")))
-				return GetCashConVar("cash_team_elimination_bomb_map");
-			return GetCashConVar(team == CS_TEAM_CT ?
-				"cash_team_elimination_hostage_map_ct" : "cash_team_elimination_hostage_map_t");
+			g_iLastMoney[client] = money;
+			g_iLastEconomyTeam[client] = CS_TEAM_CT;
+			g_bLastEconomyValid[client] = true;
 		}
 	}
-	return 0;
+	LogMessage("LAN_ECONOMY_CS2_CT_BONUS|eliminations=%d|bonus=%d",
+		g_iCs2TEliminations, bonus);
+}
+
+void TrackCs2TElimination(int client)
+{
+	if (g_eEconomyRuleset != LanEconomy_Cs2Current || g_bCs2RoundSettled ||
+		client <= 0 || client > MaxClients || g_bCs2TEliminated[client])
+	{
+		return;
+	}
+	g_bCs2TEliminated[client] = true;
+	g_iCs2TEliminations++;
+}
+
+void ResetCs2RoundState()
+{
+	g_iCs2TEliminations = 0;
+	g_bCs2RoundSettled = false;
+	for (int client = 1; client <= MaxClients; client++)
+		g_bCs2TEliminated[client] = false;
+}
+
+public void OnEconomyRulesetChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+	LanEconomyRuleset ruleset = view_as<LanEconomyRuleset>(convar.IntValue);
+	if (ruleset == g_eEconomyRuleset)
+		return;
+	g_eEconomyRuleset = ruleset;
+	ClearEconomyPhaseState();
+	LogMessage("LAN economy ruleset changed to %s; pending reconnect economy was cleared.",
+		g_eEconomyRuleset == LanEconomy_Cs2Current ? "CS2" : "CS:GO Legacy");
 }
 
 int GetCashConVar(const char[] name)

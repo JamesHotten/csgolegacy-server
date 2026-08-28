@@ -40,6 +40,7 @@ Write-Host "Applying MODs and SQLite snapshot to $csgoDir..."
 Expand-Archive -LiteralPath $modZip -DestinationPath $csgoDir -Force
 & (Join-Path $PSScriptRoot "install_custom_plugins.ps1") -ServerDir $ServerDir
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "config\server.cfg") -Destination (Join-Path $csgoDir "cfg\server.cfg") -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "config\mr12.cfg") -Destination (Join-Path $csgoDir "cfg\mr12.cfg") -Force
 Set-Content -LiteralPath (Join-Path $ServerDir "steam_appid.txt") -Value "740" -Encoding Ascii
 
 $startScript = @(

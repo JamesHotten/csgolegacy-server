@@ -25,9 +25,14 @@ Set-Location csgolegacy-server
 hostname "你的服务器名称"
 rcon_password "设置一个强密码"
 sv_password ""
+sm_lan_economy_ruleset 0
 ```
 
 不要把真实 RCON 密码提交回公共仓库。
+
+`sm_lan_economy_ruleset 0` 是默认且与旧版本完全兼容的 CS:GO Legacy/原有经济；设置为 `1` 时使用当前 CS2 经济策略，并按每名被消灭的 T 向每名 CT 增加 `$50` 团队补助。应在开局前切换；运行中切换会主动丢弃尚未恢复的断线经济缓存，防止两套规则混算，但不会删除数据库数据。
+
+要切换为 CS2 MR12 赛制，在服务器控制台执行 `exec mr12`。该配置同时设置 24 回合、先到 13 分结束、MR3 加时、加时 `$10,000` 初始经济，并启用 `sm_lan_economy_ruleset 1`。重新执行 `exec server.cfg` 可恢复仓库默认的 CS:GO Legacy 经济配置；切换后应使用 `mp_restartgame 1` 开始新比赛。
 
 ## 4. 安装
 

@@ -14,6 +14,10 @@ if ($runningServer) {
 }
 
 $source = Join-Path $PSScriptRoot "mods\lan_player_scoreboard.sp"
+$economyPolicySources = @(
+    (Join-Path $PSScriptRoot "mods\lan_economy_csgo.inc"),
+    (Join-Path $PSScriptRoot "mods\lan_economy_cs2.inc")
+)
 $scriptingDir = Join-Path $ServerDir "csgo\addons\sourcemod\scripting"
 $compiler = Join-Path $scriptingDir "spcomp.exe"
 $installedSource = Join-Path $scriptingDir "lan_player_scoreboard.sp"
@@ -25,6 +29,12 @@ if (-not (Test-Path -LiteralPath $compiler)) {
 }
 
 Copy-Item -LiteralPath $source -Destination $installedSource -Force
+foreach ($policySource in $economyPolicySources) {
+    if (-not (Test-Path -LiteralPath $policySource)) {
+        throw "LAN economy policy source was not found: '$policySource'"
+    }
+    Copy-Item -LiteralPath $policySource -Destination (Join-Path $scriptingDir ([System.IO.Path]::GetFileName($policySource))) -Force
+}
 & $compiler "-o$plugin" $installedSource
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $plugin)) {
     throw "Failed to compile lan_player_scoreboard.sp (exit code $LASTEXITCODE)."
