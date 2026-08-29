@@ -41,6 +41,8 @@ Expand-Archive -LiteralPath $modZip -DestinationPath $csgoDir -Force
 & (Join-Path $PSScriptRoot "install_custom_plugins.ps1") -ServerDir $ServerDir
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "config\server.cfg") -Destination (Join-Path $csgoDir "cfg\server.cfg") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "config\mr12.cfg") -Destination (Join-Path $csgoDir "cfg\mr12.cfg") -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "config\mr15.cfg") -Destination (Join-Path $csgoDir "cfg\mr15.cfg") -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "config\gamemode_competitive_server.cfg") -Destination (Join-Path $csgoDir "cfg\gamemode_competitive_server.cfg") -Force
 Set-Content -LiteralPath (Join-Path $ServerDir "steam_appid.txt") -Value "740" -Encoding Ascii
 
 $startScript = @(

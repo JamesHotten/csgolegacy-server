@@ -15,6 +15,7 @@ if ($runningServer) {
 
 $source = Join-Path $PSScriptRoot "mods\lan_player_scoreboard.sp"
 $economyPolicySources = @(
+    (Join-Path $PSScriptRoot "mods\lan_economy_policy.inc"),
     (Join-Path $PSScriptRoot "mods\lan_economy_csgo.inc"),
     (Join-Path $PSScriptRoot "mods\lan_economy_cs2.inc")
 )

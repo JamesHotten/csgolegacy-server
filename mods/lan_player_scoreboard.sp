@@ -6,6 +6,7 @@
 #include <cstrike>
 #include <clientprefs>
 
+#include "lan_economy_policy.inc"
 #include "lan_economy_csgo.inc"
 #include "lan_economy_cs2.inc"
 
@@ -25,14 +26,12 @@
 #define ECONOMY_MONEY 0
 #define ECONOMY_TEAM 1
 #define ECONOMY_SKIP_ROUND 2
+// More slots than CS:GO can hold as simultaneously refundable inventory;
+// refunded, used, and stale entries are recycled before this bound is reached.
+#define REFUND_MAX_PURCHASES 16
+#define ECONOMY_TRANSACTION_CVARS 11
 #define LEGACY_OWNER_ACCOUNT_ID 1919066672
 #define STEAMID64_HIGH 17825793
-
-enum LanEconomyRuleset
-{
-	LanEconomy_CsgoLegacy = 0,
-	LanEconomy_Cs2Current
-};
 
 bool g_bIdentityPatched[MAXPLAYERS + 1];
 bool g_bLanClient[MAXPLAYERS + 1];
@@ -60,17 +59,34 @@ ConVar g_cvSvLan;
 ConVar g_cvEconomyRuleset;
 ConVar g_cvCs2CtEliminationBonus;
 LanEconomyRuleset g_eEconomyRuleset;
+bool g_bApplyingEconomyRuleset;
 bool g_bRoundActive;
 bool g_bCs2TEliminated[MAXPLAYERS + 1];
 bool g_bCs2RoundSettled;
 int g_iCs2TEliminations;
+char g_sPendingPurchase[MAXPLAYERS + 1][32];
+int g_iPendingMoney[MAXPLAYERS + 1];
+int g_iPendingArmor[MAXPLAYERS + 1];
+bool g_bPendingHelmet[MAXPLAYERS + 1];
+bool g_bPendingDefuser[MAXPLAYERS + 1];
+char g_sRefundItem[MAXPLAYERS + 1][REFUND_MAX_PURCHASES][32];
+int g_iRefundPrice[MAXPLAYERS + 1][REFUND_MAX_PURCHASES];
+int g_iRefundEntityRef[MAXPLAYERS + 1][REFUND_MAX_PURCHASES];
+int g_iRefundRound[MAXPLAYERS + 1][REFUND_MAX_PURCHASES];
+int g_iRefundArmorBefore[MAXPLAYERS + 1][REFUND_MAX_PURCHASES];
+bool g_bRefundHelmetBefore[MAXPLAYERS + 1][REFUND_MAX_PURCHASES];
+bool g_bRefundDefuserBefore[MAXPLAYERS + 1][REFUND_MAX_PURCHASES];
+bool g_bRefundUsed[MAXPLAYERS + 1][REFUND_MAX_PURCHASES];
+int g_iRefundCount[MAXPLAYERS + 1];
+int g_iEconomyRoundSerial;
+float g_fEconomyRoundStartTime;
 
 public Plugin myinfo =
 {
 	name = "LAN Player Identity",
 	author = "Codex",
 	description = "Provides stable LAN identities for scoreboards and persistent MOD data",
-	version = "2.0.0"
+	version = "2.1.0"
 };
 
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorLength)
@@ -98,7 +114,9 @@ public void OnPluginStart()
 		"LAN reconnect economy: 0=CS:GO Legacy, 1=current CS2", FCVAR_NOTIFY, true, 0.0, true, 1.0);
 	g_cvCs2CtEliminationBonus = CreateConVar("sm_lan_economy_cs2_ct_kill_bonus", "50",
 		"CS2 ruleset team award per eliminated Terrorist", FCVAR_NOTIFY, true, 0.0);
-	g_eEconomyRuleset = view_as<LanEconomyRuleset>(g_cvEconomyRuleset.IntValue);
+	g_eEconomyRuleset = LanEconomy_CsgoLegacy;
+	if (!ApplyEconomyRuleset(view_as<LanEconomyRuleset>(g_cvEconomyRuleset.IntValue), false))
+		SetFailState("Failed to initialize LAN economy ruleset.");
 	g_cvEconomyRuleset.AddChangeHook(OnEconomyRulesetChanged);
 	LogMessage("LAN economy ruleset initialized: %s (CS2 CT elimination bonus: $%d).",
 		g_eEconomyRuleset == LanEconomy_Cs2Current ? "CS2" : "original/CS:GO Legacy",
@@ -107,6 +125,14 @@ public void OnPluginStart()
 	HookEvent("round_end", Event_EconomyRoundEnd, EventHookMode_Post);
 	HookEvent("announce_phase_end", Event_EconomyPhaseEnd, EventHookMode_PostNoCopy);
 	HookEvent("player_death", Event_EconomyPlayerDeath, EventHookMode_Post);
+	HookEvent("item_purchase", Event_EconomyItemPurchase, EventHookMode_Post);
+	HookEvent("weapon_fire", Event_EconomyWeaponFire, EventHookMode_Post);
+	HookEvent("player_hurt", Event_EconomyPlayerHurt, EventHookMode_Post);
+	HookEvent("bomb_begindefuse", Event_EconomyBombBeginDefuse, EventHookMode_Post);
+	RegConsoleCmd("sm_refund", Command_EconomyRefund, "Refund an unused CS2 purchase");
+	RegConsoleCmd("sm_sell", Command_EconomyRefund, "Refund an unused CS2 purchase");
+	RegServerCmd("sm_lan_economy_apply", Command_ApplyEconomyRuleset,
+		"Atomically apply 0=CS:GO Legacy or 1=CS2; no argument reapplies the selected mode");
 
 	char error[256];
 	g_hLanPrefs = SQLite_UseDatabase("lan_identity", error, sizeof(error));
@@ -139,7 +165,10 @@ public void OnMapStart()
 	g_mScoreCache.Clear();
 	g_mEconomyCache.Clear();
 	g_bRoundActive = false;
+	g_iEconomyRoundSerial = 0;
+	g_fEconomyRoundStartTime = 0.0;
 	ResetCs2RoundState();
+	ClearAllRefundState();
 	for (int client = 1; client <= MaxClients; client++)
 	{
 		if (IsClientConnected(client) && !IsFakeClient(client))
@@ -149,6 +178,13 @@ public void OnMapStart()
 			PrepareClient(client);
 		}
 	}
+}
+
+public void OnConfigsExecuted()
+{
+	LanEconomyRuleset configured = view_as<LanEconomyRuleset>(g_cvEconomyRuleset.IntValue);
+	if (!ApplyEconomyRuleset(configured, false))
+		SetFailState("Failed to apply final LAN economy configuration.");
 }
 
 public void OnClientPostAdminCheck(int client)
@@ -161,6 +197,7 @@ public void OnClientConnected(int client)
 {
 	ResetClientState(client);
 	g_bCs2TEliminated[client] = false;
+	ResetRefundState(client);
 }
 
 public void OnClientPutInServer(int client)
@@ -225,6 +262,7 @@ void ResetClientState(int client)
 	g_iRestoreCycles[client] = 0;
 	g_bLastScoreValid[client] = false;
 	ResetEconomyState(client);
+	ResetRefundState(client);
 }
 
 void ResetEconomyState(int client)
@@ -1008,17 +1046,147 @@ public Action Timer_RestoreEconomy(Handle timer, int userId)
 public void Event_EconomyRoundStart(Event event, const char[] name, bool dontBroadcast)
 {
 	g_bRoundActive = !view_as<bool>(GameRules_GetProp("m_bWarmupPeriod"));
+	g_iEconomyRoundSerial++;
+	g_fEconomyRoundStartTime = GetGameTime();
+	ClearAllRefundState();
 	ResetCs2RoundState();
 }
 
 public void Event_EconomyPlayerDeath(Event event, const char[] name, bool dontBroadcast)
 {
+	ApplyDifferentialKillAward(event);
+	InvalidateAllRefunds(GetClientOfUserId(event.GetInt("userid")));
+
 	if (g_eEconomyRuleset != LanEconomy_Cs2Current || !g_bRoundActive)
 		return;
 
 	int victim = GetClientOfUserId(event.GetInt("userid"));
 	if (victim > 0 && GetClientTeam(victim) == CS_TEAM_T)
 		TrackCs2TElimination(victim);
+}
+
+public Action CS_OnBuyCommand(int client, const char[] weapon)
+{
+	if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client))
+	{
+		return Plugin_Continue;
+	}
+
+	LanEconomy_NormalizeItem(weapon, g_sPendingPurchase[client], sizeof(g_sPendingPurchase[]));
+	g_iPendingMoney[client] = GetEntProp(client, Prop_Send, "m_iAccount");
+	g_iPendingArmor[client] = GetEntProp(client, Prop_Send, "m_ArmorValue");
+	g_bPendingHelmet[client] = view_as<bool>(GetEntProp(client, Prop_Send, "m_bHasHelmet"));
+	g_bPendingDefuser[client] = view_as<bool>(GetEntProp(client, Prop_Send, "m_bHasDefuser"));
+	return Plugin_Continue;
+}
+
+public void Event_EconomyItemPurchase(Event event, const char[] name, bool dontBroadcast)
+{
+	int client = GetClientOfUserId(event.GetInt("userid"));
+	if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client))
+	{
+		return;
+	}
+
+	char rawItem[32], item[32];
+	event.GetString("weapon", rawItem, sizeof(rawItem));
+	LanEconomy_NormalizeItem(rawItem, item, sizeof(item));
+	if (g_sPendingPurchase[client][0] == '\0' || !StrEqual(item, g_sPendingPurchase[client], false))
+		return;
+
+	int price = g_iPendingMoney[client] - GetEntProp(client, Prop_Send, "m_iAccount");
+	g_sPendingPurchase[client][0] = '\0';
+	if (price <= 0)
+		return;
+	int policyPrice;
+	if (LanEconomy_GetWeaponPrice(g_eEconomyRuleset, item, policyPrice))
+		PrintToChat(client, "[Economy] %s cost $%d under the active ruleset.", item, price);
+	if (g_eEconomyRuleset != LanEconomy_Cs2Current)
+		return;
+	RecordRefundPurchase(client, item, price);
+}
+
+public void Event_EconomyWeaponFire(Event event, const char[] name, bool dontBroadcast)
+{
+	int client = GetClientOfUserId(event.GetInt("userid"));
+	if (client <= 0)
+		return;
+	char weapon[32];
+	event.GetString("weapon", weapon, sizeof(weapon));
+	MarkLatestRefundUsed(client, weapon);
+}
+
+public void Event_EconomyPlayerHurt(Event event, const char[] name, bool dontBroadcast)
+{
+	if (event.GetInt("dmg_armor") <= 0)
+		return;
+	int client = GetClientOfUserId(event.GetInt("userid"));
+	MarkRefundCategoryUsed(client, true, false);
+}
+
+public void Event_EconomyBombBeginDefuse(Event event, const char[] name, bool dontBroadcast)
+{
+	int client = GetClientOfUserId(event.GetInt("userid"));
+	MarkRefundCategoryUsed(client, false, true);
+}
+
+public Action CS_OnCSWeaponDrop(int client, int weaponIndex, bool donated)
+{
+	if (client <= 0 || weaponIndex <= MaxClients)
+		return Plugin_Continue;
+	int reference = EntIndexToEntRef(weaponIndex);
+	for (int index = 0; index < g_iRefundCount[client]; index++)
+	{
+		if (g_iRefundEntityRef[client][index] == reference)
+			g_bRefundUsed[client][index] = true;
+	}
+	return Plugin_Continue;
+}
+
+public Action CS_OnGetWeaponPrice(int client, const char[] weapon, int &price)
+{
+	int policyPrice;
+	if (!LanEconomy_GetWeaponPrice(g_eEconomyRuleset, weapon, policyPrice))
+		return Plugin_Continue;
+	price = policyPrice;
+	return Plugin_Changed;
+}
+
+void ApplyDifferentialKillAward(Event event)
+{
+	int attacker = GetClientOfUserId(event.GetInt("attacker"));
+	int victim = GetClientOfUserId(event.GetInt("userid"));
+	if (attacker <= 0 || victim <= 0 || attacker == victim || !IsClientInGame(attacker) ||
+		GetClientTeam(attacker) == GetClientTeam(victim))
+	{
+		return;
+	}
+
+	char weapon[32];
+	event.GetString("weapon", weapon, sizeof(weapon));
+	int desiredAward;
+	if (!LanEconomy_GetKillAward(g_eEconomyRuleset, weapon, desiredAward))
+		return;
+
+	int delta = desiredAward - LanEconomy_GetLegacyEngineKillAward(weapon);
+	if (delta == 0)
+		return;
+
+	int money = GetEntProp(attacker, Prop_Send, "m_iAccount") + delta;
+	int maxMoney = GetCashConVar("mp_maxmoney");
+	if (money < 0)
+		money = 0;
+	if (maxMoney > 0 && money > maxMoney)
+		money = maxMoney;
+	SetEntProp(attacker, Prop_Send, "m_iAccount", money);
+	if (!IsFakeClient(attacker) && g_bIdentityPatched[attacker])
+	{
+		g_iLastMoney[attacker] = money;
+		g_iLastEconomyTeam[attacker] = GetClientTeam(attacker);
+		g_bLastEconomyValid[attacker] = true;
+	}
+	LogMessage("LAN_ECONOMY_KILL_AWARD|client=%N|weapon=%s|target=%d|delta=%d|balance=%d",
+		attacker, weapon, desiredAward, delta, money);
 }
 
 public void Event_EconomyRoundEnd(Event event, const char[] name, bool dontBroadcast)
@@ -1115,6 +1283,7 @@ void ClearEconomyPhaseState()
 {
 	g_mEconomyCache.Clear();
 	ResetCs2RoundState();
+	ClearAllRefundState();
 	for (int client = 1; client <= MaxClients; client++)
 	{
 		g_iCachedMoney[client] = 0;
@@ -1122,6 +1291,316 @@ void ClearEconomyPhaseState()
 		g_bEconomyRestorePending[client] = false;
 		g_bEconomyRestoreScheduled[client] = false;
 	}
+}
+
+void ResetRefundState(int client)
+{
+	g_sPendingPurchase[client][0] = '\0';
+	g_iPendingMoney[client] = 0;
+	g_iPendingArmor[client] = 0;
+	g_bPendingHelmet[client] = false;
+	g_bPendingDefuser[client] = false;
+	g_iRefundCount[client] = 0;
+	for (int index = 0; index < REFUND_MAX_PURCHASES; index++)
+	{
+		g_sRefundItem[client][index][0] = '\0';
+		g_iRefundPrice[client][index] = 0;
+		g_iRefundEntityRef[client][index] = INVALID_ENT_REFERENCE;
+		g_iRefundRound[client][index] = 0;
+		g_iRefundArmorBefore[client][index] = 0;
+		g_bRefundHelmetBefore[client][index] = false;
+		g_bRefundDefuserBefore[client][index] = false;
+		g_bRefundUsed[client][index] = false;
+	}
+}
+
+void ClearAllRefundState()
+{
+	for (int client = 1; client <= MaxClients; client++)
+		ResetRefundState(client);
+}
+
+bool IsRefundArmor(const char[] item)
+{
+	return StrEqual(item, "vest", false) || StrEqual(item, "vesthelm", false) ||
+		StrEqual(item, "kevlar", false) || StrEqual(item, "assaultsuit", false);
+}
+
+bool IsRefundDefuser(const char[] item)
+{
+	return StrEqual(item, "defuser", false) || StrEqual(item, "cutters", false);
+}
+
+bool IsRefundGrenade(const char[] item)
+{
+	return StrEqual(item, "flashbang", false) || StrEqual(item, "smokegrenade", false) ||
+		StrEqual(item, "hegrenade", false) || StrEqual(item, "decoy", false) ||
+		StrEqual(item, "molotov", false) || StrEqual(item, "incgrenade", false);
+}
+
+void RecordRefundPurchase(int client, const char[] item, int price)
+{
+	int slot = -1;
+	for (int index = 0; index < g_iRefundCount[client]; index++)
+	{
+		if (g_iRefundPrice[client][index] <= 0 || g_bRefundUsed[client][index] ||
+			g_iRefundRound[client][index] != g_iEconomyRoundSerial)
+		{
+			slot = index;
+			break;
+		}
+	}
+	if (slot < 0 && g_iRefundCount[client] < REFUND_MAX_PURCHASES)
+		slot = g_iRefundCount[client]++;
+	if (slot < 0)
+	{
+		PrintToChat(client, "[Economy] Refund history is full for this round.");
+		return;
+	}
+
+	if (IsRefundArmor(item))
+		MarkRefundCategoryUsed(client, true, false);
+	strcopy(g_sRefundItem[client][slot], sizeof(g_sRefundItem[][]), item);
+	g_iRefundPrice[client][slot] = price;
+	g_iRefundRound[client][slot] = g_iEconomyRoundSerial;
+	g_iRefundArmorBefore[client][slot] = g_iPendingArmor[client];
+	g_bRefundHelmetBefore[client][slot] = g_bPendingHelmet[client];
+	g_bRefundDefuserBefore[client][slot] = g_bPendingDefuser[client];
+	g_bRefundUsed[client][slot] = false;
+	int entity = FindOwnedRefundEntity(client, item);
+	g_iRefundEntityRef[client][slot] = entity > MaxClients ? EntIndexToEntRef(entity) : INVALID_ENT_REFERENCE;
+	LogMessage("LAN_ECONOMY_PURCHASE|client=%N|item=%s|price=%d|round=%d|entity=%d",
+		client, item, price, g_iEconomyRoundSerial, entity);
+}
+
+int FindOwnedRefundEntity(int client, const char[] item)
+{
+	char className[64], normalized[32];
+	int match = -1;
+	for (int entity = MaxClients + 1; entity < GetMaxEntities(); entity++)
+	{
+		if (!IsValidEntity(entity) || !HasEntProp(entity, Prop_Send, "m_hOwnerEntity") ||
+			GetEntPropEnt(entity, Prop_Send, "m_hOwnerEntity") != client)
+		{
+			continue;
+		}
+		GetEntityClassname(entity, className, sizeof(className));
+		LanEconomy_NormalizeItem(className, normalized, sizeof(normalized));
+		if (StrEqual(normalized, item, false))
+			match = entity;
+	}
+	return match;
+}
+
+void MarkLatestRefundUsed(int client, const char[] rawItem)
+{
+	if (client <= 0 || client > MaxClients)
+		return;
+	char item[32];
+	LanEconomy_NormalizeItem(rawItem, item, sizeof(item));
+	for (int index = g_iRefundCount[client] - 1; index >= 0; index--)
+	{
+		if (!g_bRefundUsed[client][index] && g_iRefundPrice[client][index] > 0 &&
+			StrEqual(g_sRefundItem[client][index], item, false))
+		{
+			g_bRefundUsed[client][index] = true;
+			return;
+		}
+	}
+}
+
+void MarkRefundCategoryUsed(int client, bool armor, bool defuser)
+{
+	if (client <= 0 || client > MaxClients)
+		return;
+	for (int index = 0; index < g_iRefundCount[client]; index++)
+	{
+		if ((armor && IsRefundArmor(g_sRefundItem[client][index])) ||
+			(defuser && IsRefundDefuser(g_sRefundItem[client][index])))
+		{
+			g_bRefundUsed[client][index] = true;
+		}
+	}
+}
+
+void InvalidateAllRefunds(int client)
+{
+	if (client <= 0 || client > MaxClients)
+		return;
+	g_sPendingPurchase[client][0] = '\0';
+	for (int index = 0; index < g_iRefundCount[client]; index++)
+		g_bRefundUsed[client][index] = true;
+}
+
+bool IsWithinEconomyBuyTime()
+{
+	ConVar buyTime = FindConVar("mp_buytime");
+	ConVar freezeTime = FindConVar("mp_freezetime");
+	if (buyTime == null || freezeTime == null || g_fEconomyRoundStartTime <= 0.0)
+		return false;
+	return GetGameTime() - g_fEconomyRoundStartTime <= buyTime.FloatValue + freezeTime.FloatValue;
+}
+
+bool IsRefundItemOwned(int client, int index)
+{
+	if (IsRefundArmor(g_sRefundItem[client][index]))
+	{
+		if (GetEntProp(client, Prop_Send, "m_ArmorValue") <= 0)
+			return false;
+		return !StrEqual(g_sRefundItem[client][index], "assaultsuit", false) ||
+			view_as<bool>(GetEntProp(client, Prop_Send, "m_bHasHelmet"));
+	}
+	if (IsRefundDefuser(g_sRefundItem[client][index]))
+		return view_as<bool>(GetEntProp(client, Prop_Send, "m_bHasDefuser"));
+
+	int entity = EntRefToEntIndex(g_iRefundEntityRef[client][index]);
+	return entity > MaxClients && IsValidEntity(entity) &&
+		HasEntProp(entity, Prop_Send, "m_hOwnerEntity") &&
+		GetEntPropEnt(entity, Prop_Send, "m_hOwnerEntity") == client;
+}
+
+bool IsRefundEntryEligible(int client, int index)
+{
+	if (client <= 0 || !IsClientInGame(client) || !IsPlayerAlive(client) ||
+		index < 0 || index >= g_iRefundCount[client] || g_iRefundPrice[client][index] <= 0)
+	{
+		return false;
+	}
+	return LanEconomy_CanRefund(g_eEconomyRuleset,
+		view_as<bool>(GetEntProp(client, Prop_Send, "m_bInBuyZone")),
+		IsWithinEconomyBuyTime(), g_iRefundRound[client][index] == g_iEconomyRoundSerial,
+		IsRefundItemOwned(client, index), g_bRefundUsed[client][index]);
+}
+
+public Action Command_EconomyRefund(int client, int args)
+{
+	if (client <= 0 || !IsClientInGame(client))
+		return Plugin_Handled;
+	if (g_eEconomyRuleset != LanEconomy_Cs2Current)
+	{
+		ReplyToCommand(client, "[Economy] Refunds are available only in CS2 mode.");
+		return Plugin_Handled;
+	}
+	if (args > 0)
+	{
+		char choice[16];
+		GetCmdArg(1, choice, sizeof(choice));
+		if (StrEqual(choice, "last", false))
+		{
+			for (int index = g_iRefundCount[client] - 1; index >= 0; index--)
+			{
+				if (IsRefundEntryEligible(client, index) && RefundEconomyPurchase(client, index))
+					return Plugin_Handled;
+			}
+			ReplyToCommand(client, "[Economy] No refundable purchases are currently available.");
+			return Plugin_Handled;
+		}
+	}
+
+	Menu menu = new Menu(MenuHandler_EconomyRefund);
+	menu.SetTitle("CS2 purchase refund");
+	int eligible;
+	char info[12], display[96];
+	for (int index = 0; index < g_iRefundCount[client]; index++)
+	{
+		if (!IsRefundEntryEligible(client, index))
+			continue;
+		IntToString(index, info, sizeof(info));
+		Format(display, sizeof(display), "%s  +$%d", g_sRefundItem[client][index], g_iRefundPrice[client][index]);
+		menu.AddItem(info, display);
+		eligible++;
+	}
+	if (eligible == 0)
+	{
+		delete menu;
+		ReplyToCommand(client, "[Economy] No refundable purchases are currently available.");
+		return Plugin_Handled;
+	}
+	menu.ExitButton = true;
+	menu.Display(client, MENU_TIME_FOREVER);
+	return Plugin_Handled;
+}
+
+public int MenuHandler_EconomyRefund(Menu menu, MenuAction action, int client, int selection)
+{
+	if (action == MenuAction_End)
+	{
+		delete menu;
+		return 0;
+	}
+	if (action != MenuAction_Select || !IsClientInGame(client))
+		return 0;
+
+	char info[12];
+	menu.GetItem(selection, info, sizeof(info));
+	int index = StringToInt(info);
+	if (!IsRefundEntryEligible(client, index) || !RefundEconomyPurchase(client, index))
+	{
+		PrintToChat(client, "[Economy] That purchase is no longer refundable.");
+		return 0;
+	}
+	return 0;
+}
+
+bool RefundEconomyPurchase(int client, int index)
+{
+	if (IsRefundArmor(g_sRefundItem[client][index]))
+	{
+		SetEntProp(client, Prop_Send, "m_ArmorValue", g_iRefundArmorBefore[client][index]);
+		SetEntProp(client, Prop_Send, "m_bHasHelmet", g_bRefundHelmetBefore[client][index]);
+	}
+	else if (IsRefundDefuser(g_sRefundItem[client][index]))
+	{
+		SetEntProp(client, Prop_Send, "m_bHasDefuser", g_bRefundDefuserBefore[client][index]);
+	}
+	else
+	{
+		int entity = EntRefToEntIndex(g_iRefundEntityRef[client][index]);
+		if (entity <= MaxClients || !IsValidEntity(entity) ||
+			GetEntPropEnt(entity, Prop_Send, "m_hOwnerEntity") != client)
+		{
+			return false;
+		}
+
+		if (IsRefundGrenade(g_sRefundItem[client][index]))
+		{
+			int ammoType = GetEntProp(entity, Prop_Send, "m_iPrimaryAmmoType");
+			int ammo = ammoType >= 0 ? GetEntProp(client, Prop_Send, "m_iAmmo", 4, ammoType) : 0;
+			if (ammo > 1)
+				SetEntProp(client, Prop_Send, "m_iAmmo", ammo - 1, 4, ammoType);
+			else
+			{
+				if (!RemovePlayerItem(client, entity))
+					return false;
+				AcceptEntityInput(entity, "Kill");
+			}
+		}
+		else
+		{
+			if (!RemovePlayerItem(client, entity))
+				return false;
+			AcceptEntityInput(entity, "Kill");
+		}
+	}
+
+	int refund = g_iRefundPrice[client][index];
+	int money = GetEntProp(client, Prop_Send, "m_iAccount") + refund;
+	int maxMoney = GetCashConVar("mp_maxmoney");
+	if (maxMoney > 0 && money > maxMoney)
+		money = maxMoney;
+	SetEntProp(client, Prop_Send, "m_iAccount", money);
+	g_iRefundPrice[client][index] = 0;
+	g_bRefundUsed[client][index] = true;
+	if (!IsFakeClient(client) && g_bIdentityPatched[client])
+	{
+		g_iLastMoney[client] = money;
+		g_iLastEconomyTeam[client] = GetClientTeam(client);
+		g_bLastEconomyValid[client] = true;
+	}
+	PrintToChat(client, "[Economy] Refunded %s for $%d.", g_sRefundItem[client][index], refund);
+	LogMessage("LAN_ECONOMY_REFUND|client=%N|item=%s|refund=%d|balance=%d",
+		client, g_sRefundItem[client][index], refund, money);
+	return true;
 }
 
 int GetOfflineTeamAward(int team, int winner, CSRoundEndReason reason, int cs2CtBonus)
@@ -1186,13 +1665,111 @@ void ResetCs2RoundState()
 
 public void OnEconomyRulesetChanged(ConVar convar, const char[] oldValue, const char[] newValue)
 {
+	if (g_bApplyingEconomyRuleset)
+		return;
+
 	LanEconomyRuleset ruleset = view_as<LanEconomyRuleset>(convar.IntValue);
 	if (ruleset == g_eEconomyRuleset)
 		return;
+	LanEconomyRuleset previous = g_eEconomyRuleset;
+	if (!ApplyEconomyRuleset(ruleset, true))
+	{
+		g_bApplyingEconomyRuleset = true;
+		convar.IntValue = view_as<int>(previous);
+		g_bApplyingEconomyRuleset = false;
+		LogError("LAN economy ruleset switch failed and was rolled back to %s.",
+			previous == LanEconomy_Cs2Current ? "CS2" : "CS:GO Legacy");
+	}
+}
+
+public Action Command_ApplyEconomyRuleset(int args)
+{
+	LanEconomyRuleset ruleset = view_as<LanEconomyRuleset>(g_cvEconomyRuleset.IntValue);
+	if (args > 0)
+	{
+		char value[8];
+		GetCmdArg(1, value, sizeof(value));
+		int requested = StringToInt(value);
+		if (requested < 0 || requested > 1)
+		{
+			PrintToServer("Usage: sm_lan_economy_apply [0|1]");
+			return Plugin_Handled;
+		}
+		ruleset = view_as<LanEconomyRuleset>(requested);
+	}
+
+	LanEconomyRuleset previous = g_eEconomyRuleset;
+	bool changed = ruleset != previous;
+	if (!ApplyEconomyRuleset(ruleset, changed))
+	{
+		LogError("LAN economy transaction failed; active ruleset remains %s.",
+			previous == LanEconomy_Cs2Current ? "CS2" : "CS:GO Legacy");
+		return Plugin_Handled;
+	}
+
+	if (g_cvEconomyRuleset.IntValue != view_as<int>(ruleset))
+	{
+		g_bApplyingEconomyRuleset = true;
+		g_cvEconomyRuleset.IntValue = view_as<int>(ruleset);
+		g_bApplyingEconomyRuleset = false;
+	}
+	return Plugin_Handled;
+}
+
+bool ApplyEconomyRuleset(LanEconomyRuleset ruleset, bool clearPendingState)
+{
+	ConVar transaction[ECONOMY_TRANSACTION_CVARS];
+	transaction[0] = FindConVar("cash_team_planted_bomb_but_defused");
+	transaction[1] = g_cvCs2CtEliminationBonus;
+	transaction[2] = FindConVar("mp_maxrounds");
+	transaction[3] = FindConVar("mp_match_can_clinch");
+	transaction[4] = FindConVar("mp_halftime");
+	transaction[5] = FindConVar("mp_startmoney");
+	transaction[6] = FindConVar("mp_maxmoney");
+	transaction[7] = FindConVar("mp_starting_losses");
+	transaction[8] = FindConVar("mp_overtime_enable");
+	transaction[9] = FindConVar("mp_overtime_maxrounds");
+	transaction[10] = FindConVar("mp_overtime_startmoney");
+	for (int index = 0; index < ECONOMY_TRANSACTION_CVARS; index++)
+	{
+		if (transaction[index] == null)
+			return false;
+	}
+
+	int desired[ECONOMY_TRANSACTION_CVARS];
+	desired[0] = LanEconomy_GetBombDefusedTeamAward(ruleset);
+	desired[1] = 50;
+	desired[2] = LanEconomy_GetMaxRounds(ruleset);
+	desired[3] = 1;
+	desired[4] = 1;
+	desired[5] = 800;
+	desired[6] = 16000;
+	desired[7] = 1;
+	desired[8] = LanEconomy_GetOvertimeEnabled(ruleset);
+	desired[9] = LanEconomy_GetOvertimeMaxRounds(ruleset);
+	desired[10] = LanEconomy_GetOvertimeStartMoney(ruleset);
+	int previous[ECONOMY_TRANSACTION_CVARS];
+	for (int index = 0; index < ECONOMY_TRANSACTION_CVARS; index++)
+	{
+		previous[index] = transaction[index].IntValue;
+		transaction[index].IntValue = desired[index];
+	}
+	for (int index = 0; index < ECONOMY_TRANSACTION_CVARS; index++)
+	{
+		if (transaction[index].IntValue == desired[index])
+			continue;
+		for (int rollback = 0; rollback < ECONOMY_TRANSACTION_CVARS; rollback++)
+			transaction[rollback].IntValue = previous[rollback];
+		return false;
+	}
+
 	g_eEconomyRuleset = ruleset;
-	ClearEconomyPhaseState();
-	LogMessage("LAN economy ruleset changed to %s; pending reconnect economy was cleared.",
-		g_eEconomyRuleset == LanEconomy_Cs2Current ? "CS2" : "CS:GO Legacy");
+	if (clearPendingState)
+		ClearEconomyPhaseState();
+	LogMessage("LAN economy ruleset applied atomically: %s; rounds=%d; overtime=%d; planted-but-defused award=$%d%s",
+		ruleset == LanEconomy_Cs2Current ? "CS2" : "CS:GO Legacy", desired[2], desired[8], desired[0],
+		clearPendingState ? "; pending reconnect economy cleared" : "");
+	return true;
 }
 
 int GetCashConVar(const char[] name)
