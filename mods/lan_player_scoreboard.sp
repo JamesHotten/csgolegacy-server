@@ -86,7 +86,7 @@ public Plugin myinfo =
 	name = "LAN Player Identity",
 	author = "Codex",
 	description = "Provides stable LAN identities for scoreboards and persistent MOD data",
-	version = "2.1.0"
+	version = "2.1.1"
 };
 
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorLength)
@@ -1745,9 +1745,9 @@ bool ApplyEconomyRuleset(LanEconomyRuleset ruleset, bool clearPendingState)
 	desired[5] = 800;
 	desired[6] = 16000;
 	desired[7] = 1;
-	desired[8] = LanEconomy_GetOvertimeEnabled(ruleset);
-	desired[9] = LanEconomy_GetOvertimeMaxRounds(ruleset);
-	desired[10] = LanEconomy_GetOvertimeStartMoney(ruleset);
+	desired[8] = LanEconomy_GetOvertimeEnabled();
+	desired[9] = LanEconomy_GetOvertimeMaxRounds();
+	desired[10] = LanEconomy_GetOvertimeStartMoney();
 	int previous[ECONOMY_TRANSACTION_CVARS];
 	for (int index = 0; index < ECONOMY_TRANSACTION_CVARS; index++)
 	{

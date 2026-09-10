@@ -102,17 +102,17 @@ int LanEconomy_GetMaxRounds(LanEconomyRuleset ruleset)
 	return ruleset == LanEconomy_Cs2Current ? 24 : 30;
 }
 
-int LanEconomy_GetOvertimeEnabled(LanEconomyRuleset ruleset)
+int LanEconomy_GetOvertimeEnabled()
 {
-	return ruleset == LanEconomy_Cs2Current ? 1 : 0;
+	return 1;
 }
 
-int LanEconomy_GetOvertimeMaxRounds(LanEconomyRuleset ruleset)
+int LanEconomy_GetOvertimeMaxRounds()
 {
-	return ruleset == LanEconomy_Cs2Current ? 6 : 0;
+	return 6;
 }
 
-int LanEconomy_GetOvertimeStartMoney(LanEconomyRuleset ruleset)
+int LanEconomy_GetOvertimeStartMoney()
 {
-	return ruleset == LanEconomy_Cs2Current ? 10000 : 0;
+	return 10000;
 }

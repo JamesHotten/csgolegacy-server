@@ -62,8 +62,8 @@ connect 192.168.x.x:27016
 - 默认模式：经典竞技
 - `sv_lan 1`
 - `-insecure`
-- 默认执行 `mr15.cfg`：MR15、无 Premier 加时、完整 CS:GO Legacy 经济
-- `exec mr12`：MR12、MR3 加时、完整 CS2 经济；`exec mr15` 可完整恢复
+- 默认执行 `mr15.cfg`：MR15、MR3 加时、加时 `$10,000`、完整 CS:GO Legacy 经济
+- `exec mr12`：MR12、MR3 加时、加时 `$10,000`、完整 CS2 经济；`exec mr15` 可完整恢复
 - CS2 模式可用 `!refund` 选择退款，或用 `!refund last` 退还最近一件仍符合条件的本回合未使用物品
 
 部署前务必修改 `config/server.cfg` 中的 `rcon_password`。

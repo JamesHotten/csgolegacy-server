@@ -45,10 +45,9 @@ public void OnPluginStart()
 	AssertRefundEligibility();
 	AssertEqual("CS:GO maximum rounds", LanEconomy_GetMaxRounds(LanEconomy_CsgoLegacy), 30);
 	AssertEqual("CS2 maximum rounds", LanEconomy_GetMaxRounds(LanEconomy_Cs2Current), 24);
-	AssertEqual("CS:GO overtime disabled", LanEconomy_GetOvertimeEnabled(LanEconomy_CsgoLegacy), 0);
-	AssertEqual("CS2 overtime enabled", LanEconomy_GetOvertimeEnabled(LanEconomy_Cs2Current), 1);
-	AssertEqual("CS2 overtime rounds", LanEconomy_GetOvertimeMaxRounds(LanEconomy_Cs2Current), 6);
-	AssertEqual("CS2 overtime start money", LanEconomy_GetOvertimeStartMoney(LanEconomy_Cs2Current), 10000);
+	AssertEqual("shared overtime enabled", LanEconomy_GetOvertimeEnabled(), 1);
+	AssertEqual("shared overtime rounds", LanEconomy_GetOvertimeMaxRounds(), 6);
+	AssertEqual("shared overtime start money", LanEconomy_GetOvertimeStartMoney(), 10000);
 	LogMessage("LAN_ECONOMY_POLICY_SELFTEST_OK");
 }
 
