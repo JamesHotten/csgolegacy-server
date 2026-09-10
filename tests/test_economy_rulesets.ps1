@@ -26,6 +26,7 @@ $legacySource = Get-Content -LiteralPath (Join-Path $repoRoot "mods\lan_economy_
 $cs2Source = Get-Content -LiteralPath (Join-Path $repoRoot "mods\lan_economy_cs2.inc") -Raw
 $mr12Config = Get-Content -LiteralPath (Join-Path $repoRoot "config\mr12.cfg") -Raw
 $mr15Config = Get-Content -LiteralPath (Join-Path $repoRoot "config\mr15.cfg") -Raw
+$serverConfig = Get-Content -LiteralPath (Join-Path $repoRoot "config\server.cfg") -Raw
 $competitiveOverride = Get-Content -LiteralPath (Join-Path $repoRoot "config\gamemode_competitive_server.cfg") -Raw
 $deploymentScript = Get-Content -LiteralPath (Join-Path $repoRoot "apply_mods.ps1") -Raw
 
@@ -90,6 +91,8 @@ if ($mr15Config -match '(?m)^mp_') {
 }
 Assert-Contains $deploymentScript 'config\mr15.cfg' `
     "Fresh deployments must install mr15.cfg."
+Assert-Contains $serverConfig 'mp_drop_knife_enable 1' `
+    "The default server configuration must allow players to drop knives."
 Assert-Contains $competitiveOverride 'sm_lan_economy_apply' `
 	"The final competitive-mode override must reapply the selected transaction."
 if ($competitiveOverride.Contains('exec mr15')) {
