@@ -15,6 +15,7 @@ team "Team Vitality" t
 - `t`：将该阵容设置到 T。
 - 指令目前不支持简称。`team G2 ct` 会提示 `Unknown team: G2`，正确写法是 `team "G2 Esports" ct`。
 - Logo 代码是插件内部写入 `mp_teamlogo_1/2` 的值，不能代替完整队名作为 `team` 指令参数。
+- 服务器保持原始 Logo 文件名和标准 ID，不使用 `_opt` 别名。每张地图只把当前选中的两个队标加入客户端下载表，其余队标留在服务器上供后续换图或 `team` 指令选择。
 - 可用 `sm_validate_bots` 在服务器控制台检查阵容选手是否存在于 BOT 数据库。
 
 ## 已知数据问题
@@ -76,7 +77,7 @@ team "Team Vitality" t
 | 41 | Fake do Biru | `fdb` | hardzao、PKL、detr0ittJ、ckzao、Tuurtle |
 | 42 | FengDa Gaming | `feng` | p5p、3gl、Biuckmt、Trash、salmon |
 | 43 | Fire Flux Esports | `ff` | Cizzx、Quality、xEternaLxx、zemix、zer0UKY |
-| 44 | Fisher College | `fisher` | AlekS、ReFuZR、CrePoW、corn、TH0R |
+| 44 | Fisher College | `fishr` | AlekS、ReFuZR、CrePoW、corn、TH0R |
 | 45 | FlyQuest | `flyq` | INS、Vexite、nettik、jks、story |
 | 46 | FlyQuest RED | `flyqr` | BiBiAhn、emy、vanessa、marie、Fawx |
 | 47 | Fnatic | `fntc` | KRIMZ、fear、jambo、jackasmo、Br4tkO |
@@ -129,7 +130,7 @@ team "Team Vitality" t
 | 94 | Passion UA | `pass` | Kvem、JT、nicx、try、Senzu |
 | 95 | Playing Ducks | `pduc` | OneLion、MYS、Miku、frozeN、UN1TY |
 | 96 | QUAZAR | `qua` | gehji、kaiori、1zz、newt、Ne1XXX |
-| 97 | RUSTEC | `rustec` | Brilliance、jakekeS、supra、anttzz、youka |
+| 97 | RUSTEC | `rustc` | Brilliance、jakekeS、supra、anttzz、youka |
 | 98 | Rare Atom | `rar` | Summer、L1haNg、ChildKing、TiGeR、chengking |
 | 99 | Rebels Gaming | `reb` | Icarus、snapy、NOPEEj、TMKj、stadodo |
 | 100 | Rooster | `roos` | chelleos、ju1ces、rekonz、SkulL、ADK |
