@@ -67,6 +67,7 @@ connect 192.168.x.x:27016
 - `exec mr12`：MR12、MR3 加时、加时 `$10,000`、完整 CS2 经济；`exec mr15` 可完整恢复
 - CS2 模式可用 `!refund` 选择退款，或用 `!refund last` 退还最近一件仍符合条件的本回合未使用物品
 - 队标使用 CS:GO Legacy 原始 SVG 与标准 ID；每张地图仅向客户端下载当前两个队标，避免无 FastDL 时下载全部素材
+- BOT 启用可回滚战术调度：CT 标准防守、守包、回防、前压和堵点；T 默认进攻、Rush、分推、护包、掉包回收和下包后站位；双方按逐人装备分类协调起枪、发枪和捡枪；输入层仅抑制已入位原地跳，移动寻路、NAV 必需跳跃及道具回放不受限制
 
 部署前务必修改 `config/server.cfg` 中的 `rcon_password`。
 
@@ -81,6 +82,8 @@ LAN 真人以“IP＋昵称”生成稳定的合成 Steam2 身份。RankMe、计
 旧共享数据明确保留给 `James_Hotten`，该昵称固定使用 `STEAM_1:0:959533336`，换 IP 或换机器也不改变；部署后旧数据迁移到此身份。部署脚本会备份被绑定替换的第三方 SMX；详细行为和回退方式见 [docs/MODS.md](docs/MODS.md) 与 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
 
 BOT 队伍的完整指令名称、Logo 代码和选手阵容见 [docs/TEAMS.md](docs/TEAMS.md)。
+
+CT/T BOT 战术概率、调试命令、即时关闭与完整回滚见 [docs/CT_TACTICS.md](docs/CT_TACTICS.md)。
 
 不会上传：
 

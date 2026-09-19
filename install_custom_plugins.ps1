@@ -142,3 +142,4 @@ if ($agentsDriver -notin @("sqlite", "mysql")) {
 
 & (Join-Path $PSScriptRoot "mods\patch_agents_database.ps1") -PluginPath $agentsPlugin -BackupPath $agentsBackup -DatabaseDriver $agentsDriver
 & (Join-Path $PSScriptRoot "mods\patch_lan_identity_natives.ps1") -ServerDir $ServerDir
+& (Join-Path $PSScriptRoot "mods\install_ct_tactics.ps1") -ServerDir $ServerDir
