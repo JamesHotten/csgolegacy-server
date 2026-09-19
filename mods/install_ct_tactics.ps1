@@ -498,7 +498,8 @@ if (-not $text.Contains("BEGIN CT_TACTICS_BRIDGE")) {
 if ($text.Contains('BEGIN CT_TACTICS_BRIDGE') -and -not $text.Contains('BEGIN TACTICAL_NADE_PRIORITY')) {
     $priority = @(
         "`t// BEGIN TACTICAL_NADE_PRIORITY",
-        "`tif (GetClientTeam(iClient) == CS_TEAM_T)",
+        "`t// TACTICAL_NADE_PRIORITY_V2_PREPLANT_ONLY",
+        "`tif (GetClientTeam(iClient) == CS_TEAM_T && !g_bBombPlanted)",
         "`t{",
         "`t`tbool bLineupReplay = BotMimic_IsPlayerMimicing(iClient);",
         "`t`tif (!bLineupReplay && g_iDoingSmokeNum[iClient] != -1)",
@@ -525,6 +526,51 @@ if ($text.Contains('BEGIN CT_TACTICS_BRIDGE') -and -not $text.Contains('BEGIN TA
         ''
     ) -join $newline
     $text = Replace-Once $text "`tif (bHasTacticalOrder)" ($priority + "`tif (bHasTacticalOrder)") 'opening grenade priority'
+}
+
+# Recorded opening lineups are route-level actions: a bot may walk far away
+# before replaying one. Once C4 is planted they must never override post-plant
+# guard orders. Dynamic combat/denial throws remain handled by BetterBots.
+if ($text.Contains('BEGIN TACTICAL_NADE_PRIORITY') -and -not $text.Contains('TACTICAL_NADE_PRIORITY_V2_PREPLANT_ONLY')) {
+    $oldPriorityPattern = '(?ms)^\t// BEGIN TACTICAL_NADE_PRIORITY\r?\n.*?^\t// END TACTICAL_NADE_PRIORITY'
+    $priorityMatch = [regex]::Match($text, $oldPriorityPattern)
+    if (-not $priorityMatch.Success) {
+        throw 'Could not patch BetterBots (post-plant lineup priority): priority block was not found.'
+    }
+    $newPriority = $priorityMatch.Value.Replace(
+        "`t// BEGIN TACTICAL_NADE_PRIORITY" + $newline + "`tif (GetClientTeam(iClient) == CS_TEAM_T)",
+        "`t// BEGIN TACTICAL_NADE_PRIORITY" + $newline + "`t// TACTICAL_NADE_PRIORITY_V2_PREPLANT_ONLY" + $newline + "`tif (GetClientTeam(iClient) == CS_TEAM_T && !g_bBombPlanted)"
+    )
+    if ($newPriority -eq $priorityMatch.Value) {
+        throw 'Could not patch BetterBots (post-plant lineup priority): legacy T condition was not found.'
+    }
+    $text = Replace-Once $text $priorityMatch.Value $newPriority 'post-plant lineup priority'
+}
+
+if ($text.Contains('BEGIN CT_TACTICS_BRIDGE') -and -not $text.Contains('BEGIN T_POSTPLANT_LINEUP_CANCEL')) {
+    $plantCancel = @(
+        "`tg_bBombPlanted = true;",
+        '',
+        "`t// BEGIN T_POSTPLANT_LINEUP_CANCEL",
+        "`t// A planted bomb invalidates every recorded attack-lineup trip.",
+        "`t// Local combat and bomb-denial throws are intentionally untouched.",
+        "`tfor (int iClient = 1; iClient <= MaxClients; iClient++)",
+        "`t{",
+        "`t`tif (!IsValidClient(iClient) || !IsFakeClient(iClient) || GetClientTeam(iClient) != CS_TEAM_T)",
+        "`t`t`tcontinue;",
+        "`t`tif (BotMimic_IsPlayerMimicing(iClient))",
+        "`t`t`tBotMimic_StopPlayerMimic(iClient);",
+        "`t`tg_iDoingSmokeNum[iClient] = -1;",
+        "`t}",
+        "`t// END T_POSTPLANT_LINEUP_CANCEL"
+    ) -join $newline
+    $text = Replace-Once $text "`tg_bBombPlanted = true;" $plantCancel 'post-plant lineup cancellation'
+}
+
+$legacyGenericLineupSelection = 'if (!bHasTacticalOrder && g_iDoingSmokeNum[iClient] == -1 && fNow >= g_fNadeLineupCooldown[iClient])'
+$guardedGenericLineupSelection = 'if (!bHasTacticalOrder && !(g_bBombPlanted && GetClientTeam(iClient) == CS_TEAM_T) && g_iDoingSmokeNum[iClient] == -1 && fNow >= g_fNadeLineupCooldown[iClient])'
+if ($text.Contains($legacyGenericLineupSelection)) {
+    $text = Replace-Once $text $legacyGenericLineupSelection $guardedGenericLineupSelection 'post-plant generic lineup selection'
 }
 
 if ($text.Contains('g_bTacticalMoveIssued') -and -not $text.Contains('BEGIN TACTICAL_MOVEMENT_RESET')) {

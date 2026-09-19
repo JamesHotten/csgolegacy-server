@@ -253,17 +253,15 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
 
 public void Event_FreezeEnd(Event event, const char[] name, bool dontBroadcast)
 {
-    if (g_cvEnabled.BoolValue)
-        CreateTimer(0.1, Timer_PlanInitial, _, TIMER_FLAG_NO_MAPCHANGE);
-}
-
-public Action Timer_PlanInitial(Handle timer)
-{
     if (g_cvEnabled.BoolValue && RefreshGeometry() && NavMeshReady())
+    {
+        // Publish orders before the first live movement command. A delayed
+        // plan lets native BetterBots start toward a different site and then
+        // visibly reverse when the chosen attack is assigned.
         PlanInitialAttack();
+    }
     else
         DebugLog("Initial attack skipped: geometry or navmesh unavailable.");
-    return Plugin_Stop;
 }
 
 public void Event_Reset(Event event, const char[] name, bool dontBroadcast)
@@ -297,7 +295,14 @@ public void Event_BombPickup(Event event, const char[] name, bool dontBroadcast)
 public void Event_BombPlanted(Event event, const char[] name, bool dontBroadcast)
 {
     if (g_cvEnabled.BoolValue)
+    {
+        // Site-entry combat releases apply only to the attack. Reclaim every
+        // surviving T for the new post-plant plan and discard stale entry
+        // destinations while the planted-C4 entity becomes available.
+        ClearCombatReleases();
+        ClearOrders();
         CreateTimer(0.15, Timer_PlanPostPlant, _, TIMER_FLAG_NO_MAPCHANGE);
+    }
 }
 
 public Action Timer_PlanPostPlant(Handle timer)
@@ -405,7 +410,8 @@ void PlanAttackStage()
     else
         BuildAround(site, count - 1, 520.0, 950.0, true, dirX, dirY);
     FillMissingTargetsAt(count, g_tSpawn);
-    AssignTargets(bots, count, Route_Fastest, FindBombCarrier(), count);
+    int bombCarrier = FindBombCarrier();
+    AssignTargets(bots, count, Route_Fastest, bombCarrier, count);
     g_phase = TPhase_AttackStage;
     g_phaseStarted = GetGameTime();
     DebugLog("T attack staging started for %d bots.", count);
@@ -450,7 +456,8 @@ void PlanAttackCommit()
         if (g_targetCount < count) AppendProjectedTarget(otherSite);
     }
     FillMissingTargetsAt(count, site);
-    AssignTargets(bots, count, Route_Fastest, FindBombCarrier(), count);
+    int bombCarrier = FindBombCarrier();
+    AssignTargets(bots, count, Route_Fastest, bombCarrier, count);
     g_phase = TPhase_AttackCommit;
     g_phaseStarted = GetGameTime();
     DebugLog("Synchronized T attack committed with %d bots still available for orders.", count);
@@ -492,8 +499,13 @@ void AssignTargets(const int bots[MAXPLAYERS + 1], int botCount, RouteType route
     ClearOrders();
     bool used[MAXPLAYERS + 1];
     int firstTarget;
-    if (preferredClient > 0 && IsTBot(preferredClient) && !g_combatReleased[preferredClient] && targetLimit > 0)
+    if (preferredClient > 0 && IsTBot(preferredClient) && targetLimit > 0)
     {
+        // Contact during staging may release a BOT to native combat. The C4
+        // owner must nevertheless rejoin the committed main route; visible
+        // enemies still prevent movement in the BetterBots bridge and a new
+        // combat event can release this order again immediately.
+        g_combatReleased[preferredClient] = false;
         g_hasOrder[preferredClient] = true;
         CopyVector(g_targets[0], g_orderGoal[preferredClient]);
         if (postPlantAim) SetPostPlantLook(preferredClient, 0);
@@ -738,6 +750,12 @@ bool IsTBot(int client)
 
 int FindBombCarrier()
 {
+    // Prefer the player's inventory, which is authoritative even when the
+    // weapon entity owner field is in a short hand-off transition.
+    for (int client = 1; client <= MaxClients; client++)
+        if (IsTBot(client) && GetPlayerWeaponSlot(client, CS_SLOT_C4) != -1)
+            return client;
+
     int entity = -1;
     while ((entity = FindEntityByClassname(entity, "weapon_c4")) != -1)
     {

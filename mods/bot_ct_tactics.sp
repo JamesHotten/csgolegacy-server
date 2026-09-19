@@ -321,20 +321,16 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
 
 public void Event_FreezeEnd(Event event, const char[] name, bool dontBroadcast)
 {
-    if (g_cvEnabled.BoolValue)
-        CreateTimer(0.1, Timer_PlanInitial, _, TIMER_FLAG_NO_MAPCHANGE);
-}
-
-public Action Timer_PlanInitial(Handle timer)
-{
     if (!g_cvEnabled.BoolValue || !RefreshGeometry() || !NavMeshReady())
     {
         DebugLog("Initial plan skipped: geometry or navmesh unavailable.");
-        return Plugin_Stop;
+        return;
     }
 
+    // Publish orders in the same frame that movement is released. Delaying
+    // this allowed native BetterBots to choose a site first and visibly turn
+    // around when the tactical plan arrived 0.1 seconds later.
     PlanInitialDefense();
-    return Plugin_Stop;
 }
 
 public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast)
