@@ -94,6 +94,7 @@ bool g_attackContact;
 bool g_bombPlanted;
 float g_roundLiveStart;
 float g_lastCombatAt[MAXPLAYERS + 1];
+float g_nextAttackReviewAt;
 
 bool g_hasOrder[MAXPLAYERS + 1];
 bool g_hasLook[MAXPLAYERS + 1];
@@ -127,7 +128,7 @@ public void OnPluginStart()
 {
     g_cvEnabled = CreateConVar("sm_bot_t_tactics_enable", "1", "Enable the reversible T tactical director.", _, true, 0.0, true, 1.0);
     g_cvDebug = CreateConVar("sm_bot_t_tactics_debug", "0", "Log T tactical plans and assignments.", _, true, 0.0, true, 1.0);
-    g_cvInitialHold = CreateConVar("sm_bot_t_tactics_initial_hold", "28.0", "Maximum seconds to maintain the initial T attack.", _, true, 8.0, true, 60.0);
+    g_cvInitialHold = CreateConVar("sm_bot_t_tactics_initial_hold", "28.0", "Seconds before reviewing the committed T attack without dropping its orders.", _, true, 8.0, true, 60.0);
     g_cvSyncEnabled = CreateConVar("sm_bot_t_tactics_sync_enable", "1", "Stage before committing the T attack.", _, true, 0.0, true, 1.0);
     g_cvSyncStageMin = CreateConVar("sm_bot_t_tactics_sync_stage_min", "3.0", "Minimum staging time before a synchronized attack.", _, true, 0.0, true, 10.0);
     g_cvSyncStageTimeout = CreateConVar("sm_bot_t_tactics_sync_stage_timeout", "10.0", "Hard timeout before committing even when teammates are delayed.", _, true, 2.0, true, 20.0);
@@ -415,13 +416,43 @@ public Action Timer_Update(Handle timer)
             || (elapsed >= g_cvSyncStageMin.FloatValue && OrdersMeetReadyPercent(180.0, g_cvSyncMinReady.IntValue))
             || elapsed >= g_cvSyncStageTimeout.FloatValue))
         PlanAttackCommit();
-    else if (g_phase == TPhase_AttackCommit && elapsed >= g_cvInitialHold.FloatValue)
-        ResetDirector();
+    else if (g_phase == TPhase_AttackCommit && GetGameTime() >= g_nextAttackReviewAt)
+        ReviewAttackCommit();
     else if (g_phase == TPhase_RecoverBomb && FindLooseC4() == -1)
         ResetDirector();
     else if (g_phase == TPhase_PostPlant && elapsed >= g_cvPostPlantHold.FloatValue)
         ResetDirector();
     return Plugin_Continue;
+}
+
+void ReviewAttackCommit()
+{
+    int looseC4 = FindLooseC4();
+    if (looseC4 != -1)
+    {
+        GetEntPropVector(looseC4, Prop_Send, "m_vecOrigin", g_bombPosition);
+        PlanBombRecovery();
+        return;
+    }
+
+    // Combat temporarily releases a BOT from its route. Reissue only the
+    // carrier's site objective after a quiet interval; the other fighters
+    // keep native BetterBots control until their next tactical phase.
+    int carrier = FindBombCarrier();
+    if (IsTBot(carrier) && !g_hasOrder[carrier] && g_targetCount > 0
+        && GetGameTime() - g_lastCombatAt[carrier] >= 2.0)
+    {
+        g_combatReleased[carrier] = false;
+        g_hasOrder[carrier] = true;
+        CopyVector(g_targets[0], g_orderGoal[carrier]);
+        g_orderRoute[carrier] = view_as<int>(Route_Fastest);
+    }
+
+    int ready, ordered;
+    GetOrderProgress(180.0, ready, ordered);
+    g_nextAttackReviewAt = GetGameTime() + 5.0;
+    DebugLog("T attack reviewed: site=%s ordered=%d ready=%d carrier=%d.",
+        g_attackA ? "A" : "B", ordered, ready, carrier);
 }
 
 bool ShouldUrgentlyPlant()
@@ -601,6 +632,7 @@ void PlanAttackCommit()
     AssignTargets(bots, count, Route_Fastest, bombCarrier, count);
     g_phase = TPhase_AttackCommit;
     g_phaseStarted = GetGameTime();
+    g_nextAttackReviewAt = g_phaseStarted + g_cvInitialHold.FloatValue;
     DebugLog("Synchronized T attack committed with %d bots still available for orders.", count);
 }
 
@@ -932,7 +964,7 @@ void ClearOrders()
     }
 }
 void ClearCombatReleases() { for (int client = 1; client <= MaxClients; client++) g_combatReleased[client] = false; }
-void ResetDirector() { ClearOrders(); g_phase = TPhase_Idle; g_phaseStarted = 0.0; g_targetCount = 0; g_attackContact = false; }
+void ResetDirector() { ClearOrders(); g_phase = TPhase_Idle; g_phaseStarted = 0.0; g_nextAttackReviewAt = 0.0; g_targetCount = 0; g_attackContact = false; }
 
 void GetOrderProgress(float distanceLimit, int &ready, int &ordered)
 {
