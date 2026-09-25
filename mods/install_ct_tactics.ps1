@@ -567,6 +567,47 @@ if ($text.Contains('BEGIN CT_TACTICS_BRIDGE') -and -not $text.Contains('BEGIN T_
     $text = Replace-Once $text "`tg_bBombPlanted = true;" $plantCancel 'post-plant lineup cancellation'
 }
 
+# The planting animation is already a tactical phase: stop recorded opening
+# lineups at its start, then let the T director position the non-planters.
+if (-not $text.Contains('BEGIN T_PLANT_COVER_BRIDGE')) {
+    $text = Replace-Once $text 'g_bBombPlanted, g_bHalftimeSwitch' 'g_bBombPlanted, g_bTPlanting, g_bHalftimeSwitch' 'plant-cover state'
+    $text = Replace-Once $text 'HookEventEx("bomb_beginplant", OnBombBeginPlant);' `
+        ('HookEventEx("bomb_beginplant", OnBombBeginPlant);' + $newline + '    HookEventEx("bomb_abortplant", OnBombAbortPlant);') `
+        'plant abort hook'
+    $text = Replace-Once $text "`tg_bBombPlanted = false;`n`tg_fRoundStart = GetGameTime();".Replace("`n", $newline) `
+        "`tg_bBombPlanted = false;`n`tg_bTPlanting = false;`n`tg_fRoundStart = GetGameTime();".Replace("`n", $newline) `
+        'plant state round reset'
+    $text = Replace-Once $text "`tg_bBombPlanted = true;" `
+        ("`tg_bBombPlanted = true;" + $newline + "`tg_bTPlanting = false;") `
+        'plant state completion'
+    $text = Replace-Once $text 'public void OnBombBeginPlant(Event eEvent, const char[] szName, bool bDontBroadcast)' `
+        (@(
+            'public void OnBombAbortPlant(Event eEvent, const char[] szName, bool bDontBroadcast)',
+            '{',
+            "`tg_bTPlanting = false;",
+            '}',
+            '',
+            'public void OnBombBeginPlant(Event eEvent, const char[] szName, bool bDontBroadcast)'
+        ) -join $newline) 'plant abort handler'
+    $text = Replace-Once $text "`tfloat fPlanterPos[3];" `
+        (@(
+            "`t// BEGIN T_PLANT_COVER_BRIDGE",
+            "`tg_bTPlanting = GetClientTeam(iPlanter) == CS_TEAM_T;",
+            "`tif (g_bTPlanting)",
+            "`t{",
+            "`t`tfor (int iClient = 1; iClient <= MaxClients; iClient++)",
+            "`t`t{",
+            "`t`t`tif (!IsValidClient(iClient) || !IsFakeClient(iClient) || GetClientTeam(iClient) != CS_TEAM_T)",
+            "`t`t`t`tcontinue;",
+            "`t`t`tif (BotMimic_IsPlayerMimicing(iClient)) BotMimic_StopPlayerMimic(iClient);",
+            "`t`t`tg_iDoingSmokeNum[iClient] = -1;",
+            "`t`t}",
+            "`t}",
+            "`t// END T_PLANT_COVER_BRIDGE",
+            "`tfloat fPlanterPos[3];"
+        ) -join $newline) 'plant cover opening lineup cancellation'
+}
+
 $legacyGenericLineupSelection = 'if (!bHasTacticalOrder && g_iDoingSmokeNum[iClient] == -1 && fNow >= g_fNadeLineupCooldown[iClient])'
 $guardedGenericLineupSelection = 'if (!bHasTacticalOrder && !(g_bBombPlanted && GetClientTeam(iClient) == CS_TEAM_T) && g_iDoingSmokeNum[iClient] == -1 && fNow >= g_fNadeLineupCooldown[iClient])'
 if ($text.Contains($legacyGenericLineupSelection)) {
@@ -1176,6 +1217,93 @@ if (-not $text.Contains("BEGIN BOT_EQUIPMENT_BUY_STATE")) {
     $text = Replace-Once $text $oldBuyState $newBuyState 'per-player equipment buy state'
 }
 
+if ($text.Contains('BEGIN T_PLANT_COVER_BRIDGE')) {
+    if ($text.Contains('GetClientTeam(iClient) == CS_TEAM_T && !g_bBombPlanted)')) {
+        $text = Replace-Once $text 'GetClientTeam(iClient) == CS_TEAM_T && !g_bBombPlanted)' `
+            'GetClientTeam(iClient) == CS_TEAM_T && !g_bBombPlanted && !g_bTPlanting)' `
+            'plant-cover lineup priority'
+    }
+    if ($text.Contains('!(g_bBombPlanted && GetClientTeam(iClient) == CS_TEAM_T)')) {
+        $text = Replace-Once $text '!(g_bBombPlanted && GetClientTeam(iClient) == CS_TEAM_T)' `
+            '!((g_bBombPlanted || g_bTPlanting) && GetClientTeam(iClient) == CS_TEAM_T)' `
+            'plant-cover generic lineup guard'
+    }
+    if ($text.Contains('GetClientTeam(iClient) == CS_TEAM_T && g_bBombPlanted && bHasTacticalAim')) {
+        $text = Replace-Once $text 'GetClientTeam(iClient) == CS_TEAM_T && g_bBombPlanted && bHasTacticalAim' `
+            'GetClientTeam(iClient) == CS_TEAM_T && (g_bBombPlanted || g_bTPlanting) && bHasTacticalAim' `
+            'plant-cover tactical hold'
+    }
+}
+
+# Freeze the team's buy call before any individual purchase changes cash.
+# Keep the CSGO engine responsible for the actual halftime side switch.
+if (-not $text.Contains('BEGIN BOT_ROUND_BUY_PLAN')) {
+    $text = Replace-Once $text 'g_iRoundsPlayed == iRoundsBeforeHalftime - 1' `
+        'g_iCurrentRound == iRoundsBeforeHalftime - 1' 'last pre-halftime round detection'
+    $text = Replace-Once $text "`tg_iAvgMoneyCT = GetTeamAverageMoney(CS_TEAM_CT);" `
+        ("`tg_iAvgMoneyCT = GetTeamAverageMoney(CS_TEAM_CT);" + $newline + `
+        "`t// BEGIN BOT_ROUND_BUY_PLAN" + $newline + `
+        "`tBotEquipment_BeginRound(IsResetRound(), g_bForceT, g_bForceCT);" + $newline + `
+        "`t// END BOT_ROUND_BUY_PLAN") 'fixed per-round team buy plan'
+    $text = Replace-Once $text 'BotEquipmentTier eTeamBuy = BotEquipment_ClassifyTeam(iTeam);' `
+        'BotEquipmentTier eTeamBuy = BotEquipment_GetRoundPlan(iTeam);' 'buy command round plan'
+    $text = Replace-Once $text 'bool bIsFullSave = bIsEco && ePlayerBuy == BotEquip_Eco;' `
+        'bool bIsFullSave = bIsEco && GetPlayerWeaponSlot(iClient, CS_SLOT_PRIMARY) == -1;' 'team eco save discipline'
+    $text = Replace-Once $text 'if (iArmor < 50 || !bHasHelmet)' `
+        'if (iArmor == 0 || !bHasHelmet)' 'avoid repairing damaged full armor'
+    $text = Replace-Once $text 'bool bOwnsPrimary = GetPlayerWeaponSlot(iClient, CS_SLOT_PRIMARY) != -1;' `
+        (@(
+            'if (strcmp(szWeapon, "defuser") != 0 && GetEntProp(iClient, Prop_Data, "m_ArmorValue") > 0',
+            '            && view_as<bool>(GetEntProp(iClient, Prop_Send, "m_bHasHelmet")))',
+            '            return Plugin_Handled;',
+            '        bool bOwnsPrimary = GetPlayerWeaponSlot(iClient, CS_SLOT_PRIMARY) != -1;'
+        ) -join $newline) 'full armor damage buy guard'
+    $text = Replace-Once $text 'else if (!IsTeamForcing(iTeam) && ((((iTeam == CS_TEAM_T) ? g_iAvgMoneyT : g_iAvgMoneyCT) < 3000 && iAccount > 2000 && !bHasPrimary) || iFriendsWithPrimary >= 1))' `
+        'else if (BotEquipment_GetRoundPlan(iTeam) == BotEquip_Force && !IsTeamForcing(iTeam) && !bHasPrimary && iAccount > 2000)' `
+        'force-buy pistol supplement'
+    $forceBuyAnchor = @(
+        "`tif (bHasPrimary || (iFriendsWithPrimary >= 1 && !bDefaultPistol))"
+    ) -join $newline
+    $forceBuy = @(
+        "`t// On a final/side-switch round there is no future economy to save for.",
+        "`tif (IsTeamForcing(iTeam) && !bHasPrimary)",
+        "`t{",
+        "`t`tint iRiflePrice = BotEquipment_GetCheapestRiflePrice(i);",
+        "`t`tif (iAccount >= iRiflePrice)",
+        "`t`t`tFakeClientCommand(i, iTeam == CS_TEAM_T ? `"buy galilar`" : `"buy famas`");",
+        "`t`telse if (iAccount >= (iTeam == CS_TEAM_T ? CS_GetWeaponPrice(i, CSWeapon_MAC10) : CS_GetWeaponPrice(i, CSWeapon_MP9)))",
+        "`t`t`tFakeClientCommand(i, iTeam == CS_TEAM_T ? `"buy mac10`" : `"buy mp9`");",
+        "`t`telse if (iArmor == 0 && iAccount >= 650)",
+        "`t`t`tFakeClientCommand(i, `"buy vest`");",
+        "`t`telse if (bDefaultPistol && iAccount >= 700)",
+        "`t`t`tFakeClientCommand(i, `"buy deagle`");",
+        "`t`tcontinue;",
+        "`t}",
+        '',
+        $forceBuyAnchor
+    ) -join $newline
+    $text = Replace-Once $text $forceBuyAnchor $forceBuy 'final-round buy-out'
+}
+if ($text.Contains('else if (iAccount >= 700)' + $newline + "`t`t`tFakeClientCommand(i, `"buy deagle`");")) {
+    $text = Replace-Once $text 'else if (iAccount >= 700)' `
+        'else if (bDefaultPistol && iAccount >= 700)' 'avoid repeated final-round pistol buys'
+}
+if ($text.Contains('if (bHasPrimary || (iFriendsWithPrimary >= 1 && !bDefaultPistol))')) {
+    $text = Replace-Once $text 'if (bHasPrimary || (iFriendsWithPrimary >= 1 && !bDefaultPistol))' `
+        'if (bHasPrimary || (BotEquipment_GetRoundPlan(iTeam) != BotEquip_Eco && iFriendsWithPrimary >= 1 && !bDefaultPistol))' `
+        'no utility drain during a team eco'
+}
+if ($text.Contains('int g_iCurrentRound, g_iRoundsPlayed, g_iCTScore, g_iTScore;')) {
+    $text = Replace-Once $text 'int g_iCurrentRound, g_iRoundsPlayed, g_iCTScore, g_iTScore;' `
+        'int g_iCurrentRound, g_iCTScore, g_iTScore;' 'unused previous-round state'
+    $text = Replace-Once $text '    g_iRoundsPlayed = GameRules_GetProp("m_totalRoundsPlayed");' `
+        '    // Current round number is read directly in OnRoundPreStart.' 'unused previous-round assignment'
+}
+if ($text.Contains('BotEquipmentTier ePlayerBuy = BotEquipment_ClassifyPlayer(iClient);')) {
+    $text = Replace-Once $text "`tBotEquipmentTier ePlayerBuy = BotEquipment_ClassifyPlayer(iClient);" '' `
+        'unused transient player buy state'
+}
+
 # An unarmed bot may briefly leave a tactical route to collect a visible primary;
 # equipped bots remain fully governed by the CT/T director.
 $oldPickupGuard = 'if (!bHasTacticalOrder && g_bIsProBot[iClient] && !g_bBombPlanted'
@@ -1344,6 +1472,36 @@ if ($text.Contains('BEGIN BOT_JUMP_GUARD') -and -not $text.Contains('BOT_JUMP_GU
         ""
     ) -join $newline
     $text = Replace-RegexOnce $text $oldJumpGuardPattern $newJumpGuard 'settled-only bot jump guard upgrade'
+}
+
+if ($text.Contains('BEGIN TACTICAL_NADE_PRIORITY') -and -not $text.Contains('BEGIN T_URGENT_OBJECTIVE_PRIORITY')) {
+    $text = Replace-Once $text 'native bool BotTTactics_GetAim(int client, float lookAt[3]);' `
+        ('native bool BotTTactics_GetAim(int client, float lookAt[3]);' + $newline + 'native bool BotTTactics_IsUrgentPlant();') `
+        'urgent T objective native declaration'
+    $text = Replace-Once $text 'MarkNativeAsOptional("BotTTactics_GetAim");' `
+        ('MarkNativeAsOptional("BotTTactics_GetAim");' + $newline + '    MarkNativeAsOptional("BotTTactics_IsUrgentPlant");') `
+        'optional urgent T objective native'
+    $priorityAnchor = "`t// BEGIN TACTICAL_NADE_PRIORITY"
+    $urgentPriority = @(
+        "`t// BEGIN T_URGENT_OBJECTIVE_PRIORITY",
+        "`tbool bTPlantUrgent = GetClientTeam(iClient) == CS_TEAM_T",
+        "`t`t&& GetFeatureStatus(FeatureType_Native, `"BotTTactics_IsUrgentPlant`") == FeatureStatus_Available",
+        "`t`t&& BotTTactics_IsUrgentPlant();",
+        "`tif (bTPlantUrgent)",
+        "`t{",
+        "`t`tif (BotMimic_IsPlayerMimicing(iClient)) BotMimic_StopPlayerMimic(iClient);",
+        "`t`tg_iDoingSmokeNum[iClient] = -1;",
+        "`t}",
+        "`t// END T_URGENT_OBJECTIVE_PRIORITY",
+        $priorityAnchor
+    ) -join $newline
+    $text = Replace-Once $text $priorityAnchor $urgentPriority 'urgent T lineup cancellation'
+    $text = Replace-Once $text 'GetClientTeam(iClient) == CS_TEAM_T && !g_bBombPlanted && !g_bTPlanting)' `
+        'GetClientTeam(iClient) == CS_TEAM_T && !g_bBombPlanted && !g_bTPlanting && !bTPlantUrgent)' `
+        'urgent T lineup priority guard'
+    $text = Replace-Once $text '!((g_bBombPlanted || g_bTPlanting) && GetClientTeam(iClient) == CS_TEAM_T)' `
+        '!((g_bBombPlanted || g_bTPlanting || bTPlantUrgent) && GetClientTeam(iClient) == CS_TEAM_T)' `
+        'urgent T generic lineup guard'
 }
 
 $candidateBotSource = Join-Path $buildDir "bot_stuff.sp"

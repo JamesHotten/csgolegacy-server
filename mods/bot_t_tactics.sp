@@ -24,6 +24,8 @@ enum TPhase
     TPhase_Idle = 0,
     TPhase_AttackStage,
     TPhase_AttackCommit,
+    TPhase_UrgentPlant,
+    TPhase_PlantCover,
     TPhase_RecoverBomb,
     TPhase_PostPlant
 };
@@ -74,6 +76,8 @@ ConVar g_cvForceRushChance;
 ConVar g_cvForceSplitChance;
 ConVar g_cvEcoRushChance;
 ConVar g_cvEcoSplitChance;
+ConVar g_cvPlantUrgency;
+ConVar g_cvRoundTimeDefuse;
 
 TPhase g_phase = TPhase_Idle;
 TBuyState g_buyState = TBuy_Full;
@@ -87,6 +91,9 @@ float g_bombPosition[3];
 bool g_geometryReady;
 bool g_attackA;
 bool g_attackContact;
+bool g_bombPlanted;
+float g_roundLiveStart;
+float g_lastCombatAt[MAXPLAYERS + 1];
 
 bool g_hasOrder[MAXPLAYERS + 1];
 bool g_hasLook[MAXPLAYERS + 1];
@@ -106,6 +113,7 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     CreateNative("BotTTactics_GetOrder", Native_GetOrder);
     CreateNative("BotTTactics_GetAim", Native_GetAim);
     CreateNative("BotTTactics_ShouldHoldStage", Native_ShouldHoldStage);
+    CreateNative("BotTTactics_IsUrgentPlant", Native_IsUrgentPlant);
     MarkNativeAsOptional("NavMesh_Exists");
     MarkNativeAsOptional("NavMesh_GetNearestArea");
     MarkNativeAsOptional("NavMesh_CollectSurroundingAreas");
@@ -132,6 +140,8 @@ public void OnPluginStart()
     g_cvForceSplitChance = CreateConVar("sm_bot_t_force_split_chance", "30", "Force-buy chance for a split attack.", _, true, 0.0, true, 100.0);
     g_cvEcoRushChance = CreateConVar("sm_bot_t_eco_rush_chance", "65", "Eco chance for a site rush.", _, true, 0.0, true, 100.0);
     g_cvEcoSplitChance = CreateConVar("sm_bot_t_eco_split_chance", "10", "Eco chance for a split attack.", _, true, 0.0, true, 100.0);
+    g_cvPlantUrgency = CreateConVar("sm_bot_t_plant_urgency_seconds", "40.0", "Remaining seconds at which the bomb carrier and escort take the direct plant route.", _, true, 15.0, true, 80.0);
+    g_cvRoundTimeDefuse = FindConVar("mp_roundtime_defuse");
 
     g_cvEnabled.AddChangeHook(OnEnabledChanged);
     AutoExecConfig(true, "bot_t_tactics");
@@ -140,6 +150,8 @@ public void OnPluginStart()
     HookEvent("round_end", Event_Reset, EventHookMode_PostNoCopy);
     HookEvent("bomb_dropped", Event_BombDropped, EventHookMode_PostNoCopy);
     HookEvent("bomb_pickup", Event_BombPickup, EventHookMode_PostNoCopy);
+    HookEvent("bomb_beginplant", Event_BombBeginPlant, EventHookMode_Post);
+    HookEvent("bomb_abortplant", Event_BombAbortPlant, EventHookMode_Post);
     HookEvent("bomb_planted", Event_BombPlanted, EventHookMode_PostNoCopy);
     HookEvent("bomb_defused", Event_Reset, EventHookMode_PostNoCopy);
     HookEvent("bomb_exploded", Event_Reset, EventHookMode_PostNoCopy);
@@ -156,6 +168,8 @@ public void OnMapStart()
     ResetDirector();
     ClearCombatReleases();
     g_geometryReady = false;
+    g_roundLiveStart = 0.0;
+    g_bombPlanted = false;
 }
 
 public void OnClientPutInServer(int client)
@@ -186,6 +200,11 @@ public any Native_ShouldHoldStage(Handle plugin, int numParams)
     return g_cvEnabled.BoolValue && g_phase == TPhase_AttackStage
         && client >= 1 && client <= MaxClients && g_hasOrder[client]
         && !g_combatReleased[client] && IsTBot(client);
+}
+
+public any Native_IsUrgentPlant(Handle plugin, int numParams)
+{
+    return g_cvEnabled.BoolValue && g_phase == TPhase_UrgentPlant;
 }
 
 public any Native_GetAim(Handle plugin, int numParams)
@@ -249,10 +268,15 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     ResetDirector();
     ClearCombatReleases();
     g_attackContact = false;
+    g_bombPlanted = false;
+    g_roundLiveStart = 0.0;
+    for (int client = 1; client <= MaxClients; client++)
+        g_lastCombatAt[client] = 0.0;
 }
 
 public void Event_FreezeEnd(Event event, const char[] name, bool dontBroadcast)
 {
+    g_roundLiveStart = GetGameTime();
     if (g_cvEnabled.BoolValue && RefreshGeometry() && NavMeshReady())
     {
         // Publish orders before the first live movement command. A delayed
@@ -267,6 +291,7 @@ public void Event_FreezeEnd(Event event, const char[] name, bool dontBroadcast)
 public void Event_Reset(Event event, const char[] name, bool dontBroadcast)
 {
     ResetDirector();
+    g_roundLiveStart = 0.0;
 }
 
 public void Event_BombDropped(Event event, const char[] name, bool dontBroadcast)
@@ -292,8 +317,32 @@ public void Event_BombPickup(Event event, const char[] name, bool dontBroadcast)
         ResetDirector();
 }
 
+public void Event_BombBeginPlant(Event event, const char[] name, bool dontBroadcast)
+{
+    if (!g_cvEnabled.BoolValue || g_bombPlanted || !NavMeshReady())
+        return;
+    int planter = GetClientOfUserId(event.GetInt("userid"));
+    if (planter < 1 || !IsClientInGame(planter) || GetClientTeam(planter) != CS_TEAM_T)
+        return;
+    float position[3];
+    GetClientAbsOrigin(planter, position);
+    PlanPlantCover(planter, position);
+}
+
+public void Event_BombAbortPlant(Event event, const char[] name, bool dontBroadcast)
+{
+    if (g_phase == TPhase_PlantCover && !g_bombPlanted)
+    {
+        if (FindBombCarrier() != 0)
+            PlanUrgentPlant();
+        else
+            ResetDirector();
+    }
+}
+
 public void Event_BombPlanted(Event event, const char[] name, bool dontBroadcast)
 {
+    g_bombPlanted = true;
     if (g_cvEnabled.BoolValue)
     {
         // Site-entry combat releases apply only to the attack. Reclaim every
@@ -319,6 +368,8 @@ public Action Timer_PlanPostPlant(Handle timer)
 public void Event_Contact(Event event, const char[] name, bool dontBroadcast)
 {
     int client = GetClientOfUserId(event.GetInt("userid"));
+    if (client >= 1 && client <= MaxClients)
+        g_lastCombatAt[client] = GetGameTime();
     if (g_phase == TPhase_AttackStage && IsTBot(client))
         g_attackContact = true;
     ReleaseOrder(client, "weapon contact");
@@ -328,6 +379,8 @@ public void Event_PlayerHurt(Event event, const char[] name, bool dontBroadcast)
 {
     int victim = GetClientOfUserId(event.GetInt("userid"));
     int attacker = GetClientOfUserId(event.GetInt("attacker"));
+    if (victim >= 1 && victim <= MaxClients) g_lastCombatAt[victim] = GetGameTime();
+    if (attacker >= 1 && attacker <= MaxClients) g_lastCombatAt[attacker] = GetGameTime();
     if (g_phase == TPhase_AttackStage && (IsTBot(victim) || IsTBot(attacker)))
         g_attackContact = true;
     ReleaseOrder(victim, "hurt");
@@ -347,7 +400,14 @@ public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast
 
 public Action Timer_Update(Handle timer)
 {
-    if (!g_cvEnabled.BoolValue || g_phase == TPhase_Idle)
+    if (!g_cvEnabled.BoolValue)
+        return Plugin_Continue;
+    if (g_roundLiveStart > 0.0 && !g_bombPlanted && g_phase != TPhase_PlantCover
+        && g_phase != TPhase_RecoverBomb && g_phase != TPhase_UrgentPlant && ShouldUrgentlyPlant())
+        PlanUrgentPlant();
+    if (g_phase == TPhase_UrgentPlant)
+        RefreshUrgentOrders();
+    if (g_phase == TPhase_Idle)
         return Plugin_Continue;
     float elapsed = GetGameTime() - g_phaseStarted;
     if (g_phase == TPhase_AttackStage
@@ -362,6 +422,87 @@ public Action Timer_Update(Handle timer)
     else if (g_phase == TPhase_PostPlant && elapsed >= g_cvPostPlantHold.FloatValue)
         ResetDirector();
     return Plugin_Continue;
+}
+
+bool ShouldUrgentlyPlant()
+{
+    if (FindBombCarrier() == 0)
+        return false;
+    int aliveT, aliveCT;
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!IsClientInGame(client) || !IsPlayerAlive(client))
+            continue;
+        if (GetClientTeam(client) == CS_TEAM_T) aliveT++;
+        else if (GetClientTeam(client) == CS_TEAM_CT) aliveCT++;
+    }
+    if (aliveT <= 2 && aliveCT <= 2)
+        return true;
+    if (g_cvRoundTimeDefuse == null)
+        return false;
+    return g_cvRoundTimeDefuse.FloatValue * 60.0 - (GetGameTime() - g_roundLiveStart)
+        <= g_cvPlantUrgency.FloatValue;
+}
+
+void PlanUrgentPlant()
+{
+    int carrier = FindBombCarrier();
+    if (carrier == 0 || !RefreshGeometry() || !NavMeshReady())
+        return;
+    int bots[MAXPLAYERS + 1];
+    int count = CollectTBots(bots);
+    if (count == 0)
+        return;
+    float carrierPos[3];
+    GetClientAbsOrigin(carrier, carrierPos);
+    float chosenDistance = Distance2D(carrierPos, g_attackA ? g_siteA : g_siteB);
+    float otherDistance = Distance2D(carrierPos, g_attackA ? g_siteB : g_siteA);
+    if (otherDistance + 500.0 < chosenDistance)
+        g_attackA = !g_attackA;
+    float site[3];
+    CopyVector(g_attackA ? g_siteA : g_siteB, site);
+    float dirX = g_tSpawn[0] - site[0];
+    float dirY = g_tSpawn[1] - site[1];
+    Normalize2D(dirX, dirY);
+    g_targetCount = 0;
+    AppendProjectedTarget(site);
+    BuildAround(site, count - 1, 180.0, 420.0, true, dirX, dirY);
+    FillMissingTargetsAt(count, site);
+    ClearCombatReleases();
+    AssignTargets(bots, count, Route_Fastest, carrier, count);
+    g_phase = TPhase_UrgentPlant;
+    g_phaseStarted = GetGameTime();
+    DebugLog("Urgent plant assigned: carrier=%N site=%s T bots=%d.", carrier, g_attackA ? "A" : "B", count);
+}
+
+void RefreshUrgentOrders()
+{
+    int carrier = FindBombCarrier();
+    if (!IsTBot(carrier) || g_targetCount == 0)
+        return;
+    if (!g_hasOrder[carrier] && GetGameTime() - g_lastCombatAt[carrier] >= 2.0)
+    {
+        g_combatReleased[carrier] = false;
+        g_hasOrder[carrier] = true;
+        CopyVector(g_targets[0], g_orderGoal[carrier]);
+        g_orderRoute[carrier] = view_as<int>(Route_Fastest);
+    }
+}
+
+void PlanPlantCover(int planter, const float position[3])
+{
+    int bots[MAXPLAYERS + 1], count;
+    for (int client = 1; client <= MaxClients; client++)
+        if (IsTBot(client) && client != planter)
+            bots[count++] = client;
+    g_targetCount = 0;
+    BuildAround(position, count, 180.0, 560.0, false, 0.0, 0.0);
+    FillMissingTargetsAt(count, position);
+    ClearCombatReleases();
+    AssignTargets(bots, count, Route_Safest, 0, count, true);
+    g_phase = TPhase_PlantCover;
+    g_phaseStarted = GetGameTime();
+    DebugLog("Plant cover assigned for %d T bots.", count);
 }
 
 void PlanInitialAttack()
@@ -843,7 +984,7 @@ void CopyVector(const float source[3], float destination[3])
 
 void GetPhaseName(TPhase phase, char[] buffer, int length)
 {
-    switch (phase) { case TPhase_AttackStage: strcopy(buffer, length, "attack-stage"); case TPhase_AttackCommit: strcopy(buffer, length, "attack-commit"); case TPhase_RecoverBomb: strcopy(buffer, length, "recover-c4"); case TPhase_PostPlant: strcopy(buffer, length, "post-plant"); default: strcopy(buffer, length, "idle"); }
+    switch (phase) { case TPhase_AttackStage: strcopy(buffer, length, "attack-stage"); case TPhase_AttackCommit: strcopy(buffer, length, "attack-commit"); case TPhase_UrgentPlant: strcopy(buffer, length, "urgent-plant"); case TPhase_PlantCover: strcopy(buffer, length, "plant-cover"); case TPhase_RecoverBomb: strcopy(buffer, length, "recover-c4"); case TPhase_PostPlant: strcopy(buffer, length, "post-plant"); default: strcopy(buffer, length, "idle"); }
 }
 
 void GetBuyName(TBuyState buy, char[] buffer, int length)

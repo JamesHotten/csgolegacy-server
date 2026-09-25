@@ -12,6 +12,7 @@ char g_BTR_TTeam[BTR_TEAM_NAME_MAX];
 bool g_BTR_RebuildPending;
 bool g_BTR_PhaseCheckActive;
 float g_BTR_PhaseCheckUntil;
+int g_BTR_CTSlot = 1;
 
 void BotTeams_OnPluginStart()
 {
@@ -23,6 +24,7 @@ void BotTeams_OnPluginStart()
 
 void BotTeams_OnMapStart()
 {
+    g_BTR_CTSlot = 1;
     g_BTR_CTTeam[0] = '\0';
     g_BTR_TTeam[0] = '\0';
     g_BTR_RebuildPending = false;
@@ -236,13 +238,14 @@ bool BotTeams_MaybeFollowSwappedSides()
     int stayed = ctStayedCT + tStayedT;
     bool ctAccountedFor = ctMovedToT > 0 || (g_BTR_PhaseCheckActive && BotTeams_CountHumans(CS_TEAM_T) >= BTR_ROSTER_SIZE);
     bool tAccountedFor = tMovedToCT > 0 || (g_BTR_PhaseCheckActive && BotTeams_CountHumans(CS_TEAM_CT) >= BTR_ROSTER_SIZE);
-    if (moved < 3 || moved <= stayed || !ctAccountedFor || !tAccountedFor)
+    if (moved == 0 || moved <= stayed || !ctAccountedFor || !tAccountedFor)
         return false;
 
     char oldCT[BTR_TEAM_NAME_MAX];
     strcopy(oldCT, sizeof(oldCT), g_BTR_CTTeam);
     strcopy(g_BTR_CTTeam, sizeof(g_BTR_CTTeam), g_BTR_TTeam);
     strcopy(g_BTR_TTeam, sizeof(g_BTR_TTeam), oldCT);
+    g_BTR_CTSlot = 3 - g_BTR_CTSlot;
     g_BTR_PhaseCheckActive = false;
     LogMessage("BOT rosters followed real side swap: CT=%s, T=%s; preserving %d switched BOTs.",
         g_BTR_CTTeam, g_BTR_TTeam, moved);
@@ -260,6 +263,11 @@ void BotTeams_RebuildAll()
     BotTeams_QueueRoster(CS_TEAM_T, g_BTR_TTeam);
     ServerExecute();
     BotTeams_ApplyQuota();
+}
+
+int BotTeams_SlotForSide(int side)
+{
+    return side == CS_TEAM_CT ? g_BTR_CTSlot : 3 - g_BTR_CTSlot;
 }
 
 void BotTeams_RebuildSide(int side)
@@ -354,7 +362,7 @@ void BotTeams_ReconcileSide(int side)
     BotTeams_ApplyQuota();
 
     if (logo[0] != '\0')
-        ServerCommand("mp_teamlogo_%d \"%s\"", side == CS_TEAM_CT ? 1 : 2, logo);
+        ServerCommand("mp_teamlogo_%d \"%s\"", BotTeams_SlotForSide(side), logo);
 }
 
 void BotTeams_QueueRoster(int side, const char[] teamName)
@@ -382,7 +390,7 @@ void BotTeams_QueueRoster(int side, const char[] teamName)
     }
 
     if (logo[0] != '\0')
-        ServerCommand("mp_teamlogo_%d \"%s\"", side == CS_TEAM_CT ? 1 : 2, logo);
+        ServerCommand("mp_teamlogo_%d \"%s\"", BotTeams_SlotForSide(side), logo);
 }
 
 int BotTeams_CountHumans(int side)

@@ -14,11 +14,11 @@ int BotEquipment_GetArmorReserve(int client)
 {
     int armor = GetEntProp(client, Prop_Data, "m_ArmorValue");
     bool helmet = view_as<bool>(GetEntProp(client, Prop_Send, "m_bHasHelmet"));
-    if (armor >= 50 && helmet)
+    if (armor > 0 && helmet)
         return 0;
-    if (armor >= 50)
+    if (armor > 0)
         return 350;
-    return helmet ? 650 : 1000;
+    return 1000;
 }
 
 int BotEquipment_GetCheapestRiflePrice(int client)
@@ -35,16 +35,17 @@ BotEquipmentTier BotEquipment_ClassifyPlayer(int client)
     bool hasPrimary = primary != -1;
     int armor = GetEntProp(client, Prop_Data, "m_ArmorValue");
     bool helmet = view_as<bool>(GetEntProp(client, Prop_Send, "m_bHasHelmet"));
+    int money = GetEntProp(client, Prop_Send, "m_iAccount");
     if (hasPrimary)
     {
         CSWeaponID weapon = CS_ItemDefIndexToID(GetEntProp(primary, Prop_Send, "m_iItemDefinitionIndex"));
         int weaponPrice = weapon == CSWeapon_NONE ? 0 : CS_GetWeaponPrice(client, weapon);
-        if (weaponPrice >= BotEquipment_GetCheapestRiflePrice(client) && armor >= 50 && helmet)
+        if (weaponPrice >= BotEquipment_GetCheapestRiflePrice(client)
+            && ((armor > 0 && helmet) || money >= BotEquipment_GetArmorReserve(client)))
             return BotEquip_Full;
         return BotEquip_Force;
     }
 
-    int money = GetEntProp(client, Prop_Send, "m_iAccount");
     int rifleAndArmor = BotEquipment_GetCheapestRiflePrice(client) + BotEquipment_GetArmorReserve(client);
     if (money >= rifleAndArmor)
         return BotEquip_Full;
@@ -70,14 +71,40 @@ BotEquipmentTier BotEquipment_ClassifyTeam(int team)
             forceOrBetter++;
     }
 
-    if (players == 0 || full * 2 >= players)
+    if (players == 0)
+        return BotEquip_Eco;
+    if (full >= 4)
         return BotEquip_Full;
-    if (forceOrBetter * 2 >= players)
+    if (forceOrBetter >= 3)
         return BotEquip_Force;
     return BotEquip_Eco;
 }
 
 #if defined BOT_EQUIPMENT_CORE
+BotEquipmentTier g_BotEquipmentRoundPlan[4];
+BotEquipmentTier g_BotEquipmentPreviousPlan[4];
+
+void BotEquipment_BeginRound(bool resetRound, bool forceT, bool forceCT)
+{
+    for (int team = CS_TEAM_T; team <= CS_TEAM_CT; team++)
+    {
+        BotEquipmentTier plan = BotEquipment_ClassifyTeam(team);
+        if (resetRound || (team == CS_TEAM_T ? forceT : forceCT))
+            plan = BotEquip_Full;
+        else if (plan == BotEquip_Force && g_BotEquipmentPreviousPlan[team] == BotEquip_Force)
+            plan = BotEquip_Eco;
+        g_BotEquipmentRoundPlan[team] = plan;
+        g_BotEquipmentPreviousPlan[team] = plan;
+    }
+}
+
+BotEquipmentTier BotEquipment_GetRoundPlan(int team)
+{
+    if (team != CS_TEAM_T && team != CS_TEAM_CT)
+        return BotEquip_Eco;
+    return g_BotEquipmentRoundPlan[team];
+}
+
 bool BotEquipment_CanSelfBuyPrimary(int client)
 {
     if (GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY) != -1)
@@ -88,7 +115,7 @@ bool BotEquipment_CanSelfBuyPrimary(int client)
 
 bool BotEquipment_CanDonateWeapon(int client, int replacementPrice)
 {
-    if (BotEquipment_ClassifyTeam(GetClientTeam(client)) == BotEquip_Eco)
+    if (BotEquipment_GetRoundPlan(GetClientTeam(client)) == BotEquip_Eco)
         return false;
 
     int reserve = BotEquipment_GetArmorReserve(client);
@@ -110,6 +137,8 @@ int BotEquipment_GetRecipientPriority(int client)
 
 void BotEquipment_OnPluginStart()
 {
+    g_BotEquipmentRoundPlan[CS_TEAM_T] = BotEquip_Full;
+    g_BotEquipmentRoundPlan[CS_TEAM_CT] = BotEquip_Full;
     RegConsoleCmd("sm_bot_equipment_status", BotEquipment_CommandStatus);
 }
 
@@ -138,7 +167,7 @@ public Action BotEquipment_CommandStatus(int client, int args)
         }
         ReplyToCommand(client, "[BotEquipment] %s full=%d force=%d eco=%d unarmed=%d donors=%d team_state=%d",
             team == CS_TEAM_T ? "T" : "CT", full, force, eco, unarmed, eligibleDonors,
-            view_as<int>(BotEquipment_ClassifyTeam(team)));
+            view_as<int>(BotEquipment_GetRoundPlan(team)));
     }
     return Plugin_Handled;
 }

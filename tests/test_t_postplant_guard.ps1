@@ -21,8 +21,8 @@ if (-not $bombPlanted.Contains('BEGIN T_POSTPLANT_LINEUP_CANCEL') -or
 
 $afterPriority = $core.Substring($core.IndexOf('// END TACTICAL_NADE_PRIORITY'))
 $genericSelection = [regex]::Match($afterPriority, '(?m)^\s*if \(!bHasTacticalOrder && .*g_iDoingSmokeNum\[iClient\] == -1 && fNow >= g_fNadeLineupCooldown\[iClient\].*$').Value
-if (-not $genericSelection.Contains('!(g_bBombPlanted && GetClientTeam(iClient) == CS_TEAM_T)')) {
-    throw 'Generic lineup selection must not create a new travel order for a post-plant T.'
+if (-not $genericSelection.Contains('!((g_bBombPlanted || g_bTPlanting || bTPlantUrgent) && GetClientTeam(iClient) == CS_TEAM_T)')) {
+    throw 'Generic lineup selection must not create a new travel order during a plant or post-plant.'
 }
 
 $directorPlant = [regex]::Match($director, '(?s)public void Event_BombPlanted\(.*?\r?\n}').Value

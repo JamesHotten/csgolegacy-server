@@ -30,12 +30,12 @@ void BotPurchase_EnsureArmorBeforePrimary(int client, const char[] weapon, bool 
 
     int armor = GetEntProp(client, Prop_Data, "m_ArmorValue");
     bool helmet = view_as<bool>(GetEntProp(client, Prop_Send, "m_bHasHelmet"));
-    if (armor >= 50 && helmet)
+    if (armor > 0 && helmet)
         return;
 
     int account = GetEntProp(client, Prop_Send, "m_iAccount");
-    if (!helmet && ((armor >= 50 && account >= 350) || account >= 1000))
+    if (!helmet && ((armor > 0 && account >= 350) || account >= 1000))
         FakeClientCommand(client, "buy vesthelm");
-    else if (armor < 50 && account >= 650)
+    else if (armor == 0 && account >= 650)
         FakeClientCommand(client, "buy vest");
 }
