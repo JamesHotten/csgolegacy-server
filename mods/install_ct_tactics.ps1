@@ -25,10 +25,13 @@ $botPlugin = Join-Path $pluginDir "bot_stuff.smx"
 $profileConfig = Join-Path $smRoot "configs\bot_stuff.cfg"
 $directorSource = Join-Path $PSScriptRoot "bot_ct_tactics.sp"
 $tDirectorSource = Join-Path $PSScriptRoot "bot_t_tactics.sp"
+$sideStatsSource = Join-Path $PSScriptRoot "bot_side_win_stats.sp"
 $installedDirectorSource = Join-Path $scriptingDir "bot_ct_tactics.sp"
 $installedTDirectorSource = Join-Path $scriptingDir "bot_t_tactics.sp"
+$installedSideStatsSource = Join-Path $scriptingDir "bot_side_win_stats.sp"
 $directorPlugin = Join-Path $pluginDir "001_bot_ct_tactics.smx"
 $tDirectorPlugin = Join-Path $pluginDir "002_bot_t_tactics.smx"
+$sideStatsPlugin = Join-Path $pluginDir "000_bot_side_win_stats.smx"
 $compatSource = Join-Path $PSScriptRoot "include\bot_stuff_compile_compat.inc"
 $navmeshSource = Join-Path $PSScriptRoot "include\navmesh.inc"
 $rosterSource = Join-Path $PSScriptRoot "include\bot_team_rosters.inc"
@@ -36,7 +39,7 @@ $purchaseSource = Join-Path $PSScriptRoot "include\bot_purchase_policy.inc"
 $equipmentSource = Join-Path $PSScriptRoot "include\bot_equipment_policy.inc"
 $anglesSource = Join-Path $PSScriptRoot "include\bot_tactical_angles.inc"
 
-foreach ($required in @($compiler, $botSource, $botPlugin, $directorSource, $tDirectorSource, $compatSource, $navmeshSource, $rosterSource, $purchaseSource, $equipmentSource, $anglesSource)) {
+foreach ($required in @($compiler, $botSource, $botPlugin, $directorSource, $tDirectorSource, $sideStatsSource, $compatSource, $navmeshSource, $rosterSource, $purchaseSource, $equipmentSource, $anglesSource)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required CT tactics installation file was not found: '$required'"
     }
@@ -1605,6 +1608,7 @@ $candidateBotSource = Join-Path $buildDir "bot_stuff.sp"
 $candidateBotPlugin = Join-Path $buildDir "bot_stuff.smx"
 $candidateDirectorPlugin = Join-Path $buildDir "001_bot_ct_tactics.smx"
 $candidateTDirectorPlugin = Join-Path $buildDir "002_bot_t_tactics.smx"
+$candidateSideStatsPlugin = Join-Path $buildDir "000_bot_side_win_stats.smx"
 
 try {
     [System.IO.File]::WriteAllText($candidateBotSource, $text, [System.Text.UTF8Encoding]::new($false))
@@ -1623,6 +1627,10 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateTDirectorPlugin)) {
         throw "Failed to compile bot_t_tactics.sp (exit code $LASTEXITCODE)."
     }
+    & $compiler "-o$candidateSideStatsPlugin" $sideStatsSource
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateSideStatsPlugin)) {
+        throw "Failed to compile bot_side_win_stats.sp (exit code $LASTEXITCODE)."
+    }
     & $compiler "-o$candidateBotPlugin" $candidateBotSource
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateBotPlugin)) {
         throw "Failed to compile the BetterBots CT tactics bridge (exit code $LASTEXITCODE)."
@@ -1631,9 +1639,11 @@ try {
     Copy-Item -LiteralPath $candidateBotSource -Destination $botSource -Force
     Copy-Item -LiteralPath $directorSource -Destination $installedDirectorSource -Force
     Copy-Item -LiteralPath $tDirectorSource -Destination $installedTDirectorSource -Force
+    Copy-Item -LiteralPath $sideStatsSource -Destination $installedSideStatsSource -Force
     Move-Item -LiteralPath $candidateBotPlugin -Destination $botPlugin -Force
     Move-Item -LiteralPath $candidateDirectorPlugin -Destination $directorPlugin -Force
     Move-Item -LiteralPath $candidateTDirectorPlugin -Destination $tDirectorPlugin -Force
+    Move-Item -LiteralPath $candidateSideStatsPlugin -Destination $sideStatsPlugin -Force
 
     # AutoExecConfig does not replace an existing cfg when plugin defaults
     # change. Migrate only our previous exact defaults so administrator custom

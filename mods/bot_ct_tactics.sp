@@ -27,6 +27,7 @@ enum TacticalPhase
 {
     Phase_Idle = 0,
     Phase_Initial,
+    Phase_CarrierResponse,
     Phase_GuardLooseBomb,
     Phase_RetakeStage,
     Phase_RetakeCommit
@@ -103,6 +104,8 @@ bool g_reorganizedSite[2];
 bool g_fullRotateSite[2];
 float g_siteCasualtyAt[2];
 int g_lastReinforcement[2];
+float g_carrierLastPlanAt;
+float g_carrierLastPosition[3];
 
 bool g_hasOrder[MAXPLAYERS + 1];
 bool g_hasLook[MAXPLAYERS + 1];
@@ -309,6 +312,14 @@ public any Native_ReportContact(Handle plugin, int numParams)
     GetClientAbsOrigin(enemy, enemyPosition);
     int site = NearestSite(enemyPosition);
     float now = GetGameTime();
+    if ((g_phase == Phase_Initial || g_phase == Phase_CarrierResponse) && IsBombCarrier(enemy))
+    {
+        // The spotter keeps fighting. Every other available CT abandons the
+        // initial split, including the last weak-side anchor.
+        ReleaseOrder(spotter, "bomb carrier spotted");
+        g_combatReleased[spotter] = true;
+        PlanCarrierResponse(enemyPosition);
+    }
     float siteDistance = Distance2D(enemyPosition, site == 0 ? g_siteA : g_siteB);
     float otherDistance = Distance2D(enemyPosition, site == 0 ? g_siteB : g_siteA);
     bool credibleSite = siteDistance <= 900.0 && otherDistance >= siteDistance + 300.0;
@@ -323,9 +334,44 @@ public any Native_ReportContact(Handle plugin, int numParams)
 
     ReleaseOrder(spotter, "enemy spotted");
     ReportEnemy(spotter, enemyPosition, site);
-    if (g_cvReinforceOnContact.BoolValue && credibleSite && !g_reorganizedSite[site])
+    if (g_cvReinforceOnContact.BoolValue && credibleSite && !g_reorganizedSite[site]
+        && g_phase != Phase_CarrierResponse)
         RequestReinforcement(enemyPosition, site, spotter, "enemy contact");
     return true;
+}
+
+bool IsBombCarrier(int client)
+{
+    if (GetPlayerWeaponSlot(client, CS_SLOT_C4) != -1)
+        return true;
+    int entity = -1;
+    while ((entity = FindEntityByClassname(entity, "weapon_c4")) != -1)
+        if (GetEntPropEnt(entity, Prop_Send, "m_hOwnerEntity") == client)
+            return true;
+    return false;
+}
+
+void PlanCarrierResponse(const float carrierPosition[3])
+{
+    float now = GetGameTime();
+    if (g_phase == Phase_CarrierResponse && now < g_carrierLastPlanAt + 8.0)
+        return;
+    if (g_phase == Phase_CarrierResponse && Distance2D(carrierPosition, g_carrierLastPosition) < 500.0)
+        return;
+
+    int bots[MAXPLAYERS + 1];
+    int count = CollectCTBots(bots);
+    if (count == 0)
+        return;
+    g_targetCount = 0;
+    BuildAround(carrierPosition, count, 250.0, 600.0, false, 0.0, 0.0);
+    FillMissingTargetsAt(count, carrierPosition);
+    AssignTargets(bots, count, Route_Fastest);
+    g_phase = Phase_CarrierResponse;
+    g_phaseStarted = now;
+    g_carrierLastPlanAt = now;
+    CopyVector(carrierPosition, g_carrierLastPosition);
+    DebugLog("C4 carrier spotted: all available CT bots rotating to the last confirmed position.");
 }
 
 void RememberSiteEnemy(int site, int userId, float now)
@@ -391,6 +437,7 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     g_retakeContact = false;
     g_lastContactAt[0] = 0.0;
     g_lastContactAt[1] = 0.0;
+    g_carrierLastPlanAt = 0.0;
     for (int site = 0; site < 2; site++)
     {
         g_reorganizedSite[site] = false;
@@ -526,7 +573,7 @@ public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast
             float deathPosition[3];
             GetClientAbsOrigin(client, deathPosition);
             int deathSite = NearestSite(deathPosition);
-            if (!g_fullRotateSite[deathSite])
+            if (!g_fullRotateSite[deathSite] && g_phase != Phase_CarrierResponse)
                 RequestReinforcement(deathPosition, deathSite, client, "CT casualty");
         }
         g_hasOrder[client] = false;
@@ -1373,6 +1420,7 @@ void GetPhaseName(TacticalPhase phase, char[] buffer, int maxLength)
     switch (phase)
     {
         case Phase_Initial: strcopy(buffer, maxLength, "initial");
+        case Phase_CarrierResponse: strcopy(buffer, maxLength, "carrier-response");
         case Phase_GuardLooseBomb: strcopy(buffer, maxLength, "guard-c4");
         case Phase_RetakeStage: strcopy(buffer, maxLength, "retake-stage");
         case Phase_RetakeCommit: strcopy(buffer, maxLength, "retake-commit");
