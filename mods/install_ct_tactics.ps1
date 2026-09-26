@@ -1504,6 +1504,44 @@ if ($text.Contains('BEGIN TACTICAL_NADE_PRIORITY') -and -not $text.Contains('BEG
         'urgent T generic lineup guard'
 }
 
+# Give both sides an affordable primary before optional pistol/utility spending.
+# This is an idempotent migration for existing installations and fresh pack
+# installs; the original BetterBots source remains in ct-tactics-rollback.
+if (-not $text.Contains('BEGIN BOT_PRIMARY_FALLBACK')) {
+    $text = Replace-Once $text `
+        'BotPurchase_EnsureArmorBeforePrimary(iClient, szWeapon, bIsFullSave);' `
+        ('if (BotPurchase_EnsureArmorBeforePrimary(iClient, szWeapon, bIsFullSave))' + $newline + `
+        "`t`treturn Plugin_Handled;") `
+        'defer original rifle purchase after armor'
+
+    $defuserAnchor = 'bool bOwnsPrimary = GetPlayerWeaponSlot(iClient, CS_SLOT_PRIMARY) != -1;'
+    $text = Replace-Once $text $defuserAnchor `
+        ('if (strcmp(szWeapon, "defuser") == 0 && BotPurchase_ShouldReservePrimary(iClient, iTeam, bIsEco))' + $newline + `
+        "            return Plugin_Handled;" + $newline + '        ' + $defuserAnchor) `
+        'reserve primary before defuser'
+
+    $text = Replace-Once $text `
+        'return bIsEco ? Plugin_Handled : Plugin_Continue;' `
+        'return (bIsEco || BotPurchase_ShouldReservePrimary(iClient, iTeam, bIsEco)) ? Plugin_Handled : Plugin_Continue;' `
+        'reserve primary before grenades'
+    $text = Replace-Once $text `
+        'return bIsFullSave ? Plugin_Handled : Plugin_Continue;' `
+        'return (bIsFullSave || BotPurchase_ShouldReservePrimary(iClient, iTeam, bIsEco)) ? Plugin_Handled : Plugin_Continue;' `
+        'reserve primary before upgraded pistols'
+
+    $normalBuyAnchor = 'if (bHasPrimary || (BotEquipment_GetRoundPlan(iTeam) != BotEquip_Eco && iFriendsWithPrimary >= 1 && !bDefaultPistol))'
+    $primaryFallback = @(
+        '// BEGIN BOT_PRIMARY_FALLBACK',
+        'if (!g_bFreezetimeEnd && !bHasPrimary && BotEquipment_GetRoundPlan(iTeam) != BotEquip_Eco',
+        '    && BotEquipment_BuyAffordablePrimary(i))',
+        '    continue;',
+        '// END BOT_PRIMARY_FALLBACK',
+        '',
+        $normalBuyAnchor
+    ) -join $newline
+    $text = Replace-Once $text $normalBuyAnchor $primaryFallback 'CT/T affordable primary fallback'
+}
+
 $candidateBotSource = Join-Path $buildDir "bot_stuff.sp"
 $candidateBotPlugin = Join-Path $buildDir "bot_stuff.smx"
 $candidateDirectorPlugin = Join-Path $buildDir "001_bot_ct_tactics.smx"

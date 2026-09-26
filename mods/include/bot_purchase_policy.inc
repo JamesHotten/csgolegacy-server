@@ -17,25 +17,40 @@ bool BotPurchase_IsPrimaryAlias(const char[] weapon)
         || StrEqual(weapon, "mp7") || StrEqual(weapon, "ump45")
         || StrEqual(weapon, "p90") || StrEqual(weapon, "bizon");
 }
-void BotPurchase_EnsureArmorBeforePrimary(int client, const char[] weapon, bool fullSave)
+bool BotPurchase_EnsureArmorBeforePrimary(int client, const char[] weapon, bool fullSave)
 {
     int team = GetClientTeam(client);
     if ((team != CS_TEAM_CT && team != CS_TEAM_T) || !BotPurchase_IsPrimaryAlias(weapon))
-        return;
+        return false;
 
     // A genuine full save remains a save. A BOT carrying a saved primary is
     // allowed to repair its armor below in the normal armor-buy branch.
     if (fullSave && GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY) == -1)
-        return;
+        return false;
 
     int armor = GetEntProp(client, Prop_Data, "m_ArmorValue");
     bool helmet = view_as<bool>(GetEntProp(client, Prop_Send, "m_bHasHelmet"));
     if (armor > 0 && helmet)
-        return;
+        return false;
 
     int account = GetEntProp(client, Prop_Send, "m_iAccount");
     if (!helmet && ((armor > 0 && account >= 350) || account >= 1000))
         FakeClientCommand(client, "buy vesthelm");
     else if (armor == 0 && account >= 650)
         FakeClientCommand(client, "buy vest");
+
+    // The engine may have checked affordability before this buy callback.
+    // Defer the original rifle command if armor was bought here so it cannot
+    // use the pre-armor balance; a later BOT attempt/fallback will reprice it.
+    return GetEntProp(client, Prop_Send, "m_iAccount") != account;
+}
+
+bool BotPurchase_ShouldReservePrimary(int client, int team, bool isEco)
+{
+    if (isEco || (team != CS_TEAM_CT && team != CS_TEAM_T)
+        || GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY) != -1)
+        return false;
+
+    int cheapestPrimary = CS_GetWeaponPrice(client, team == CS_TEAM_CT ? CSWeapon_MP9 : CSWeapon_MAC10);
+    return cheapestPrimary > 0 && GetEntProp(client, Prop_Send, "m_iAccount") >= cheapestPrimary;
 }

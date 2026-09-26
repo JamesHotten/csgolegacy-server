@@ -105,6 +105,49 @@ BotEquipmentTier BotEquipment_GetRoundPlan(int team)
     return g_BotEquipmentRoundPlan[team];
 }
 
+bool BotEquipment_BuyAffordablePrimary(int client)
+{
+    int team = GetClientTeam(client);
+    if ((team != CS_TEAM_T && team != CS_TEAM_CT)
+        || BotEquipment_GetRoundPlan(team) == BotEquip_Eco
+        || GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY) != -1)
+        return false;
+
+    // Re-read cash after armor and native BOT buy attempts. Do not predict a
+    // purchase from the command alone: callbacks/loadout rules may reject it.
+    CSWeaponID weapons[3];
+    char aliases[3][12];
+    if (team == CS_TEAM_CT)
+    {
+        weapons[0] = CSWeapon_M4A1;
+        weapons[1] = CSWeapon_FAMAS;
+        weapons[2] = CSWeapon_MP9;
+        strcopy(aliases[0], sizeof(aliases[]), "m4a1");
+        strcopy(aliases[1], sizeof(aliases[]), "famas");
+        strcopy(aliases[2], sizeof(aliases[]), "mp9");
+    }
+    else
+    {
+        weapons[0] = CSWeapon_AK47;
+        weapons[1] = CSWeapon_GALILAR;
+        weapons[2] = CSWeapon_MAC10;
+        strcopy(aliases[0], sizeof(aliases[]), "ak47");
+        strcopy(aliases[1], sizeof(aliases[]), "galilar");
+        strcopy(aliases[2], sizeof(aliases[]), "mac10");
+    }
+
+    for (int index = 0; index < sizeof(weapons); index++)
+    {
+        int price = CS_GetWeaponPrice(client, weapons[index]);
+        if (price <= 0 || GetEntProp(client, Prop_Send, "m_iAccount") < price)
+            continue;
+        FakeClientCommand(client, "buy %s", aliases[index]);
+        if (GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY) != -1)
+            return true;
+    }
+    return false;
+}
+
 bool BotEquipment_CanSelfBuyPrimary(int client)
 {
     if (GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY) != -1)
