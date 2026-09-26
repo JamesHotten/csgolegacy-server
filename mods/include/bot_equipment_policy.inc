@@ -83,9 +83,18 @@ BotEquipmentTier BotEquipment_ClassifyTeam(int team)
 #if defined BOT_EQUIPMENT_CORE
 BotEquipmentTier g_BotEquipmentRoundPlan[4];
 BotEquipmentTier g_BotEquipmentPreviousPlan[4];
+int g_BotEquipmentForceChoice[MAXPLAYERS + 1]; // 0: unset, 1: rifle, 2: SMG
+int g_BotEquipmentForceChoiceUserId[MAXPLAYERS + 1];
+bool g_BotEquipmentRoutingBuy[MAXPLAYERS + 1];
 
 void BotEquipment_BeginRound(bool resetRound, bool forceT, bool forceCT)
 {
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        g_BotEquipmentForceChoice[client] = 0;
+        g_BotEquipmentForceChoiceUserId[client] = 0;
+        g_BotEquipmentRoutingBuy[client] = false;
+    }
     for (int team = CS_TEAM_T; team <= CS_TEAM_CT; team++)
     {
         BotEquipmentTier plan = BotEquipment_ClassifyTeam(team);
@@ -105,11 +114,38 @@ BotEquipmentTier BotEquipment_GetRoundPlan(int team)
     return g_BotEquipmentRoundPlan[team];
 }
 
+int BotEquipment_GetForceChoice(int client)
+{
+    int userId = GetClientUserId(client);
+    if (g_BotEquipmentForceChoiceUserId[client] != userId)
+    {
+        g_BotEquipmentForceChoiceUserId[client] = userId;
+        g_BotEquipmentForceChoice[client] = 0;
+    }
+    if (g_BotEquipmentForceChoice[client] != 0)
+        return g_BotEquipmentForceChoice[client];
+
+    int team = GetClientTeam(client);
+    int money = GetEntProp(client, Prop_Send, "m_iAccount");
+    int riflePrice = CS_GetWeaponPrice(client, team == CS_TEAM_CT ? CSWeapon_FAMAS : CSWeapon_GALILAR);
+    int smgPrice = CS_GetWeaponPrice(client, team == CS_TEAM_CT ? CSWeapon_MP9 : CSWeapon_MAC10);
+    bool canRifle = riflePrice > 0 && money >= riflePrice;
+    bool canSMG = smgPrice > 0 && money >= smgPrice;
+    if (canRifle && canSMG)
+        g_BotEquipmentForceChoice[client] = GetRandomInt(0, 1) == 0 ? 1 : 2;
+    else if (canRifle)
+        g_BotEquipmentForceChoice[client] = 1;
+    else if (canSMG)
+        g_BotEquipmentForceChoice[client] = 2;
+    return g_BotEquipmentForceChoice[client];
+}
+
 bool BotEquipment_BuyAffordablePrimary(int client)
 {
     int team = GetClientTeam(client);
+    BotEquipmentTier plan = BotEquipment_GetRoundPlan(team);
     if ((team != CS_TEAM_T && team != CS_TEAM_CT)
-        || BotEquipment_GetRoundPlan(team) == BotEquip_Eco
+        || plan == BotEquip_Eco
         || GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY) != -1)
         return false;
 
@@ -117,33 +153,72 @@ bool BotEquipment_BuyAffordablePrimary(int client)
     // purchase from the command alone: callbacks/loadout rules may reject it.
     CSWeaponID weapons[3];
     char aliases[3][12];
+    int count = 3;
     if (team == CS_TEAM_CT)
     {
-        weapons[0] = CSWeapon_M4A1;
-        weapons[1] = CSWeapon_FAMAS;
-        weapons[2] = CSWeapon_MP9;
-        strcopy(aliases[0], sizeof(aliases[]), "m4a1");
-        strcopy(aliases[1], sizeof(aliases[]), "famas");
-        strcopy(aliases[2], sizeof(aliases[]), "mp9");
+        if (plan == BotEquip_Force)
+        {
+            bool rifleFirst = BotEquipment_GetForceChoice(client) != 2;
+            weapons[0] = rifleFirst ? CSWeapon_FAMAS : CSWeapon_MP9;
+            weapons[1] = rifleFirst ? CSWeapon_MP9 : CSWeapon_FAMAS;
+            strcopy(aliases[0], sizeof(aliases[]), rifleFirst ? "famas" : "mp9");
+            strcopy(aliases[1], sizeof(aliases[]), rifleFirst ? "mp9" : "famas");
+            count = 2;
+        }
+        else
+        {
+            weapons[0] = CSWeapon_M4A1;
+            weapons[1] = CSWeapon_FAMAS;
+            weapons[2] = CSWeapon_MP9;
+            strcopy(aliases[0], sizeof(aliases[]), "m4a1");
+            strcopy(aliases[1], sizeof(aliases[]), "famas");
+            strcopy(aliases[2], sizeof(aliases[]), "mp9");
+        }
     }
     else
     {
-        weapons[0] = CSWeapon_AK47;
-        weapons[1] = CSWeapon_GALILAR;
-        weapons[2] = CSWeapon_MAC10;
-        strcopy(aliases[0], sizeof(aliases[]), "ak47");
-        strcopy(aliases[1], sizeof(aliases[]), "galilar");
-        strcopy(aliases[2], sizeof(aliases[]), "mac10");
+        if (plan == BotEquip_Force)
+        {
+            bool rifleFirst = BotEquipment_GetForceChoice(client) != 2;
+            weapons[0] = rifleFirst ? CSWeapon_GALILAR : CSWeapon_MAC10;
+            weapons[1] = rifleFirst ? CSWeapon_MAC10 : CSWeapon_GALILAR;
+            strcopy(aliases[0], sizeof(aliases[]), rifleFirst ? "galilar" : "mac10");
+            strcopy(aliases[1], sizeof(aliases[]), rifleFirst ? "mac10" : "galilar");
+            count = 2;
+        }
+        else
+        {
+            weapons[0] = CSWeapon_AK47;
+            weapons[1] = CSWeapon_GALILAR;
+            weapons[2] = CSWeapon_MAC10;
+            strcopy(aliases[0], sizeof(aliases[]), "ak47");
+            strcopy(aliases[1], sizeof(aliases[]), "galilar");
+            strcopy(aliases[2], sizeof(aliases[]), "mac10");
+        }
     }
 
-    for (int index = 0; index < sizeof(weapons); index++)
+    for (int index = 0; index < count; index++)
     {
         int price = CS_GetWeaponPrice(client, weapons[index]);
         if (price <= 0 || GetEntProp(client, Prop_Send, "m_iAccount") < price)
             continue;
+        int moneyBefore = GetEntProp(client, Prop_Send, "m_iAccount");
+        g_BotEquipmentRoutingBuy[client] = true;
         FakeClientCommand(client, "buy %s", aliases[index]);
+        g_BotEquipmentRoutingBuy[client] = false;
         if (GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY) != -1)
             return true;
+        // An armor purchase in the buy callback can consume the first attempt.
+        // Re-price before retrying so the fallback never uses stale cash.
+        int moneyAfter = GetEntProp(client, Prop_Send, "m_iAccount");
+        if (moneyAfter < moneyBefore && moneyAfter >= price)
+        {
+            g_BotEquipmentRoutingBuy[client] = true;
+            FakeClientCommand(client, "buy %s", aliases[index]);
+            g_BotEquipmentRoutingBuy[client] = false;
+            if (GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY) != -1)
+                return true;
+        }
     }
     return false;
 }

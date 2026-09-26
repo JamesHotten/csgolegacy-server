@@ -1504,6 +1504,35 @@ if ($text.Contains('BEGIN TACTICAL_NADE_PRIORITY') -and -not $text.Contains('BEG
         'urgent T generic lineup guard'
 }
 
+# Let the T director use the same already-confirmed visible-enemy signal as
+# the CT director. The optional native keeps the BetterBots core independently
+# loadable, and the one-second client throttle avoids adding per-tick work.
+if ($text.Contains('BEGIN CT_TACTICS_BRIDGE') -and -not $text.Contains('BEGIN T_MIDROUND_CONTACT_BRIDGE')) {
+    $text = Replace-Once $text 'native bool BotTTactics_IsUrgentPlant();' `
+        ('native bool BotTTactics_IsUrgentPlant();' + $newline + 'native bool BotTTactics_ReportContact(int spotter, int enemy);') `
+        'T mid-round contact native declaration'
+    $text = Replace-Once $text 'MarkNativeAsOptional("BotTTactics_IsUrgentPlant");' `
+        ('MarkNativeAsOptional("BotTTactics_IsUrgentPlant");' + $newline + '    MarkNativeAsOptional("BotTTactics_ReportContact");') `
+        'optional T mid-round contact native'
+    $contactBridge = @(
+        "`t// BEGIN T_MIDROUND_CONTACT_BRIDGE",
+        "`tif (GetClientTeam(iClient) == CS_TEAM_T && bEnemyVisible && fNow >= g_fTacticalContactTimestamp[iClient]",
+        "`t`t&& GetFeatureStatus(FeatureType_Native, `"BotTTactics_ReportContact`") == FeatureStatus_Available)",
+        "`t{",
+        "`t`tint iVisibleEnemy = BotGetEnemy(iClient);",
+        "`t`tif (IsValidClient(iVisibleEnemy) && IsPlayerAlive(iVisibleEnemy) && GetClientTeam(iVisibleEnemy) == CS_TEAM_CT)",
+        "`t`t{",
+        "`t`t`tBotTTactics_ReportContact(iClient, iVisibleEnemy);",
+        "`t`t`tg_fTacticalContactTimestamp[iClient] = fNow + 1.0;",
+        "`t`t}",
+        "`t}",
+        "`t// END T_MIDROUND_CONTACT_BRIDGE",
+        '',
+        "`t// BEGIN T_URGENT_OBJECTIVE_PRIORITY"
+    ) -join $newline
+    $text = Replace-Once $text "`t// BEGIN T_URGENT_OBJECTIVE_PRIORITY" $contactBridge 'T mid-round visible contact bridge'
+}
+
 # Give both sides an affordable primary before optional pistol/utility spending.
 # This is an idempotent migration for existing installations and fresh pack
 # installs; the original BetterBots source remains in ct-tactics-rollback.
@@ -1540,6 +1569,36 @@ if (-not $text.Contains('BEGIN BOT_PRIMARY_FALLBACK')) {
         $normalBuyAnchor
     ) -join $newline
     $text = Replace-Once $text $normalBuyAnchor $primaryFallback 'CT/T affordable primary fallback'
+}
+
+# Route native force-round primary requests through one per-BOT 50/50 choice.
+# Preserve saved guns and the established cheap-drop path. The helper's nested
+# buy command bypasses this route, and SMGs bypass the old 40% upgrade rule.
+$forceBuyPolicy = @(
+    '// BEGIN BOT_FORCE_PRIMARY_POLICY',
+    'if (eTeamBuy == BotEquip_Force && !g_bBuyingCheapDrop[iClient]',
+    '    && !g_BotEquipmentRoutingBuy[iClient]',
+    '    && GetPlayerWeaponSlot(iClient, CS_SLOT_PRIMARY) == -1',
+    '    && BotPurchase_IsPrimaryAlias(szWeapon))',
+    '{',
+    '    BotEquipment_BuyAffordablePrimary(iClient);',
+    '    return Plugin_Handled;',
+    '}',
+    'if (eTeamBuy == BotEquip_Force && !g_bBuyingCheapDrop[iClient]',
+    '    && (strcmp(szWeapon, "mp9") == 0 || strcmp(szWeapon, "mac10") == 0))',
+    '    return Plugin_Continue;',
+    '// END BOT_FORCE_PRIMARY_POLICY'
+) -join $newline
+if (-not $text.Contains('BEGIN BOT_FORCE_PRIMARY_POLICY')) {
+    $text = Replace-Once $text `
+        'int iEnemyAvgMoney = (iTeam == CS_TEAM_CT) ? g_iAvgMoneyT : g_iAvgMoneyCT;' `
+        ($forceBuyPolicy + $newline + $newline + 'int iEnemyAvgMoney = (iTeam == CS_TEAM_CT) ? g_iAvgMoneyT : g_iAvgMoneyCT;') `
+        'force-round native primary routing'
+}
+elseif (-not $text.Contains('g_BotEquipmentRoutingBuy[iClient]')) {
+    $text = Replace-RegexOnce $text `
+        '(?s)// BEGIN BOT_FORCE_PRIMARY_POLICY.*?// END BOT_FORCE_PRIMARY_POLICY' `
+        $forceBuyPolicy 'force-round 50/50 primary migration'
 }
 
 $candidateBotSource = Join-Path $buildDir "bot_stuff.sp"

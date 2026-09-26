@@ -77,6 +77,7 @@ ConVar g_cvForceSplitChance;
 ConVar g_cvEcoRushChance;
 ConVar g_cvEcoSplitChance;
 ConVar g_cvPlantUrgency;
+ConVar g_cvMidRotate;
 ConVar g_cvRoundTimeDefuse;
 
 TPhase g_phase = TPhase_Idle;
@@ -95,6 +96,10 @@ bool g_bombPlanted;
 float g_roundLiveStart;
 float g_lastCombatAt[MAXPLAYERS + 1];
 float g_nextAttackReviewAt;
+bool g_midRotationActive;
+bool g_midRotationUsed;
+int g_siteEnemyUserId[2];
+float g_siteEnemySeenAt[2];
 
 bool g_hasOrder[MAXPLAYERS + 1];
 bool g_hasLook[MAXPLAYERS + 1];
@@ -115,6 +120,7 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     CreateNative("BotTTactics_GetAim", Native_GetAim);
     CreateNative("BotTTactics_ShouldHoldStage", Native_ShouldHoldStage);
     CreateNative("BotTTactics_IsUrgentPlant", Native_IsUrgentPlant);
+    CreateNative("BotTTactics_ReportContact", Native_ReportContact);
     MarkNativeAsOptional("NavMesh_Exists");
     MarkNativeAsOptional("NavMesh_GetNearestArea");
     MarkNativeAsOptional("NavMesh_CollectSurroundingAreas");
@@ -142,6 +148,7 @@ public void OnPluginStart()
     g_cvEcoRushChance = CreateConVar("sm_bot_t_eco_rush_chance", "65", "Eco chance for a site rush.", _, true, 0.0, true, 100.0);
     g_cvEcoSplitChance = CreateConVar("sm_bot_t_eco_split_chance", "10", "Eco chance for a split attack.", _, true, 0.0, true, 100.0);
     g_cvPlantUrgency = CreateConVar("sm_bot_t_plant_urgency_seconds", "40.0", "Remaining seconds at which the bomb carrier and escort take the direct plant route.", _, true, 15.0, true, 80.0);
+    g_cvMidRotate = CreateConVar("sm_bot_t_mid_rotate_enable", "1", "Allow one evidence-based mid-round T site rotation per round.", _, true, 0.0, true, 1.0);
     g_cvRoundTimeDefuse = FindConVar("mp_roundtime_defuse");
 
     g_cvEnabled.AddChangeHook(OnEnabledChanged);
@@ -205,7 +212,38 @@ public any Native_ShouldHoldStage(Handle plugin, int numParams)
 
 public any Native_IsUrgentPlant(Handle plugin, int numParams)
 {
-    return g_cvEnabled.BoolValue && g_phase == TPhase_UrgentPlant;
+    // The bridge uses this objective-priority flag to cancel stale opening
+    // lineups. A mid-round rotation must not be pulled back to the old site.
+    return g_cvEnabled.BoolValue && (g_phase == TPhase_UrgentPlant || g_midRotationActive);
+}
+
+public any Native_ReportContact(Handle plugin, int numParams)
+{
+    int spotter = GetNativeCell(1);
+    int enemy = GetNativeCell(2);
+    if (!g_cvEnabled.BoolValue || !g_cvMidRotate.BoolValue || g_phase != TPhase_AttackCommit
+        || g_midRotationUsed || g_bombPlanted || !IsTBot(spotter)
+        || enemy < 1 || enemy > MaxClients || !IsClientInGame(enemy)
+        || !IsPlayerAlive(enemy) || GetClientTeam(enemy) != CS_TEAM_CT)
+        return false;
+
+    float position[3];
+    GetClientAbsOrigin(enemy, position);
+    float targetDistance = Distance2D(position, g_attackA ? g_siteA : g_siteB);
+    float otherDistance = Distance2D(position, g_attackA ? g_siteB : g_siteA);
+    if (targetDistance > 900.0 || otherDistance < targetDistance + 300.0)
+        return false; // Mid-map sightings do not prove a site is defended.
+
+    int userId = GetClientUserId(enemy);
+    float now = GetGameTime();
+    if (g_siteEnemyUserId[0] != userId)
+    {
+        g_siteEnemyUserId[1] = g_siteEnemyUserId[0];
+        g_siteEnemySeenAt[1] = g_siteEnemySeenAt[0];
+        g_siteEnemyUserId[0] = userId;
+    }
+    g_siteEnemySeenAt[0] = now;
+    return true;
 }
 
 public any Native_GetAim(Handle plugin, int numParams)
@@ -247,6 +285,9 @@ public Action Command_Status(int client, int args)
         g_cvEnabled.BoolValue, g_geometryReady, phase, buy, plan, g_attackA ? "A" : "B", active);
     ReplyToCommand(client, "[T Tactics] sync=%d ready=%d/%d contact=%d",
         g_cvSyncEnabled.BoolValue, syncReady, syncOrdered, g_attackContact);
+    ReplyToCommand(client, "[T Tactics] mid_rotate_enabled=%d used=%d active=%d sightings=%d/%d",
+        g_cvMidRotate.BoolValue, g_midRotationUsed, g_midRotationActive,
+        g_siteEnemyUserId[0] != 0, g_siteEnemyUserId[1] != 0);
     ReplyToCommand(client, "[T Tactics] t_bots=%d armored=%d primary_without_armor=%d",
         tBots, armored, primaryWithoutArmor);
     return Plugin_Handled;
@@ -271,6 +312,10 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     g_attackContact = false;
     g_bombPlanted = false;
     g_roundLiveStart = 0.0;
+    g_midRotationActive = false;
+    g_midRotationUsed = false;
+    g_siteEnemyUserId[0] = 0;
+    g_siteEnemyUserId[1] = 0;
     for (int client = 1; client <= MaxClients; client++)
         g_lastCombatAt[client] = 0.0;
 }
@@ -297,6 +342,7 @@ public void Event_Reset(Event event, const char[] name, bool dontBroadcast)
 
 public void Event_BombDropped(Event event, const char[] name, bool dontBroadcast)
 {
+    g_midRotationActive = false;
     if (g_cvEnabled.BoolValue)
         CreateTimer(0.2, Timer_PlanRecovery, _, TIMER_FLAG_NO_MAPCHANGE);
 }
@@ -325,6 +371,7 @@ public void Event_BombBeginPlant(Event event, const char[] name, bool dontBroadc
     int planter = GetClientOfUserId(event.GetInt("userid"));
     if (planter < 1 || !IsClientInGame(planter) || GetClientTeam(planter) != CS_TEAM_T)
         return;
+    g_midRotationActive = false;
     float position[3];
     GetClientAbsOrigin(planter, position);
     PlanPlantCover(planter, position);
@@ -408,6 +455,8 @@ public Action Timer_Update(Handle timer)
         PlanUrgentPlant();
     if (g_phase == TPhase_UrgentPlant)
         RefreshUrgentOrders();
+    if (g_phase == TPhase_AttackCommit)
+        TryMidRoundRotation();
     if (g_phase == TPhase_Idle)
         return Plugin_Continue;
     float elapsed = GetGameTime() - g_phaseStarted;
@@ -453,6 +502,45 @@ void ReviewAttackCommit()
     g_nextAttackReviewAt = GetGameTime() + 5.0;
     DebugLog("T attack reviewed: site=%s ordered=%d ready=%d carrier=%d.",
         g_attackA ? "A" : "B", ordered, ready, carrier);
+}
+
+void TryMidRoundRotation()
+{
+    if (!g_cvMidRotate.BoolValue || g_midRotationUsed || g_midRotationActive
+        || g_bombPlanted || GetGameTime() - g_phaseStarted < 12.0
+        || FindLooseC4() != -1 || g_cvRoundTimeDefuse == null)
+        return;
+    float now = GetGameTime();
+    if (g_siteEnemyUserId[0] == 0 || g_siteEnemyUserId[1] == 0
+        || now - g_siteEnemySeenAt[0] > 10.0 || now - g_siteEnemySeenAt[1] > 10.0)
+        return;
+    float remaining = g_cvRoundTimeDefuse.FloatValue * 60.0 - (now - g_roundLiveStart);
+    if (remaining < 55.0)
+        return; // A late detour risks running out of plant time.
+
+    int carrier = FindBombCarrier();
+    if (!IsTBot(carrier) || now - g_lastCombatAt[carrier] < 2.5)
+        return;
+    float carrierPosition[3];
+    GetClientAbsOrigin(carrier, carrierPosition);
+    if (Distance2D(carrierPosition, g_attackA ? g_siteA : g_siteB) < 800.0)
+        return; // Already executing at the site: fight and plant instead.
+    int aliveT;
+    for (int client = 1; client <= MaxClients; client++)
+        if (client > 0 && IsClientInGame(client) && IsPlayerAlive(client) && GetClientTeam(client) == CS_TEAM_T)
+            aliveT++;
+    if (aliveT < 3)
+        return;
+
+    g_midRotationUsed = true;
+    g_midRotationActive = true;
+    g_attackA = !g_attackA;
+    // Only quiet teammates rejoin; bots actively fighting keep native combat.
+    for (int client = 1; client <= MaxClients; client++)
+        if (IsTBot(client) && now - g_lastCombatAt[client] >= 2.5)
+            g_combatReleased[client] = false;
+    PlanAttackCommit();
+    DebugLog("Mid-round T rotation committed to %s with %.0f seconds left.", g_attackA ? "A" : "B", remaining);
 }
 
 bool ShouldUrgentlyPlant()
@@ -545,6 +633,10 @@ void PlanInitialAttack()
     g_plan = ChooseAttackPlan(g_buyState);
     g_attackA = GetRandomInt(0, 1) == 0;
     g_attackContact = false;
+    g_midRotationActive = false;
+    g_midRotationUsed = false;
+    g_siteEnemyUserId[0] = 0;
+    g_siteEnemyUserId[1] = 0;
 
     if (g_cvSyncEnabled.BoolValue)
         PlanAttackStage();
@@ -605,7 +697,13 @@ void PlanAttackCommit()
     float dirX = g_tSpawn[0] - site[0];
     float dirY = g_tSpawn[1] - site[1];
     Normalize2D(dirX, dirY);
-    if (g_plan == TPlan_Rush)
+    if (g_midRotationActive)
+    {
+        // Keep the C4 and every available escort on the new site. The
+        // default split's old-site flank is inappropriate after a rotation.
+        BuildAround(site, count - 1, 180.0, 520.0, true, dirX, dirY);
+    }
+    else if (g_plan == TPlan_Rush)
     {
         BuildAround(site, count - 1, 120.0, 520.0, true, dirX, dirY);
     }
@@ -964,7 +1062,7 @@ void ClearOrders()
     }
 }
 void ClearCombatReleases() { for (int client = 1; client <= MaxClients; client++) g_combatReleased[client] = false; }
-void ResetDirector() { ClearOrders(); g_phase = TPhase_Idle; g_phaseStarted = 0.0; g_nextAttackReviewAt = 0.0; g_targetCount = 0; g_attackContact = false; }
+void ResetDirector() { ClearOrders(); g_phase = TPhase_Idle; g_phaseStarted = 0.0; g_nextAttackReviewAt = 0.0; g_targetCount = 0; g_attackContact = false; g_midRotationActive = false; }
 
 void GetOrderProgress(float distanceLimit, int &ready, int &ordered)
 {

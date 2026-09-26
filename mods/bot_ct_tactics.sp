@@ -83,6 +83,7 @@ ConVar g_cvContactCooldown;
 ConVar g_cvReinforceHold;
 ConVar g_cvRadioReport;
 ConVar g_cvNavigationStallTimeout;
+ConVar g_cvMidReorganize;
 
 TacticalPhase g_phase = Phase_Idle;
 BuyState g_buyState = Buy_Full;
@@ -96,6 +97,12 @@ bool g_geometryReady;
 bool g_bombPlanted;
 bool g_retakeContact;
 float g_lastContactAt[2];
+int g_siteEnemyUserId[2][4];
+float g_siteEnemySeenAt[2][4];
+bool g_reorganizedSite[2];
+bool g_fullRotateSite[2];
+float g_siteCasualtyAt[2];
+int g_lastReinforcement[2];
 
 bool g_hasOrder[MAXPLAYERS + 1];
 bool g_hasLook[MAXPLAYERS + 1];
@@ -135,7 +142,7 @@ public void OnPluginStart()
 {
     g_cvEnabled = CreateConVar("sm_bot_ct_tactics_enable", "1", "Enable the reversible CT tactical director.", _, true, 0.0, true, 1.0);
     g_cvDebug = CreateConVar("sm_bot_ct_tactics_debug", "0", "Log CT tactical plans and assignments.", _, true, 0.0, true, 1.0);
-    g_cvInitialHold = CreateConVar("sm_bot_ct_tactics_initial_hold", "70.0", "Maximum seconds to maintain the initial CT setup.", _, true, 5.0, true, 105.0);
+    g_cvInitialHold = CreateConVar("sm_bot_ct_tactics_initial_hold", "70.0", "Seconds between CT setup reviews; intact anchors remain in place.", _, true, 5.0, true, 105.0);
     g_cvRetakeStage = CreateConVar("sm_bot_ct_tactics_retake_stage", "6.0", "Minimum seconds spent taking distinct retake approaches.", _, true, 0.5, true, 12.0);
     g_cvRetakeCommit = CreateConVar("sm_bot_ct_tactics_retake_commit", "14.0", "Maximum seconds to push the planted bomb after staging.", _, true, 2.0, true, 25.0);
     g_cvRetakeStageTimeout = CreateConVar("sm_bot_ct_tactics_retake_stage_timeout", "12.0", "Hard timeout before committing the retake.", _, true, 2.0, true, 20.0);
@@ -154,6 +161,7 @@ public void OnPluginStart()
     g_cvReinforceHold = CreateConVar("sm_bot_ct_tactics_reinforce_hold", "12.0", "Maximum seconds for an individual reinforcement order.", _, true, 3.0, true, 25.0);
     g_cvRadioReport = CreateConVar("sm_bot_ct_tactics_radio_report", "1", "Use bot radio and team chat for enemy reports.", _, true, 0.0, true, 1.0);
     g_cvNavigationStallTimeout = CreateConVar("sm_bot_ct_tactics_navigation_stall_timeout", "3.0", "Release a CT order to native AI after this many seconds without meaningful route progress.", _, true, 1.5, true, 8.0);
+    g_cvMidReorganize = CreateConVar("sm_bot_ct_mid_reorganize_enable", "1", "Reinforce on two confirmed attackers; permit full rotation only against a strong confirmed execute.", _, true, 0.0, true, 1.0);
 
     g_cvEnabled.AddChangeHook(OnEnabledChanged);
     AutoExecConfig(true, "bot_ct_tactics");
@@ -227,6 +235,9 @@ public Action Command_Status(int client, int args)
     ReplyToCommand(client, "[CT Tactics] ct_bots=%d armored=%d primary_without_armor=%d",
         ctBots, armored, primaryWithoutArmor);
     ReplyToCommand(client, "[CT Tactics] retake_ready=%d/%d contact=%d", syncReady, syncOrdered, g_retakeContact);
+    ReplyToCommand(client, "[CT Tactics] mid_reorganize_enabled=%d reorg_A/B=%d/%d full_rotate_A/B=%d/%d",
+        g_cvMidReorganize.BoolValue, g_reorganizedSite[0], g_reorganizedSite[1],
+        g_fullRotateSite[0], g_fullRotateSite[1]);
     return Plugin_Handled;
 }
 
@@ -298,15 +309,78 @@ public any Native_ReportContact(Handle plugin, int numParams)
     GetClientAbsOrigin(enemy, enemyPosition);
     int site = NearestSite(enemyPosition);
     float now = GetGameTime();
+    float siteDistance = Distance2D(enemyPosition, site == 0 ? g_siteA : g_siteB);
+    float otherDistance = Distance2D(enemyPosition, site == 0 ? g_siteB : g_siteA);
+    bool credibleSite = siteDistance <= 900.0 && otherDistance >= siteDistance + 300.0;
+    if (credibleSite && g_phase == Phase_Initial)
+    {
+        RememberSiteEnemy(site, GetClientUserId(enemy), now);
+        TryReorganizeDefense(site, enemyPosition, spotter, now);
+    }
     if (g_lastContactAt[site] > 0.0 && now < g_lastContactAt[site] + g_cvContactCooldown.FloatValue)
         return false;
     g_lastContactAt[site] = now;
 
     ReleaseOrder(spotter, "enemy spotted");
     ReportEnemy(spotter, enemyPosition, site);
-    if (g_cvReinforceOnContact.BoolValue)
+    if (g_cvReinforceOnContact.BoolValue && credibleSite && !g_reorganizedSite[site])
         RequestReinforcement(enemyPosition, site, spotter, "enemy contact");
     return true;
+}
+
+void RememberSiteEnemy(int site, int userId, float now)
+{
+    if (userId == 0)
+        return;
+    int existing = -1;
+    for (int slot = 0; slot < 4; slot++)
+        if (g_siteEnemyUserId[site][slot] == userId)
+            existing = slot;
+    if (existing < 0)
+        existing = 3;
+    for (int slot = existing; slot > 0; slot--)
+    {
+        g_siteEnemyUserId[site][slot] = g_siteEnemyUserId[site][slot - 1];
+        g_siteEnemySeenAt[site][slot] = g_siteEnemySeenAt[site][slot - 1];
+    }
+    g_siteEnemyUserId[site][0] = userId;
+    g_siteEnemySeenAt[site][0] = now;
+}
+
+void TryReorganizeDefense(int site, const float contactPosition[3], int spotter, float now)
+{
+    if (!g_cvMidReorganize.BoolValue || g_bombPlanted || g_plan != Plan_Standard)
+        return;
+    int recentEnemies;
+    for (int slot = 0; slot < 4; slot++)
+        if (g_siteEnemyUserId[site][slot] != 0 && now - g_siteEnemySeenAt[site][slot] <= 10.0)
+            recentEnemies++;
+
+    if (!g_fullRotateSite[0] && !g_fullRotateSite[1] && (recentEnemies >= 4
+        || (recentEnemies >= 3 && g_siteCasualtyAt[site] > 0.0 && now - g_siteCasualtyAt[site] <= 10.0)))
+    {
+        // A confirmed hard execute is worth vacating the weak side. If its
+        // last defender is already fighting, leave native combat in control.
+        int rotated;
+        for (int attempt = 0; attempt < MaxClients; attempt++)
+        {
+            if (RequestReinforcement(contactPosition, site, spotter, "confirmed hard execute", 0, true, true) == 0)
+                break;
+            rotated++;
+        }
+        if (rotated > 0)
+        {
+            g_fullRotateSite[site] = true;
+            g_reorganizedSite[site] = true;
+            DebugLog("CT full rotation toward %s after strong execute evidence: %d weak-side defenders.", site == 0 ? "A" : "B", rotated);
+        }
+        return;
+    }
+    if (g_reorganizedSite[site] || recentEnemies < 2)
+        return;
+    g_reorganizedSite[site] = true;
+    RequestReinforcement(contactPosition, site, spotter, "confirmed multi-enemy site pressure", g_lastReinforcement[site]);
+    DebugLog("Mid-round CT defense reorganized toward %s; opposite-site anchor retained.", site == 0 ? "A" : "B");
 }
 
 public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
@@ -317,6 +391,18 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     g_retakeContact = false;
     g_lastContactAt[0] = 0.0;
     g_lastContactAt[1] = 0.0;
+    for (int site = 0; site < 2; site++)
+    {
+        g_reorganizedSite[site] = false;
+        g_fullRotateSite[site] = false;
+        g_siteCasualtyAt[site] = 0.0;
+        g_lastReinforcement[site] = 0;
+        for (int slot = 0; slot < 4; slot++)
+        {
+            g_siteEnemyUserId[site][slot] = 0;
+            g_siteEnemySeenAt[site][slot] = 0.0;
+        }
+    }
 }
 
 public void Event_FreezeEnd(Event event, const char[] name, bool dontBroadcast)
@@ -419,12 +505,29 @@ public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast
     int client = GetClientOfUserId(event.GetInt("userid"));
     if (client >= 1 && client <= MaxClients)
     {
+        int attacker = GetClientOfUserId(event.GetInt("attacker"));
+        if (g_phase == Phase_Initial && IsClientInGame(client) && GetClientTeam(client) == CS_TEAM_CT
+            && attacker >= 1 && IsClientInGame(attacker) && GetClientTeam(attacker) == CS_TEAM_T)
+        {
+            float casualtyPosition[3];
+            GetClientAbsOrigin(client, casualtyPosition);
+            int casualtySite = NearestSite(casualtyPosition);
+            float siteDistance = Distance2D(casualtyPosition, casualtySite == 0 ? g_siteA : g_siteB);
+            float otherDistance = Distance2D(casualtyPosition, casualtySite == 0 ? g_siteB : g_siteA);
+            if (siteDistance <= 900.0 && otherDistance >= siteDistance + 300.0)
+            {
+                g_siteCasualtyAt[casualtySite] = GetGameTime();
+                TryReorganizeDefense(casualtySite, casualtyPosition, client, GetGameTime());
+            }
+        }
         if (g_cvEnabled.BoolValue && g_cvReinforceOnDeath.BoolValue && !g_bombPlanted
             && IsClientInGame(client) && GetClientTeam(client) == CS_TEAM_CT && g_geometryReady && NavMeshReady())
         {
             float deathPosition[3];
             GetClientAbsOrigin(client, deathPosition);
-            RequestReinforcement(deathPosition, NearestSite(deathPosition), client, "CT casualty");
+            int deathSite = NearestSite(deathPosition);
+            if (!g_fullRotateSite[deathSite])
+                RequestReinforcement(deathPosition, deathSite, client, "CT casualty");
         }
         g_hasOrder[client] = false;
         g_orderExpires[client] = 0.0;
@@ -441,8 +544,10 @@ public Action Timer_Update(Handle timer)
     float elapsed = GetGameTime() - g_phaseStarted;
     if (g_phase == Phase_Initial && elapsed >= g_cvInitialHold.FloatValue)
     {
-        DebugLog("Initial setup expired; returning all bots to native AI.");
-        ResetDirector();
+        // Reviewing the setup must not remove every anchor before a late
+        // execute. Contact and casualties still trigger targeted support.
+        g_phaseStarted = GetGameTime();
+        DebugLog("CT setup reviewed; surviving anchors retained.");
     }
     else if (g_phase == Phase_GuardLooseBomb && FindLooseC4() == -1)
     {
@@ -1010,7 +1115,8 @@ void ReportEnemy(int spotter, const float enemyPosition[3], int site)
     DebugLog("%N reported enemy contact near %s.", spotter, location);
 }
 
-void RequestReinforcement(const float contactPosition[3], int site, int excludedClient, const char[] reason)
+int RequestReinforcement(const float contactPosition[3], int site, int excludedClient, const char[] reason,
+    int additionalExcluded = 0, bool allowEmptyOtherSite = false, bool onlyOtherSite = false)
 {
     float sitePosition[3], otherSite[3];
     if (site == 0)
@@ -1031,8 +1137,8 @@ void RequestReinforcement(const float contactPosition[3], int site, int excluded
             continue;
         float position[3];
         GetClientAbsOrigin(client, position);
-        if (Distance2D(position, otherSite) <= 850.0
-            || (g_hasOrder[client] && Distance2D(g_orderGoal[client], otherSite) <= 850.0))
+        if ((g_hasOrder[client] && Distance2D(g_orderGoal[client], otherSite) <= 850.0)
+            || (!g_hasOrder[client] && Distance2D(position, otherSite) <= 850.0))
             otherDefenders++;
     }
 
@@ -1040,16 +1146,18 @@ void RequestReinforcement(const float contactPosition[3], int site, int excluded
     float bestDistance = 99999999.0;
     for (int client = 1; client <= MaxClients; client++)
     {
-        if (!IsCTBot(client) || client == excludedClient || g_combatReleased[client])
+        if (!IsCTBot(client) || client == excludedClient || client == additionalExcluded || g_combatReleased[client])
             continue;
         float position[3];
         GetClientAbsOrigin(client, position);
         float contactDistance = Distance2D(position, contactPosition);
         if (contactDistance < 450.0)
             continue;
-        bool protectsOtherSite = Distance2D(position, otherSite) <= 850.0
-            || (g_hasOrder[client] && Distance2D(g_orderGoal[client], otherSite) <= 850.0);
-        if (protectsOtherSite && otherDefenders <= 1)
+        bool protectsOtherSite = (g_hasOrder[client] && Distance2D(g_orderGoal[client], otherSite) <= 850.0)
+            || (!g_hasOrder[client] && Distance2D(position, otherSite) <= 850.0);
+        if (onlyOtherSite && !protectsOtherSite)
+            continue;
+        if (protectsOtherSite && otherDefenders <= 1 && !allowEmptyOtherSite)
             continue;
         if (contactDistance < bestDistance)
         {
@@ -1061,7 +1169,7 @@ void RequestReinforcement(const float contactPosition[3], int site, int excluded
     if (selected == 0)
     {
         DebugLog("No safe CT reinforcement available for %s.", reason);
-        return;
+        return 0;
     }
 
     float dirX = contactPosition[0] - sitePosition[0];
@@ -1079,9 +1187,12 @@ void RequestReinforcement(const float contactPosition[3], int site, int excluded
         g_hasLook[selected] = true;
         g_orderRoute[selected] = view_as<int>(Route_Fastest);
         g_orderExpires[selected] = GetGameTime() + g_cvReinforceHold.FloatValue;
+        g_lastReinforcement[site] = selected;
         StartOrderProgress(selected);
         DebugLog("Assigned %N to reinforce %s for %s.", selected, site == 0 ? "A" : "B", reason);
+        return selected;
     }
+    return 0;
 }
 
 void ReleaseOrder(int client, const char[] reason)

@@ -3,7 +3,7 @@ param([Parameter(Mandatory = $true)][string]$TDirectorSource)
 $ErrorActionPreference = 'Stop'
 $text = Get-Content -LiteralPath $TDirectorSource -Raw
 $update = [regex]::Match($text, '(?s)public Action Timer_Update\(Handle timer\).*?bool ShouldUrgentlyPlant\(').Value
-$review = [regex]::Match($text, '(?s)void ReviewAttackCommit\(\).*?void PlanUrgentPlant\(').Value
+$review = [regex]::Match($text, '(?s)void ReviewAttackCommit\(\).*?void TryMidRoundRotation\(').Value
 
 if (-not $update.Contains('g_phase == TPhase_AttackCommit && GetGameTime() >= g_nextAttackReviewAt') -or
     -not $update.Contains('ReviewAttackCommit();') -or
