@@ -13,6 +13,8 @@ if ($runningServer) {
     throw "Stop the target srcds.exe before installing CT tactics. Use sm_bot_ct_tactics_enable 0 for live rollback."
 }
 
+& (Join-Path $PSScriptRoot "install_ct_nav_place.ps1") -ServerDir $ServerDir
+
 $smRoot = Join-Path $ServerDir "csgo\addons\sourcemod"
 $scriptingDir = Join-Path $smRoot "scripting"
 $includeDir = Join-Path $scriptingDir "include"
@@ -26,20 +28,27 @@ $profileConfig = Join-Path $smRoot "configs\bot_stuff.cfg"
 $directorSource = Join-Path $PSScriptRoot "bot_ct_tactics.sp"
 $tDirectorSource = Join-Path $PSScriptRoot "bot_t_tactics.sp"
 $sideStatsSource = Join-Path $PSScriptRoot "bot_side_win_stats.sp"
+$experienceSource = Join-Path $PSScriptRoot "bot_tactical_experience.sp"
 $installedDirectorSource = Join-Path $scriptingDir "bot_ct_tactics.sp"
 $installedTDirectorSource = Join-Path $scriptingDir "bot_t_tactics.sp"
 $installedSideStatsSource = Join-Path $scriptingDir "bot_side_win_stats.sp"
+$installedExperienceSource = Join-Path $scriptingDir "bot_tactical_experience.sp"
 $directorPlugin = Join-Path $pluginDir "001_bot_ct_tactics.smx"
 $tDirectorPlugin = Join-Path $pluginDir "002_bot_t_tactics.smx"
 $sideStatsPlugin = Join-Path $pluginDir "000_bot_side_win_stats.smx"
+$experiencePlugin = Join-Path $pluginDir "000_bot_tactical_experience.smx"
 $compatSource = Join-Path $PSScriptRoot "include\bot_stuff_compile_compat.inc"
 $navmeshSource = Join-Path $PSScriptRoot "include\navmesh.inc"
 $rosterSource = Join-Path $PSScriptRoot "include\bot_team_rosters.inc"
 $purchaseSource = Join-Path $PSScriptRoot "include\bot_purchase_policy.inc"
 $equipmentSource = Join-Path $PSScriptRoot "include\bot_equipment_policy.inc"
 $anglesSource = Join-Path $PSScriptRoot "include\bot_tactical_angles.inc"
+$looseC4Source = Join-Path $PSScriptRoot "include\bot_loose_c4_perception.inc"
+$fixedWatchSource = Join-Path $PSScriptRoot "include\bot_ct_fixed_watch.inc"
+$watchSectorsSource = Join-Path $PSScriptRoot "include\bot_ct_watch_sectors.inc"
+$entranceWatchSource = Join-Path $PSScriptRoot "include\bot_ct_entrance_watch.inc"
 
-foreach ($required in @($compiler, $botSource, $botPlugin, $directorSource, $tDirectorSource, $sideStatsSource, $compatSource, $navmeshSource, $rosterSource, $purchaseSource, $equipmentSource, $anglesSource)) {
+foreach ($required in @($compiler, $botSource, $botPlugin, $directorSource, $tDirectorSource, $sideStatsSource, $experienceSource, $compatSource, $navmeshSource, $rosterSource, $purchaseSource, $equipmentSource, $anglesSource, $looseC4Source, $fixedWatchSource, $watchSectorsSource, $entranceWatchSource)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required CT tactics installation file was not found: '$required'"
     }
@@ -1604,11 +1613,101 @@ elseif (-not $text.Contains('g_BotEquipmentRoutingBuy[iClient]')) {
         $forceBuyPolicy 'force-round 50/50 primary migration'
 }
 
+# Read-only perception bridge: register before optional tactical directors load.
+if (-not $text.Contains('CreateNative("BotStuff_CanSeeLooseC4"')) {
+    $text = Replace-Once $text 'MarkNativeAsOptional("BotCTTactics_GetOrder");' `
+        ('CreateNative("BotStuff_CanSeeLooseC4", Native_CanSeeLooseC4);' + $newline +
+         '    CreateNative("BotStuff_HasVisibleEnemy", Native_HasVisibleEnemy);' + $newline +
+         '    MarkNativeAsOptional("BotCTTactics_GetOrder");') 'CT loose C4 perception natives'
+}
+if (-not $text.Contains('#include <bot_loose_c4_perception>')) {
+    $text = Replace-Once $text 'public void OnPluginStart()' `
+        ('#include <bot_loose_c4_perception>' + $newline + $newline + 'public void OnPluginStart()') `
+        'CT loose C4 perception implementation'
+}
+
+# Keep the original engine perception result. The old callback promoted false
+# to true after finding any weapon_c4, even if the native bot manager had no
+# valid loose-C4 entity. Native Update then passed null to its chatter helper
+# (2026-10-20 dump: server.dll+0x4E06D3, read [null+0xD4]).
+# Custom sight sharing/guard movement belongs exclusively to the CT director.
+$nativeLooseC4Guard = @(
+    '// BEGIN NATIVE_LOOSE_C4_RESULT_GUARD',
+    'public MRESReturn CCSBot_CanSeeLooseBomb(int iClient, DHookReturn hReturn)',
+    '{',
+    '    // Never promote a native false result: a matching loose weapon does',
+    '    // not guarantee that the engine bot manager has a valid C4 handle.',
+    '    // Preserve native perception; optional CT guard orders use their own',
+    '    // confirmed sight interface and must not rewrite this engine result.',
+    '    return MRES_Ignored;',
+    '}',
+    '// END NATIVE_LOOSE_C4_RESULT_GUARD'
+) -join $newline
+if ($text.Contains('// BEGIN NATIVE_LOOSE_C4_RESULT_GUARD')) {
+    $text = Replace-RegexOnce $text `
+        '(?s)// BEGIN NATIVE_LOOSE_C4_RESULT_GUARD.*?// END NATIVE_LOOSE_C4_RESULT_GUARD' `
+        $nativeLooseC4Guard 'native loose C4 result guard refresh'
+}
+else {
+    $text = Replace-RegexOnce $text `
+        '(?s)public MRESReturn CCSBot_CanSeeLooseBomb\(int iClient, DHookReturn hReturn\)\s*\{.*?\r?\n\}' `
+        $nativeLooseC4Guard 'remove unsafe native loose C4 result override'
+}
+if (-not $text.Contains('stock int FindLooseBomb()')) {
+    $text = Replace-Once $text 'int FindLooseBomb()' 'stock int FindLooseBomb()' `
+        'retain optional legacy loose-weapon helper without an unused-symbol warning'
+}
+
+# Keep each settled CT's cached watch direction until its order is released.
+# Native idle/noise glance requests must not steal that assigned sector.
+if (-not $text.Contains('#include <bot_ct_fixed_watch>')) {
+    $text = Replace-Once $text 'public void OnPluginStart()' `
+        ('#include <bot_ct_fixed_watch>' + $newline + $newline + 'public void OnPluginStart()') `
+        'CT fixed-watch policy include'
+}
+if (-not $text.Contains('// BEGIN CT_FIXED_WATCH_LOOK_GUARD')) {
+    $lookGuard = @(
+        '// BEGIN CT_FIXED_WATCH_LOOK_GUARD',
+        '    if (StrEqual(szDesc, "CT assigned hold"))',
+        '        return MRES_Ignored; // Already a cached eye-height target; do not add 25 units.',
+        '    if (BotCTWatch_IsQuietHold(iClient) && !BotCTWatch_IsEssentialLook(szDesc, hParams.Get(7) != 0))',
+        '        return MRES_Supercede;',
+        '    // END CT_FIXED_WATCH_LOOK_GUARD'
+    ) -join $newline
+    $lookAnchor = 'DHookGetParamString(hParams, 1, szDesc, sizeof(szDesc));'
+    $text = Replace-Once $text $lookAnchor ($lookAnchor + $newline + '    ' + $lookGuard) `
+        'CT quiet hold attention arbitration'
+}
+$watchRefresh = @(
+        '// BEGIN CT_FIXED_WATCH_REFRESH',
+        '            bool bFixedCTWatch = BotCTWatch_IsQuietHold(iClient);',
+        '            if (bFixedCTWatch)',
+        '                BotSetLookAt(iClient, "CT assigned hold", fTacticalLook, PRIORITY_HIGH, 0.75, false, 8.0, false);',
+        '            else',
+        '                BotSetLookAt(iClient, "tactical hold", fTacticalLook, PRIORITY_HIGH, 0.75, false, 8.0, false);',
+        '            // END CT_FIXED_WATCH_REFRESH'
+    ) -join $newline
+if (-not $text.Contains('// BEGIN CT_FIXED_WATCH_REFRESH')) {
+    $text = Replace-Once $text `
+        'BotSetLookAt(iClient, "tactical hold", fTacticalLook, PRIORITY_HIGH, 0.75, false, 8.0, false);' `
+        $watchRefresh 'CT cached watch refresh without changing T behavior'
+}
+else {
+    $text = Replace-RegexOnce $text '(?s)// BEGIN CT_FIXED_WATCH_REFRESH.*?// END CT_FIXED_WATCH_REFRESH' `
+        $watchRefresh 'refresh CT cached watch implementation'
+}
+if (-not $text.Contains('fNow + (bFixedCTWatch ? 0.1 : 0.5)')) {
+    $text = Replace-Once $text 'g_fTacticalMoveTimestamp[iClient] = fNow + 0.5;' `
+        'g_fTacticalMoveTimestamp[iClient] = fNow + (bFixedCTWatch ? 0.1 : 0.5);' `
+        'renew settled CT attention before native expiry without accelerating T updates'
+}
+
 $candidateBotSource = Join-Path $buildDir "bot_stuff.sp"
 $candidateBotPlugin = Join-Path $buildDir "bot_stuff.smx"
 $candidateDirectorPlugin = Join-Path $buildDir "001_bot_ct_tactics.smx"
 $candidateTDirectorPlugin = Join-Path $buildDir "002_bot_t_tactics.smx"
 $candidateSideStatsPlugin = Join-Path $buildDir "000_bot_side_win_stats.smx"
+$candidateExperiencePlugin = Join-Path $buildDir "000_bot_tactical_experience.smx"
 
 try {
     [System.IO.File]::WriteAllText($candidateBotSource, $text, [System.Text.UTF8Encoding]::new($false))
@@ -1618,6 +1717,10 @@ try {
     Copy-Item -LiteralPath $purchaseSource -Destination (Join-Path $includeDir "bot_purchase_policy.inc") -Force
     Copy-Item -LiteralPath $equipmentSource -Destination (Join-Path $includeDir "bot_equipment_policy.inc") -Force
     Copy-Item -LiteralPath $anglesSource -Destination (Join-Path $includeDir "bot_tactical_angles.inc") -Force
+    Copy-Item -LiteralPath $looseC4Source -Destination (Join-Path $includeDir "bot_loose_c4_perception.inc") -Force
+    Copy-Item -LiteralPath $fixedWatchSource -Destination (Join-Path $includeDir "bot_ct_fixed_watch.inc") -Force
+    Copy-Item -LiteralPath $watchSectorsSource -Destination (Join-Path $includeDir "bot_ct_watch_sectors.inc") -Force
+    Copy-Item -LiteralPath $entranceWatchSource -Destination (Join-Path $includeDir "bot_ct_entrance_watch.inc") -Force
 
     & $compiler "-o$candidateDirectorPlugin" $directorSource
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateDirectorPlugin)) {
@@ -1631,6 +1734,10 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateSideStatsPlugin)) {
         throw "Failed to compile bot_side_win_stats.sp (exit code $LASTEXITCODE)."
     }
+    & $compiler "-o$candidateExperiencePlugin" $experienceSource
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateExperiencePlugin)) {
+        throw "Failed to compile bot_tactical_experience.sp (exit code $LASTEXITCODE)."
+    }
     & $compiler "-o$candidateBotPlugin" $candidateBotSource
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateBotPlugin)) {
         throw "Failed to compile the BetterBots CT tactics bridge (exit code $LASTEXITCODE)."
@@ -1640,10 +1747,12 @@ try {
     Copy-Item -LiteralPath $directorSource -Destination $installedDirectorSource -Force
     Copy-Item -LiteralPath $tDirectorSource -Destination $installedTDirectorSource -Force
     Copy-Item -LiteralPath $sideStatsSource -Destination $installedSideStatsSource -Force
+    Copy-Item -LiteralPath $experienceSource -Destination $installedExperienceSource -Force
     Move-Item -LiteralPath $candidateBotPlugin -Destination $botPlugin -Force
     Move-Item -LiteralPath $candidateDirectorPlugin -Destination $directorPlugin -Force
     Move-Item -LiteralPath $candidateTDirectorPlugin -Destination $tDirectorPlugin -Force
     Move-Item -LiteralPath $candidateSideStatsPlugin -Destination $sideStatsPlugin -Force
+    Move-Item -LiteralPath $candidateExperiencePlugin -Destination $experiencePlugin -Force
 
     # AutoExecConfig does not replace an existing cfg when plugin defaults
     # change. Migrate only our previous exact defaults so administrator custom
@@ -1655,6 +1764,9 @@ try {
         $ctConfigText = $ctConfigText -replace '(?m)^(\s*sm_bot_ct_tactics_initial_hold\s+")40\.0("\s*)$', '${1}70.0${2}'
         $ctConfigText = $ctConfigText -replace '(?m)^(\s*sm_bot_ct_tactics_retake_stage\s+")4\.0("\s*)$', '${1}6.0${2}'
         $ctConfigText = $ctConfigText -replace '(?m)^(\s*sm_bot_ct_tactics_retake_commit\s+")8\.0("\s*)$', '${1}14.0${2}'
+        # Previous default was three omniscient guards; now a confirmed CT
+        # sight mobilizes all alive bots. Preserve non-default admin caps.
+        $ctConfigText = $ctConfigText -replace '(?m)^(\s*sm_bot_ct_tactics_guard_count\s+")3("\s*)$', '${1}0${2}'
         [System.IO.File]::WriteAllText($ctConfig, $ctConfigText, [System.Text.UTF8Encoding]::new($false))
     }
 
@@ -1680,6 +1792,6 @@ finally {
     }
 }
 
-Write-Host "Installed reversible BetterBots CT and T tactical directors."
+Write-Host "Installed reversible BetterBots CT/T tactical directors and read-only experience recorder."
 Write-Host "Live disable: sm_bot_ct_tactics_enable 0 / sm_bot_t_tactics_enable 0"
 Write-Host "Full rollback (server stopped): .\rollback_ct_tactics.ps1 -ServerDir `"$ServerDir`""

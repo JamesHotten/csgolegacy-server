@@ -3,12 +3,14 @@
 #include <sdkhooks>
 #include <cstrike>
 #include <bot_equipment_policy>
+#include <bot_ct_watch_sectors>
 
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.0"
+#define PLUGIN_VERSION "0.1.3"
 #define MAX_CANDIDATES 256
+#define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
 
 // Minimal declarations for the already installed SourcePawn NavMesh parser.
@@ -17,11 +19,21 @@ native bool NavMesh_Exists();
 native int NavMesh_GetNearestArea(const float pos[3], bool anyZ=false, float maxDist=10000.0, bool checkLOS=false, bool checkGround=true, int team=TEAM_ANY);
 native void NavMesh_CollectSurroundingAreas(ArrayStack stack, int startArea, float travelDistLimit=1500.0, float maxStepUpLimit=18.0, float maxDropDownLimit=100.0);
 native bool NavMeshArea_GetCenter(int areaIndex, float buffer[3]);
+native void NavMeshArea_GetClosestPointOnArea(int areaIndex, const float position[3], float result[3]);
 native void NavMeshArea_GetPlace(int areaIndex, char[] buffer, int maxlen);
+native void NavMeshArea_GetPlaceCanonical(int areaIndex, char[] buffer, int maxlen);
+native int NavMesh_WorldToGridX(float x);
+native int NavMesh_WorldToGridY(float y);
+native void NavMesh_GetAreasOnGrid(ArrayStack areas, int x, int y);
 native void NavMeshArea_GetHidingSpots(ArrayStack stack, int areaIndex);
 native void NavHidingSpot_GetPosition(int hidingSpotIndex, float buffer[3]);
+native void BotExperience_RecordOpeningPlan(int team, int buy, int plan, int site, int botCount);
+native void BotExperience_RecordSignal(int team, const char[] kind, const char[] detail, int site, int actor);
+native bool BotStuff_CanSeeLooseC4(int client, int bomb);
+native bool BotStuff_HasVisibleEnemy(int client);
 
 #include <bot_tactical_angles>
+#include <bot_ct_entrance_watch>
 
 enum TacticalPhase
 {
@@ -66,6 +78,7 @@ public Plugin myinfo =
 
 ConVar g_cvEnabled;
 ConVar g_cvDebug;
+ConVar g_cvEntranceWatch;
 ConVar g_cvInitialHold;
 ConVar g_cvRetakeStage;
 ConVar g_cvRetakeCommit;
@@ -89,6 +102,7 @@ ConVar g_cvMidReorganize;
 TacticalPhase g_phase = Phase_Idle;
 BuyState g_buyState = Buy_Full;
 DefensePlan g_plan = Plan_Standard;
+int g_planSite = -1;
 float g_phaseStarted;
 float g_siteA[3];
 float g_siteB[3];
@@ -96,6 +110,13 @@ float g_tSpawn[3];
 float g_bombPosition[3];
 bool g_geometryReady;
 bool g_bombPlanted;
+bool g_roundLive;
+int g_guardBombRef = INVALID_ENT_REFERENCE;
+int g_guardSlot[MAXPLAYERS + 1];
+int g_guardStalls[MAXPLAYERS + 1];
+float g_lastCombatAt[MAXPLAYERS + 1];
+float g_guardReleasedAt[MAXPLAYERS + 1];
+float g_blindUntil[MAXPLAYERS + 1];
 bool g_retakeContact;
 float g_lastContactAt[2];
 int g_siteEnemyUserId[2][4];
@@ -123,6 +144,10 @@ float g_candidates[MAX_CANDIDATES][3];
 int g_candidateCount;
 float g_targets[MAXPLAYERS + 1][3];
 int g_targetCount;
+char g_anchorPlaces[2][ANCHORS_PER_SITE][32];
+float g_anchorPositions[2][ANCHORS_PER_SITE][3];
+bool g_anchorAttempted[2][ANCHORS_PER_SITE];
+bool g_anchorResolved[2][ANCHORS_PER_SITE];
 
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMax)
 {
@@ -135,9 +160,18 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     MarkNativeAsOptional("NavMesh_GetNearestArea");
     MarkNativeAsOptional("NavMesh_CollectSurroundingAreas");
     MarkNativeAsOptional("NavMeshArea_GetCenter");
+    MarkNativeAsOptional("NavMeshArea_GetClosestPointOnArea");
     MarkNativeAsOptional("NavMeshArea_GetPlace");
+    MarkNativeAsOptional("NavMeshArea_GetPlaceCanonical");
+    MarkNativeAsOptional("NavMesh_WorldToGridX");
+    MarkNativeAsOptional("NavMesh_WorldToGridY");
+    MarkNativeAsOptional("NavMesh_GetAreasOnGrid");
     MarkNativeAsOptional("NavMeshArea_GetHidingSpots");
     MarkNativeAsOptional("NavHidingSpot_GetPosition");
+    MarkNativeAsOptional("BotExperience_RecordOpeningPlan");
+    MarkNativeAsOptional("BotExperience_RecordSignal");
+    MarkNativeAsOptional("BotStuff_CanSeeLooseC4");
+    MarkNativeAsOptional("BotStuff_HasVisibleEnemy");
     return APLRes_Success;
 }
 
@@ -145,12 +179,14 @@ public void OnPluginStart()
 {
     g_cvEnabled = CreateConVar("sm_bot_ct_tactics_enable", "1", "Enable the reversible CT tactical director.", _, true, 0.0, true, 1.0);
     g_cvDebug = CreateConVar("sm_bot_ct_tactics_debug", "0", "Log CT tactical plans and assignments.", _, true, 0.0, true, 1.0);
+    g_cvEntranceWatch = CreateConVar("sm_bot_ct_entrance_watch", "1", "Use visible named entrances for standard Mirage/Dust2 opening holds; otherwise use generic angles.", _, true, 0.0, true, 1.0);
+    g_cvEntranceWatch.AddChangeHook(OnEntranceWatchChanged);
     g_cvInitialHold = CreateConVar("sm_bot_ct_tactics_initial_hold", "70.0", "Seconds between CT setup reviews; intact anchors remain in place.", _, true, 5.0, true, 105.0);
     g_cvRetakeStage = CreateConVar("sm_bot_ct_tactics_retake_stage", "6.0", "Minimum seconds spent taking distinct retake approaches.", _, true, 0.5, true, 12.0);
     g_cvRetakeCommit = CreateConVar("sm_bot_ct_tactics_retake_commit", "14.0", "Maximum seconds to push the planted bomb after staging.", _, true, 2.0, true, 25.0);
     g_cvRetakeStageTimeout = CreateConVar("sm_bot_ct_tactics_retake_stage_timeout", "12.0", "Hard timeout before committing the retake.", _, true, 2.0, true, 20.0);
     g_cvSyncMinReady = CreateConVar("sm_bot_ct_tactics_sync_min_ready", "50", "Percent of active ordered CT bots required at retake staging goals.", _, true, 20.0, true, 100.0);
-    g_cvGuardCount = CreateConVar("sm_bot_ct_tactics_guard_count", "3", "Maximum CT bots assigned to guard a dropped C4.", _, true, 1.0, true, 5.0);
+    g_cvGuardCount = CreateConVar("sm_bot_ct_tactics_guard_count", "0", "Dropped C4 guards: 0 = all alive CT bots; positive values cap the count.", _, true, 0.0, true, 5.0);
 
     g_cvFullPushChance = CreateConVar("sm_bot_ct_tactics_full_push_chance", "10", "Full-buy chance for a single-site push.", _, true, 0.0, true, 100.0);
     g_cvFullStackChance = CreateConVar("sm_bot_ct_tactics_full_stack_chance", "15", "Full-buy chance for a choke stack.", _, true, 0.0, true, 100.0);
@@ -181,6 +217,7 @@ public void OnPluginStart()
     HookEvent("weapon_fire", Event_Contact, EventHookMode_Post);
     HookEvent("player_hurt", Event_PlayerHurt, EventHookMode_Post);
     HookEvent("player_death", Event_PlayerDeath, EventHookMode_Post);
+    HookEvent("player_blind", Event_PlayerBlind, EventHookMode_Post);
 
     RegAdminCmd("sm_ct_tactics_status", Command_Status, ADMFLAG_GENERIC, "Show the current CT tactical plan and active orders.");
     RegAdminCmd("sm_ct_tactics_replan", Command_Replan, ADMFLAG_GENERIC, "Rebuild the current round's CT setup.");
@@ -193,12 +230,37 @@ public void OnMapStart()
     ResetDirector();
     ClearCombatReleases();
     g_bombPlanted = false;
+    g_roundLive = false;
     g_geometryReady = false;
+    ConfigureMapAnchorProfile();
+}
+
+public void OnEntranceWatchChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+    ConfigureMapAnchorProfile(); // Next round/replan must not reuse the other decoding mode's cached anchors.
+}
+
+void CTWatch_GetPlace(int area, char[] place, int length)
+{
+    char map[64];
+    GetCurrentMap(map, sizeof(map));
+    if (g_cvEntranceWatch.BoolValue && (StrEqual(map, "de_mirage") || StrEqual(map, "de_dust2"))
+        && NativeAvailable("NavMeshArea_GetPlaceCanonical"))
+        NavMeshArea_GetPlaceCanonical(area, place, length);
+    else
+        NavMeshArea_GetPlace(area, place, length);
 }
 
 public void OnClientPutInServer(int client)
 {
     g_combatReleased[client] = false;
+    g_guardSlot[client] = -1;
+    g_guardStalls[client] = 0;
+    g_lastCombatAt[client] = -100.0;
+    g_guardReleasedAt[client] = -100.0;
+    g_blindUntil[client] = 0.0;
+    g_hasOrder[client] = false;
+    g_hasLook[client] = false;
 }
 
 public void OnEnabledChanged(ConVar convar, const char[] oldValue, const char[] newValue)
@@ -238,6 +300,12 @@ public Action Command_Status(int client, int args)
     ReplyToCommand(client, "[CT Tactics] ct_bots=%d armored=%d primary_without_armor=%d",
         ctBots, armored, primaryWithoutArmor);
     ReplyToCommand(client, "[CT Tactics] retake_ready=%d/%d contact=%d", syncReady, syncOrdered, g_retakeContact);
+    int guards;
+    for (int i = 1; i <= MaxClients; i++)
+        if (IsCTBot(i) && g_guardSlot[i] >= 0) guards++;
+    ReplyToCommand(client, "[CT Tactics] loose_c4_known=%d guard_members=%d perception=%d",
+        g_guardBombRef != INVALID_ENT_REFERENCE, guards,
+        NativeAvailable("BotStuff_CanSeeLooseC4") && NativeAvailable("BotStuff_HasVisibleEnemy"));
     ReplyToCommand(client, "[CT Tactics] mid_reorganize_enabled=%d reorg_A/B=%d/%d full_rotate_A/B=%d/%d",
         g_cvMidReorganize.BoolValue, g_reorganizedSite[0], g_reorganizedSite[1],
         g_fullRotateSite[0], g_fullRotateSite[1]);
@@ -311,7 +379,11 @@ public any Native_ReportContact(Handle plugin, int numParams)
     float enemyPosition[3];
     GetClientAbsOrigin(enemy, enemyPosition);
     int site = NearestSite(enemyPosition);
+    ExperienceSignal("first_sight", "visible_enemy", site, spotter);
     float now = GetGameTime();
+    // Refresh even when site radio is on cooldown or this bot already yielded
+    // its order. Otherwise it can be pulled back into formation mid-fight.
+    g_lastCombatAt[spotter] = now;
     if ((g_phase == Phase_Initial || g_phase == Phase_CarrierResponse) && IsBombCarrier(enemy))
     {
         // The spotter keeps fighting. Every other available CT abandons the
@@ -371,6 +443,7 @@ void PlanCarrierResponse(const float carrierPosition[3])
     g_phaseStarted = now;
     g_carrierLastPlanAt = now;
     CopyVector(carrierPosition, g_carrierLastPosition);
+    ExperienceSignal("carrier_rotate", "bomb_carrier_spotted", NearestSite(carrierPosition), 0);
     DebugLog("C4 carrier spotted: all available CT bots rotating to the last confirmed position.");
 }
 
@@ -418,6 +491,7 @@ void TryReorganizeDefense(int site, const float contactPosition[3], int spotter,
         {
             g_fullRotateSite[site] = true;
             g_reorganizedSite[site] = true;
+            ExperienceSignal("full_rotate", "confirmed_execute", site, 0);
             DebugLog("CT full rotation toward %s after strong execute evidence: %d weak-side defenders.", site == 0 ? "A" : "B", rotated);
         }
         return;
@@ -426,12 +500,14 @@ void TryReorganizeDefense(int site, const float contactPosition[3], int spotter,
         return;
     g_reorganizedSite[site] = true;
     RequestReinforcement(contactPosition, site, spotter, "confirmed multi-enemy site pressure", g_lastReinforcement[site]);
+    ExperienceSignal("reorganize", "multi_enemy_pressure", site, 0);
     DebugLog("Mid-round CT defense reorganized toward %s; opposite-site anchor retained.", site == 0 ? "A" : "B");
 }
 
 public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
 {
     ResetDirector();
+    g_roundLive = false;
     ClearCombatReleases();
     g_bombPlanted = false;
     g_retakeContact = false;
@@ -454,6 +530,7 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
 
 public void Event_FreezeEnd(Event event, const char[] name, bool dontBroadcast)
 {
+    g_roundLive = GameRules_GetProp("m_bWarmupPeriod") == 0;
     if (!g_cvEnabled.BoolValue || !RefreshGeometry() || !NavMeshReady())
     {
         DebugLog("Initial plan skipped: geometry or navmesh unavailable.");
@@ -468,25 +545,15 @@ public void Event_FreezeEnd(Event event, const char[] name, bool dontBroadcast)
 
 public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast)
 {
+    g_roundLive = false;
     ResetDirector();
     g_bombPlanted = false;
 }
 
 public void Event_BombDropped(Event event, const char[] name, bool dontBroadcast)
 {
-    if (g_cvEnabled.BoolValue)
-        CreateTimer(0.2, Timer_PlanGuard, _, TIMER_FLAG_NO_MAPCHANGE);
-}
-
-public Action Timer_PlanGuard(Handle timer)
-{
-    int c4 = FindLooseC4();
-    if (c4 == -1)
-        return Plugin_Stop;
-
-    GetEntPropVector(c4, Prop_Send, "m_vecOrigin", g_bombPosition);
-    PlanLooseBombGuard();
-    return Plugin_Stop;
+    // The global event is not CT knowledge. The existing half-second update
+    // waits for an alive CT's forward, unobstructed, smoke-free view instead.
 }
 
 public void Event_BombPickup(Event event, const char[] name, bool dontBroadcast)
@@ -497,6 +564,7 @@ public void Event_BombPickup(Event event, const char[] name, bool dontBroadcast)
 
 public void Event_BombPlanted(Event event, const char[] name, bool dontBroadcast)
 {
+    ClearLooseBombGuard();
     g_bombPlanted = true;
     g_retakeContact = false;
     // A CT that fought during the site take must still receive the new retake
@@ -525,16 +593,33 @@ public void Event_BombBeginDefuse(Event event, const char[] name, bool dontBroad
 
 public void Event_RoundObjectiveComplete(Event event, const char[] name, bool dontBroadcast)
 {
+    g_roundLive = false;
     ResetDirector();
     g_bombPlanted = false;
 }
 
 public void Event_Contact(Event event, const char[] name, bool dontBroadcast)
 {
+    if (IsUtilityWeaponFire(event))
+        return; // Utility use must not release an otherwise valid CT position.
     int client = GetClientOfUserId(event.GetInt("userid"));
     if (g_phase == Phase_RetakeStage && IsCTBot(client))
         g_retakeContact = true;
     ReleaseOrder(client, "weapon contact");
+}
+
+bool IsUtilityWeaponFire(Event event)
+{
+    char weapon[32];
+    event.GetString("weapon", weapon, sizeof(weapon));
+    ReplaceString(weapon, sizeof(weapon), "weapon_", "", false);
+    return StrEqual(weapon, "smokegrenade", false)
+        || StrEqual(weapon, "flashbang", false)
+        || StrEqual(weapon, "hegrenade", false)
+        || StrEqual(weapon, "molotov", false)
+        || StrEqual(weapon, "incgrenade", false)
+        || StrEqual(weapon, "decoy", false)
+        || StrEqual(weapon, "tagrenade", false);
 }
 
 public void Event_PlayerHurt(Event event, const char[] name, bool dontBroadcast)
@@ -545,6 +630,13 @@ public void Event_PlayerHurt(Event event, const char[] name, bool dontBroadcast)
         g_retakeContact = true;
     ReleaseOrder(victim, "hurt");
     ReleaseOrder(attacker, "combat");
+}
+
+public void Event_PlayerBlind(Event event, const char[] name, bool dontBroadcast)
+{
+    int client = GetClientOfUserId(event.GetInt("userid"));
+    if (client >= 1 && client <= MaxClients)
+        g_blindUntil[client] = GetGameTime() + event.GetFloat("blind_duration");
 }
 
 public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast)
@@ -579,14 +671,18 @@ public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast
         g_hasOrder[client] = false;
         g_orderExpires[client] = 0.0;
         g_orderArrived[client] = false;
+        g_guardSlot[client] = -1;
     }
 }
 
 public Action Timer_Update(Handle timer)
 {
-    if (!g_cvEnabled.BoolValue || g_phase == Phase_Idle)
+    if (!g_cvEnabled.BoolValue)
         return Plugin_Continue;
 
+    UpdateLooseBombGuard();
+    if (g_phase == Phase_Idle)
+        return Plugin_Continue;
     ReleaseStalledOrders();
     float elapsed = GetGameTime() - g_phaseStarted;
     if (g_phase == Phase_Initial && elapsed >= g_cvInitialHold.FloatValue)
@@ -595,10 +691,6 @@ public Action Timer_Update(Handle timer)
         // execute. Contact and casualties still trigger targeted support.
         g_phaseStarted = GetGameTime();
         DebugLog("CT setup reviewed; surviving anchors retained.");
-    }
-    else if (g_phase == Phase_GuardLooseBomb && FindLooseC4() == -1)
-    {
-        ResetDirector();
     }
     else if (g_phase == Phase_RetakeStage
         && (g_retakeContact
@@ -622,12 +714,16 @@ void PlanInitialDefense()
     if (count == 0)
         return;
 
+    // An administrator can explicitly replan mid-round; do not retain loose
+    // C4 membership/cache while publishing an unrelated opening formation.
+    ClearLooseBombGuard();
     g_buyState = ClassifyCTBuy();
     // A pistol round has the same low equipment profile as an eco, but it is
     // not an eco strategy round. Keep both regulation pistol rounds on the
     // balanced 2A/2B/rotator setup; reserve pressure/stack rolls for actual
     // eco and force-buy rounds.
     g_plan = IsRegulationPistolRound() ? Plan_Standard : ChooseDefensePlan(g_buyState);
+    g_planSite = -1;
     g_targetCount = 0;
 
     if (g_plan == Plan_Standard)
@@ -641,13 +737,16 @@ void PlanInitialDefense()
     // Initial deployments are time-sensitive and must not inherit BetterBots'
     // accumulated danger weights. SAFEST_ROUTE can send an A defender through
     // B/T spawn; FASTEST_ROUTE keeps the setup on its intended side of the map.
-    AssignTargets(bots, count, Route_Fastest);
+    AssignTargets(bots, count, Route_Fastest, -1, true);
     g_phase = Phase_Initial;
     g_phaseStarted = GetGameTime();
+    ExperienceSignal("opening_orders", "initial_defense", g_planSite, 0);
     char buy[12], plan[24];
     GetBuyName(g_buyState, buy, sizeof(buy));
     GetPlanName(g_plan, plan, sizeof(plan));
     DebugLog("Initial CT plan: buy=%s plan=%s bots=%d", buy, plan, count);
+    if (GetFeatureStatus(FeatureType_Native, "BotExperience_RecordOpeningPlan") == FeatureStatus_Available)
+        BotExperience_RecordOpeningPlan(CS_TEAM_CT, view_as<int>(g_buyState), view_as<int>(g_plan), g_planSite, count);
 }
 
 void BuildStandardTargets(int count)
@@ -656,14 +755,8 @@ void BuildStandardTargets(int count)
     int countB = count / 2;
     int rotators = count - countA - countB;
 
-    float dirAX = g_tSpawn[0] - g_siteA[0];
-    float dirAY = g_tSpawn[1] - g_siteA[1];
-    float dirBX = g_tSpawn[0] - g_siteB[0];
-    float dirBY = g_tSpawn[1] - g_siteB[1];
-    Normalize2D(dirAX, dirAY);
-    Normalize2D(dirBX, dirBY);
-    BuildAround(g_siteA, countA, 180.0, 650.0, true, dirAX, dirAY);
-    BuildAround(g_siteB, countB, 180.0, 650.0, true, dirBX, dirBY);
+    BuildDefensiveSiteTargets(0, countA, true);
+    BuildDefensiveSiteTargets(1, countB, true);
 
     if (rotators > 0)
     {
@@ -677,6 +770,7 @@ void BuildStandardTargets(int count)
 void BuildPushTargets(int count)
 {
     bool pushA = GetRandomInt(0, 1) == 0;
+    g_planSite = pushA ? 0 : 1;
     float pushSite[3], otherSite[3];
     if (pushA)
     {
@@ -698,7 +792,7 @@ void BuildPushTargets(int count)
 
     int remaining = count - pushCount;
     int otherCount = remaining >= 2 ? 2 : remaining;
-    BuildAround(otherSite, otherCount, 180.0, 600.0, false, 0.0, 0.0);
+    BuildDefensiveSiteTargets(pushA ? 1 : 0, otherCount, false);
 
     int rotators = remaining - otherCount;
     if (rotators > 0)
@@ -716,6 +810,7 @@ void BuildPushTargets(int count)
 void BuildStackTargets(int count)
 {
     bool stackA = GetRandomInt(0, 1) == 0;
+    g_planSite = stackA ? 0 : 1;
     float stackSite[3], otherSite[3];
     if (stackA)
     {
@@ -737,12 +832,196 @@ void BuildStackTargets(int count)
     BuildAround(stackSite, stackCount, 250.0, 700.0, true, dirX, dirY);
 
     int otherCount = count - stackCount;
-    BuildAround(otherSite, otherCount, 180.0, 600.0, false, 0.0, 0.0);
+    BuildDefensiveSiteTargets(stackA ? 1 : 0, otherCount, false);
 
     DebugLog("Choke stack selected for site %s.", stackA ? "A" : "B");
 }
 
-void PlanLooseBombGuard()
+void ConfigureMapAnchorProfile()
+{
+    for (int site = 0; site < 2; site++)
+    {
+        for (int slot = 0; slot < ANCHORS_PER_SITE; slot++)
+        {
+            g_anchorPlaces[site][slot][0] = '\0';
+            g_anchorAttempted[site][slot] = false;
+            g_anchorResolved[site][slot] = false;
+        }
+    }
+
+    char map[64];
+    GetCurrentMap(map, sizeof(map));
+    if (StrEqual(map, "de_inferno", false))
+        SetAnchorProfile("BombsiteA", "Pit", "BombsiteB", "Ruins");
+    else if (StrEqual(map, "de_train", false))
+        SetAnchorProfile("BombsiteA", "Connector", "BombsiteB", "BPlatform");
+    else if (StrEqual(map, "de_mirage", false))
+        SetAnchorProfile("BombsiteA", "Stairs", "BombsiteB", "Shop");
+    else if (StrEqual(map, "de_nuke", false))
+        SetAnchorProfile("BombsiteA", "Heaven", "BombsiteB", "Decon");
+    else if (StrEqual(map, "de_dust2", false))
+        SetAnchorProfile("BombsiteA", "LongA", "BombsiteB", "BDoors");
+    else if (StrEqual(map, "de_overpass", false))
+        SetAnchorProfile("BombsiteA", "BackofA", "BombsiteB", "Construction");
+    else if (StrEqual(map, "de_vertigo", false))
+        SetAnchorProfile("BombsiteA", "BackofA", "BombsiteB", "BackofB");
+    else if (StrEqual(map, "de_ancient", false))
+        SetAnchorProfile("BombsiteA", "SideHall", "BombsiteB", "Ruins");
+    else if (StrEqual(map, "de_anubis", false))
+        SetAnchorProfile("BombsiteA", "Heaven", "BombsiteB", "BackofB");
+}
+
+void SetAnchorProfile(const char[] aPrimary, const char[] aSecondary,
+    const char[] bPrimary, const char[] bSecondary)
+{
+    strcopy(g_anchorPlaces[0][0], 32, aPrimary);
+    strcopy(g_anchorPlaces[0][1], 32, aSecondary);
+    strcopy(g_anchorPlaces[1][0], 32, bPrimary);
+    strcopy(g_anchorPlaces[1][1], 32, bSecondary);
+}
+
+void BuildDefensiveSiteTargets(int site, int wanted, bool directional)
+{
+    if (wanted <= 0)
+        return;
+
+    int before = g_targetCount;
+    for (int slot = 0; slot < ANCHORS_PER_SITE && g_targetCount - before < wanted; slot++)
+        TryAppendNamedAnchor(site, slot);
+
+    int missing = wanted - (g_targetCount - before);
+    if (missing <= 0)
+        return;
+
+    float sitePosition[3];
+    CopyVector(site == 0 ? g_siteA : g_siteB, sitePosition);
+    float dirX = g_tSpawn[0] - sitePosition[0];
+    float dirY = g_tSpawn[1] - sitePosition[1];
+    Normalize2D(dirX, dirY);
+    BuildAround(sitePosition, missing, 180.0, directional ? 650.0 : 600.0,
+        directional, dirX, dirY);
+}
+
+bool TryAppendNamedAnchor(int site, int slot)
+{
+    if (g_anchorPlaces[site][slot][0] == '\0')
+        return false;
+    if (!g_anchorAttempted[site][slot])
+        ResolveNamedAnchor(site, slot);
+    if (!g_anchorResolved[site][slot])
+        return false;
+
+    for (int target = 0; target < g_targetCount; target++)
+    {
+        if (GetVectorDistance(g_anchorPositions[site][slot], g_targets[target]) < 150.0)
+            return false;
+    }
+    AppendTarget(g_anchorPositions[site][slot]);
+    return true;
+}
+
+void ResolveNamedAnchor(int site, int slot)
+{
+    g_anchorAttempted[site][slot] = true;
+    float sitePosition[3];
+    CopyVector(site == 0 ? g_siteA : g_siteB, sitePosition);
+    int startArea = NavMesh_GetNearestArea(sitePosition, false, 600.0, false, true, TEAM_ANY);
+    if (startArea < 0)
+        return;
+
+    ArrayStack areas = new ArrayStack();
+    areas.Push(startArea);
+    NavMesh_CollectSurroundingAreas(areas, startArea, 1250.0, 18.0, 100.0);
+    float bestScore = -999999.0;
+    float bestPosition[3];
+    while (!areas.Empty)
+    {
+        int area = areas.Pop();
+        char place[32];
+        CTWatch_GetPlace(area, place, sizeof(place));
+        if (!StrEqual(place, g_anchorPlaces[site][slot], false))
+            continue;
+
+        float center[3];
+        if (NavMeshArea_GetCenter(area, center))
+            ConsiderAnchorCandidate(sitePosition, center, slot == 0, bestScore, bestPosition);
+        ArrayStack spots = new ArrayStack();
+        NavMeshArea_GetHidingSpots(spots, area);
+        while (!spots.Empty)
+        {
+            float position[3];
+            NavHidingSpot_GetPosition(spots.Pop(), position);
+            ConsiderAnchorCandidate(sitePosition, position, slot == 0, bestScore, bestPosition);
+        }
+        delete spots;
+    }
+    delete areas;
+
+    if (bestScore <= -999999.0)
+    {
+        DebugLog("No valid %s site anchor at NAV place %s; using generic setup.",
+            site == 0 ? "A" : "B", g_anchorPlaces[site][slot]);
+        return;
+    }
+    CopyVector(bestPosition, g_anchorPositions[site][slot]);
+    g_anchorResolved[site][slot] = true;
+    DebugLog("Resolved %s site anchor %s at %.0f %.0f %.0f.",
+        site == 0 ? "A" : "B", g_anchorPlaces[site][slot],
+        bestPosition[0], bestPosition[1], bestPosition[2]);
+}
+
+void ConsiderAnchorCandidate(const float sitePosition[3], const float position[3],
+    bool primary, float &bestScore, float bestPosition[3])
+{
+    if (FloatAbs(position[2] - sitePosition[2]) > 250.0)
+        return;
+    float distance = Distance2D(sitePosition, position);
+    if (distance > 850.0)
+        return;
+    float preferredDistance = primary ? 230.0 : 430.0;
+    float score = -FloatAbs(distance - preferredDistance);
+    if (score > bestScore)
+    {
+        bestScore = score;
+        CopyVector(position, bestPosition);
+    }
+}
+
+void UpdateLooseBombGuard()
+{
+    if (!g_roundLive || g_bombPlanted || !g_geometryReady || !NavMeshReady())
+        return;
+    // Fail closed when BetterBots is absent: never invent visual knowledge.
+    if (!NativeAvailable("BotStuff_CanSeeLooseC4") || !NativeAvailable("BotStuff_HasVisibleEnemy"))
+    {
+        if (g_phase == Phase_GuardLooseBomb) ResetDirector();
+        return;
+    }
+    int bomb = FindLooseC4();
+    if (g_phase == Phase_GuardLooseBomb && (bomb == -1 || EntRefToEntIndex(g_guardBombRef) != bomb))
+        ResetDirector();
+    if (bomb == -1) return;
+
+    float position[3];
+    GetEntPropVector(bomb, Prop_Send, "m_vecOrigin", position);
+    // A sliding C4 only changes the shared objective after another real sight;
+    // retain the last confirmed position if it moves out of view.
+    bool needsPlan = g_phase != Phase_GuardLooseBomb || GetVectorDistance(position, g_bombPosition) >= 128.0;
+    if (needsPlan)
+    {
+        for (int client = 1; client <= MaxClients; client++)
+        {
+            if (!IsClientInGame(client) || !IsPlayerAlive(client) || GetClientTeam(client) != CS_TEAM_CT
+                || g_blindUntil[client] > GetGameTime() || !BotStuff_CanSeeLooseC4(client, bomb))
+                continue;
+            PlanLooseBombGuard(bomb, client);
+            break;
+        }
+    }
+    if (g_phase == Phase_GuardLooseBomb) ResumeLooseBombGuards();
+}
+
+void PlanLooseBombGuard(int bomb, int spotter)
 {
     int bots[MAXPLAYERS + 1];
     int count = CollectCTBots(bots);
@@ -750,16 +1029,77 @@ void PlanLooseBombGuard()
         return;
 
     int guardCount = g_cvGuardCount.IntValue;
-    if (guardCount > count)
+    if (guardCount == 0 || guardCount > count)
         guardCount = count;
 
+    ClearOrders();
+    ClearLooseBombGuard();
+    g_guardBombRef = EntIndexToEntRef(bomb);
+    GetEntPropVector(bomb, Prop_Send, "m_vecOrigin", g_bombPosition);
+    g_phase = Phase_GuardLooseBomb;
+    g_phaseStarted = GetGameTime();
     g_targetCount = 0;
     BuildAround(g_bombPosition, guardCount, 160.0, 620.0, false, 0.0, 0.0);
     FillMissingTargetsAt(guardCount, g_bombPosition);
-    AssignTargets(bots, count, Route_Safest, guardCount);
-    g_phase = Phase_GuardLooseBomb;
-    g_phaseStarted = GetGameTime();
-    DebugLog("Assigned %d CT bots to defend the dropped C4.", guardCount);
+    // Reserve a stable slot for EVERY guard, including bots currently fighting
+    // and those released earlier in the round. Publish only after combat ends.
+    bool used[MAXPLAYERS + 1];
+    for (int target = 0; target < guardCount; target++)
+    {
+        int selected;
+        float bestDistance = 99999999.0;
+        for (int index = 0; index < count; index++)
+        {
+            int client = bots[index];
+            if (used[client]) continue;
+            float position[3];
+            GetClientAbsOrigin(client, position);
+            float distance = GetVectorDistance(position, g_targets[target]);
+            if (distance < bestDistance) { selected = client; bestDistance = distance; }
+        }
+        if (selected == 0) continue;
+        used[selected] = true;
+        g_guardSlot[selected] = target;
+        CopyVector(g_targets[target], g_orderGoal[selected]);
+        SetOrderLook(selected, g_tSpawn, target);
+    }
+    ExperienceSignal("guard_bomb", "loose_c4_seen", NearestSite(g_bombPosition), spotter);
+    DebugLog("%N saw dropped C4; reserved %d CT guard positions.", spotter, guardCount);
+}
+
+void ResumeLooseBombGuards()
+{
+    float now = GetGameTime();
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!IsCTBot(client) || g_guardSlot[client] < 0) continue;
+        if (BotStuff_HasVisibleEnemy(client))
+        {
+            ReleaseOrder(client, "enemy spotted");
+            continue;
+        }
+        if (g_hasOrder[client] || g_guardStalls[client] >= 3 || g_blindUntil[client] > now
+            || now - g_lastCombatAt[client] < 2.5 || now - g_guardReleasedAt[client] < 2.5)
+            continue;
+        g_combatReleased[client] = false;
+        g_hasOrder[client] = true;
+        g_hasLook[client] = true;
+        g_orderRoute[client] = view_as<int>(Route_Fastest);
+        g_orderExpires[client] = 0.0;
+        StartOrderProgress(client);
+        ExperienceSignal("guard_resume", "quiet_after_contact", NearestSite(g_bombPosition), client);
+    }
+}
+
+void ClearLooseBombGuard()
+{
+    g_guardBombRef = INVALID_ENT_REFERENCE;
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        g_guardSlot[client] = -1;
+        g_guardStalls[client] = 0;
+        g_guardReleasedAt[client] = -100.0;
+    }
 }
 
 void PlanRetake(bool commit)
@@ -779,6 +1119,7 @@ void PlanRetake(bool commit)
     AssignTargets(bots, count, commit ? Route_Fastest : Route_Safest);
     g_phase = commit ? Phase_RetakeCommit : Phase_RetakeStage;
     g_phaseStarted = GetGameTime();
+    ExperienceSignal(commit ? "retake_commit" : "retake_stage", "bomb_planted", NearestSite(g_bombPosition), 0);
     DebugLog(commit ? "CT retake committed to the bomb." : "CT retake staging on distinct approaches.");
 }
 
@@ -934,13 +1275,17 @@ void FillMissingTargetsAt(int wanted, const float fallback[3])
         AppendProjectedTarget(fallback);
 }
 
-void AssignTargets(const int bots[MAXPLAYERS + 1], int botCount, RouteType route, int targetLimit = -1)
+void AssignTargets(const int bots[MAXPLAYERS + 1], int botCount, RouteType route, int targetLimit = -1, bool siteLocalWatch = false)
 {
     ClearOrders();
     bool used[MAXPLAYERS + 1];
     int limit = targetLimit == -1 ? g_targetCount : targetLimit;
     if (limit > g_targetCount)
         limit = g_targetCount;
+    int siteSlots[2], siteCounts[2], usedEntrances[2];
+    if (siteLocalWatch)
+        for (int target = 0; target < limit; target++)
+            siteCounts[NearestSite(g_targets[target])]++;
 
     for (int target = 0; target < limit; target++)
     {
@@ -970,7 +1315,23 @@ void AssignTargets(const int bots[MAXPLAYERS + 1], int botCount, RouteType route
             if (g_bombPlanted)
                 SetOrderLook(client, g_bombPosition, target);
             else
-                SetOrderLook(client, g_tSpawn, target);
+            {
+                int site = NearestSite(g_orderGoal[client]);
+                int sector = siteLocalWatch ? CTWatch_GetSector(siteSlots[site]++, siteCounts[site]) : target;
+                SetOrderLook(client, g_tSpawn, sector, siteLocalWatch);
+                // No new movement/order lifecycle: refine only the cached aim
+                // of a standard opening hold, retaining generic fallback.
+                if (siteLocalWatch && g_plan == Plan_Standard && g_cvEntranceWatch.BoolValue)
+                {
+                    char entrance[32];
+                    float look[3];
+                    if (CTEntrance_SelectLook(client, g_orderGoal[client], site, usedEntrances[site], look, entrance, sizeof(entrance)))
+                    {
+                        CopyVector(look, g_orderLook[client]);
+                        DebugLog("Watch %N: site=%s entrance=%s", client, site == 0 ? "A" : "B", entrance);
+                    }
+                }
+            }
             g_orderRoute[client] = view_as<int>(route);
             g_orderExpires[client] = 0.0;
             StartOrderProgress(client);
@@ -1165,6 +1526,9 @@ void ReportEnemy(int spotter, const float enemyPosition[3], int site)
 int RequestReinforcement(const float contactPosition[3], int site, int excludedClient, const char[] reason,
     int additionalExcluded = 0, bool allowEmptyOtherSite = false, bool onlyOtherSite = false)
 {
+    // Once loose C4 is confirmed, site reports/casualties must not overwrite
+    // its cached guard goals. Individual combat still releases immediately.
+    if (g_phase == Phase_GuardLooseBomb) return 0;
     float sitePosition[3], otherSite[3];
     if (site == 0)
     {
@@ -1236,6 +1600,7 @@ int RequestReinforcement(const float contactPosition[3], int site, int excludedC
         g_orderExpires[selected] = GetGameTime() + g_cvReinforceHold.FloatValue;
         g_lastReinforcement[site] = selected;
         StartOrderProgress(selected);
+        ExperienceSignal("reinforce", reason, site, selected);
         DebugLog("Assigned %N to reinforce %s for %s.", selected, site == 0 ? "A" : "B", reason);
         return selected;
     }
@@ -1244,8 +1609,18 @@ int RequestReinforcement(const float contactPosition[3], int site, int excludedC
 
 void ReleaseOrder(int client, const char[] reason)
 {
+    if (IsCTBot(client) && !StrEqual(reason, "navigation stalled") && !StrEqual(reason, "defusing"))
+        g_lastCombatAt[client] = GetGameTime();
     if (client < 1 || client > MaxClients || !g_hasOrder[client] || !IsClientInGame(client) || !IsFakeClient(client))
         return;
+    if (g_phase == Phase_GuardLooseBomb && g_guardSlot[client] >= 0)
+    {
+        g_guardReleasedAt[client] = GetGameTime();
+        // Bounded retries preserve native anti-stuck behavior; do not oscillate
+        // forever toward a bad NAV target if it fails three separate times.
+        if (StrEqual(reason, "navigation stalled")) g_guardStalls[client]++;
+    }
+    ExperienceSignal("order_release", reason, g_geometryReady ? NearestSite(g_orderGoal[client]) : -1, client);
     g_hasOrder[client] = false;
     g_hasLook[client] = false;
     g_orderExpires[client] = 0.0;
@@ -1293,6 +1668,8 @@ void ReleaseStalledOrders()
         float displacement = Distance2D(position, g_orderLastProgressPosition[client]);
         if (distance <= 128.0)
         {
+            if (!g_orderArrived[client])
+                ExperienceSignal("order_arrived", "within_128", g_geometryReady ? NearestSite(g_orderGoal[client]) : -1, client);
             g_orderArrived[client] = true;
             g_orderLastProgressDistance[client] = distance;
             g_orderLastProgressAt[client] = now;
@@ -1302,7 +1679,7 @@ void ReleaseStalledOrders()
 
         // Do not release a settled initial defender merely because the
         // engine's idle movement displaced it a few steps from its cover.
-        if (g_phase == Phase_Initial && g_orderArrived[client] && distance <= 256.0)
+        if ((g_phase == Phase_Initial || g_phase == Phase_GuardLooseBomb) && g_orderArrived[client] && distance <= 256.0)
         {
             g_orderLastProgressDistance[client] = distance;
             g_orderLastProgressAt[client] = now;
@@ -1327,9 +1704,15 @@ void ReleaseStalledOrders()
     }
 }
 
-void SetOrderLook(int client, const float threat[3], int slot)
+void ExperienceSignal(const char[] kind, const char[] detail, int site, int actor)
 {
-    TacticalAngles_SelectLook(client, g_orderGoal[client], threat, slot, g_orderLook[client]);
+    if (GetFeatureStatus(FeatureType_Native, "BotExperience_RecordSignal") == FeatureStatus_Available)
+        BotExperience_RecordSignal(CS_TEAM_CT, kind, detail, site, actor);
+}
+
+void SetOrderLook(int client, const float threat[3], int slot, bool constrainSector = false)
+{
+    TacticalAngles_SelectLook(client, g_orderGoal[client], threat, slot, g_orderLook[client], constrainSector);
     g_hasLook[client] = true;
 }
 
@@ -1359,12 +1742,17 @@ bool OrdersMeetReadyPercent(float distanceLimit, int requiredPercent)
 void ClearCombatReleases()
 {
     for (int client = 1; client <= MaxClients; client++)
+    {
         g_combatReleased[client] = false;
+        g_lastCombatAt[client] = -100.0;
+        g_blindUntil[client] = 0.0;
+    }
 }
 
 void ResetDirector()
 {
     ClearOrders();
+    ClearLooseBombGuard();
     g_phase = Phase_Idle;
     g_phaseStarted = 0.0;
     g_targetCount = 0;

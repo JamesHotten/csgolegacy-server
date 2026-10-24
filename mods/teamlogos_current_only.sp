@@ -38,7 +38,7 @@ public Plugin myinfo =
     name = "Team Logo Management",
     author = "Neuro Toxin, uspeek, crashzk",
     description = "Team Logo Management",
-	version = "1.4.4-current-only"
+	version = "1.4.4-no-logo-safe"
 };
 
 public void OnPluginStart()
@@ -397,6 +397,8 @@ stock void AddDefaultTeamLogos()
 
 stock void SetTeamName(const char[] logo, int team)
 {
+    if (logo[0] == '\0')
+        return; // Intentional no-logo roster; BetterBots supplies its team name.
 	char cfgpath[PLATFORM_MAX_PATH]; char teamname[MAX_TEAMNAME_LENGTH];
 	Format(cfgpath, sizeof(cfgpath), "resource/flash/econ/tournaments/teams/%s.cfg", logo);
 	Handle cfgstream = OpenFile(cfgpath, "r");

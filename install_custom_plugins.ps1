@@ -13,6 +13,8 @@ if ($runningServer) {
     throw "Stop the target srcds.exe before installing unified LAN identity plugins."
 }
 
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'lan_resources.ps1') -Destination (Join-Path $ServerDir 'lan_resources.ps1') -Force
+
 $source = Join-Path $PSScriptRoot "mods\lan_player_scoreboard.sp"
 $economyPolicySources = @(
     (Join-Path $PSScriptRoot "mods\lan_economy_policy.inc"),
@@ -112,6 +114,8 @@ foreach ($entry in $legacyLogoAliases.GetEnumerator()) {
 [System.IO.File]::WriteAllText($botRosterPath, $botRosterText, [System.Text.UTF8Encoding]::new($false))
 
 Write-Host "Installed five-character Legacy aliases for long team logo IDs."
+
+& (Join-Path $PSScriptRoot "mods\patch_bot_roster_assets.ps1") -ServerDir $ServerDir
 
 $agentsPlugin = Join-Path $ServerDir "csgo\addons\sourcemod\plugins\csgo_agentschooser.smx"
 $agentsBackup = Join-Path $ServerDir "csgo\addons\sourcemod\plugins\disabled\csgo_agentschooser.mysql-original.smx"

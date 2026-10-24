@@ -57,7 +57,7 @@ stock bool TacticalAngles_IsVisible(const float start[3], const float target[3],
     return fraction >= 0.90;
 }
 
-stock bool TacticalAngles_SelectLook(int client, const float hold[3], const float threat[3], int slot, float result[3])
+stock bool TacticalAngles_SelectLook(int client, const float hold[3], const float threat[3], int slot, float result[3], bool constrainSector = false)
 {
     float baseX = threat[0] - hold[0];
     float baseY = threat[1] - hold[1];
@@ -95,6 +95,16 @@ stock bool TacticalAngles_SelectLook(int client, const float hold[3], const floa
             float distance = Distance2D(hold, candidates[candidate]);
             if (distance < 128.0)
                 continue;
+            // CT opening sectors must not collapse onto one NAV-projected
+            // target outside their responsibility. Default false preserves T
+            // post-plant, dropped-C4 and retake behavior exactly as before.
+            if (constrainSector)
+            {
+                float dx = candidates[candidate][0] - hold[0];
+                float dy = candidates[candidate][1] - hold[1];
+                float alignment = (dx * slotX + dy * slotY) / distance;
+                if (alignment < Cosine(DegToRad(20.1))) continue;
+            }
 
             float visibleFraction;
             bool visible = TacticalAngles_IsVisible(eye, candidates[candidate], client, visibleFraction);

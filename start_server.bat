@@ -1,6 +1,8 @@
 @echo off
 setlocal
 chcp 65001 >nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0lan_resources.ps1" -ServerDir "%~dp0server"
+if errorlevel 1 exit /b 1
 cd /d "%~dp0server"
 set "SteamAppId=740"
 set "SteamGameId=740"

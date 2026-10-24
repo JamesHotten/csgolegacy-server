@@ -361,8 +361,7 @@ void BotTeams_ReconcileSide(int side)
     ServerExecute();
     BotTeams_ApplyQuota();
 
-    if (logo[0] != '\0')
-        ServerCommand("mp_teamlogo_%d \"%s\"", BotTeams_SlotForSide(side), logo);
+    BotTeams_ApplyIdentity(side, teamName, logo);
 }
 
 void BotTeams_QueueRoster(int side, const char[] teamName)
@@ -389,8 +388,22 @@ void BotTeams_QueueRoster(int side, const char[] teamName)
         ServerCommand("bot_add_%s \"%s\"", sideName, players[index]);
     }
 
-    if (logo[0] != '\0')
-        ServerCommand("mp_teamlogo_%d \"%s\"", BotTeams_SlotForSide(side), logo);
+    BotTeams_ApplyIdentity(side, teamName, logo);
+}
+
+void BotTeams_ApplyIdentity(int side, const char[] teamName, const char[] logo)
+{
+    // Empty is an intentional no-logo roster: clear the old opponent's logo
+    // and keep the roster name rather than displaying stale team identity.
+    ServerCommand("mp_teamlogo_%d \"%s\"", BotTeams_SlotForSide(side), logo);
+    if (logo[0] == '\0')
+    {
+        char safeName[BTR_TEAM_NAME_MAX];
+        strcopy(safeName, sizeof(safeName), teamName);
+        ReplaceString(safeName, sizeof(safeName), "\"", "");
+        ReplaceString(safeName, sizeof(safeName), ";", "");
+        ServerCommand("mp_teamname_%d \"%s\"", BotTeams_SlotForSide(side), safeName);
+    }
 }
 
 int BotTeams_CountHumans(int side)

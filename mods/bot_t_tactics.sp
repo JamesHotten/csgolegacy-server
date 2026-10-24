@@ -16,6 +16,8 @@ native void NavMesh_CollectSurroundingAreas(ArrayStack stack, int startArea, flo
 native bool NavMeshArea_GetCenter(int areaIndex, float buffer[3]);
 native void NavMeshArea_GetHidingSpots(ArrayStack stack, int areaIndex);
 native void NavHidingSpot_GetPosition(int hidingSpotIndex, float buffer[3]);
+native void BotExperience_RecordOpeningPlan(int team, int buy, int plan, int site, int botCount);
+native void BotExperience_RecordSignal(int team, const char[] kind, const char[] detail, int site, int actor);
 
 #include <bot_tactical_angles>
 
@@ -107,6 +109,11 @@ bool g_combatReleased[MAXPLAYERS + 1];
 float g_orderGoal[MAXPLAYERS + 1][3];
 float g_orderLook[MAXPLAYERS + 1][3];
 int g_orderRoute[MAXPLAYERS + 1];
+float g_orderLastDistance[MAXPLAYERS + 1];
+float g_orderLastPosition[MAXPLAYERS + 1][3];
+float g_orderLastProgressAt[MAXPLAYERS + 1];
+bool g_orderArrived[MAXPLAYERS + 1];
+bool g_orderStallReported[MAXPLAYERS + 1];
 
 float g_candidates[MAX_CANDIDATES][3];
 int g_candidateCount;
@@ -127,6 +134,8 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     MarkNativeAsOptional("NavMeshArea_GetCenter");
     MarkNativeAsOptional("NavMeshArea_GetHidingSpots");
     MarkNativeAsOptional("NavHidingSpot_GetPosition");
+    MarkNativeAsOptional("BotExperience_RecordOpeningPlan");
+    MarkNativeAsOptional("BotExperience_RecordSignal");
     return APLRes_Success;
 }
 
@@ -183,6 +192,8 @@ public void OnMapStart()
 public void OnClientPutInServer(int client)
 {
     g_combatReleased[client] = false;
+    g_orderArrived[client] = false;
+    g_orderStallReported[client] = false;
 }
 
 public void OnEnabledChanged(ConVar convar, const char[] oldValue, const char[] newValue)
@@ -221,6 +232,9 @@ public any Native_ReportContact(Handle plugin, int numParams)
 {
     int spotter = GetNativeCell(1);
     int enemy = GetNativeCell(2);
+    if (IsTBot(spotter) && enemy >= 1 && enemy <= MaxClients && IsClientInGame(enemy)
+        && GetClientTeam(enemy) == CS_TEAM_CT)
+        ExperienceSignal("first_sight", "visible_enemy", g_geometryReady ? NearestSiteForExperience(enemy) : -1, spotter);
     if (!g_cvEnabled.BoolValue || !g_cvMidRotate.BoolValue || g_phase != TPhase_AttackCommit
         || g_midRotationUsed || g_bombPlanted || !IsTBot(spotter)
         || enemy < 1 || enemy > MaxClients || !IsClientInGame(enemy)
@@ -415,12 +429,28 @@ public Action Timer_PlanPostPlant(Handle timer)
 
 public void Event_Contact(Event event, const char[] name, bool dontBroadcast)
 {
+    if (IsUtilityWeaponFire(event))
+        return; // An opening smoke/flash is not enemy contact.
     int client = GetClientOfUserId(event.GetInt("userid"));
     if (client >= 1 && client <= MaxClients)
         g_lastCombatAt[client] = GetGameTime();
     if (g_phase == TPhase_AttackStage && IsTBot(client))
         g_attackContact = true;
     ReleaseOrder(client, "weapon contact");
+}
+
+bool IsUtilityWeaponFire(Event event)
+{
+    char weapon[32];
+    event.GetString("weapon", weapon, sizeof(weapon));
+    ReplaceString(weapon, sizeof(weapon), "weapon_", "", false);
+    return StrEqual(weapon, "smokegrenade", false)
+        || StrEqual(weapon, "flashbang", false)
+        || StrEqual(weapon, "hegrenade", false)
+        || StrEqual(weapon, "molotov", false)
+        || StrEqual(weapon, "incgrenade", false)
+        || StrEqual(weapon, "decoy", false)
+        || StrEqual(weapon, "tagrenade", false);
 }
 
 public void Event_PlayerHurt(Event event, const char[] name, bool dontBroadcast)
@@ -450,6 +480,7 @@ public Action Timer_Update(Handle timer)
 {
     if (!g_cvEnabled.BoolValue)
         return Plugin_Continue;
+    ObserveOrderProgress();
     if (g_roundLiveStart > 0.0 && !g_bombPlanted && g_phase != TPhase_PlantCover
         && g_phase != TPhase_RecoverBomb && g_phase != TPhase_UrgentPlant && ShouldUrgentlyPlant())
         PlanUrgentPlant();
@@ -464,7 +495,12 @@ public Action Timer_Update(Handle timer)
         && (g_attackContact
             || (elapsed >= g_cvSyncStageMin.FloatValue && OrdersMeetReadyPercent(180.0, g_cvSyncMinReady.IntValue))
             || elapsed >= g_cvSyncStageTimeout.FloatValue))
+    {
+        ExperienceSignal("stage_exit",
+            g_attackContact ? "contact" : (elapsed >= g_cvSyncStageTimeout.FloatValue ? "timeout" : "ready"),
+            g_attackA ? 0 : 1, 0);
         PlanAttackCommit();
+    }
     else if (g_phase == TPhase_AttackCommit && GetGameTime() >= g_nextAttackReviewAt)
         ReviewAttackCommit();
     else if (g_phase == TPhase_RecoverBomb && FindLooseC4() == -1)
@@ -495,6 +531,7 @@ void ReviewAttackCommit()
         g_hasOrder[carrier] = true;
         CopyVector(g_targets[0], g_orderGoal[carrier]);
         g_orderRoute[carrier] = view_as<int>(Route_Fastest);
+        StartOrderProgress(carrier);
     }
 
     int ready, ordered;
@@ -535,6 +572,7 @@ void TryMidRoundRotation()
     g_midRotationUsed = true;
     g_midRotationActive = true;
     g_attackA = !g_attackA;
+    ExperienceSignal("mid_rotate", "two_defenders_spotted", g_attackA ? 0 : 1, carrier);
     // Only quiet teammates rejoin; bots actively fighting keep native combat.
     for (int client = 1; client <= MaxClients; client++)
         if (IsTBot(client) && now - g_lastCombatAt[client] >= 2.5)
@@ -591,6 +629,7 @@ void PlanUrgentPlant()
     AssignTargets(bots, count, Route_Fastest, carrier, count);
     g_phase = TPhase_UrgentPlant;
     g_phaseStarted = GetGameTime();
+    ExperienceSignal("urgent_plant", "time_or_low_players", g_attackA ? 0 : 1, carrier);
     DebugLog("Urgent plant assigned: carrier=%N site=%s T bots=%d.", carrier, g_attackA ? "A" : "B", count);
 }
 
@@ -605,6 +644,7 @@ void RefreshUrgentOrders()
         g_hasOrder[carrier] = true;
         CopyVector(g_targets[0], g_orderGoal[carrier]);
         g_orderRoute[carrier] = view_as<int>(Route_Fastest);
+        StartOrderProgress(carrier);
     }
 }
 
@@ -621,6 +661,7 @@ void PlanPlantCover(int planter, const float position[3])
     AssignTargets(bots, count, Route_Safest, 0, count, true);
     g_phase = TPhase_PlantCover;
     g_phaseStarted = GetGameTime();
+    ExperienceSignal("plant_cover", "plant_started", g_attackA ? 0 : 1, planter);
     DebugLog("Plant cover assigned for %d T bots.", count);
 }
 
@@ -648,6 +689,8 @@ void PlanInitialAttack()
     GetPlanName(g_plan, plan, sizeof(plan));
     DebugLog("Initial T attack: buy=%s plan=%s site=%s bots=%d sync=%d", buy, plan,
         g_attackA ? "A" : "B", count, g_cvSyncEnabled.BoolValue);
+    if (GetFeatureStatus(FeatureType_Native, "BotExperience_RecordOpeningPlan") == FeatureStatus_Available)
+        BotExperience_RecordOpeningPlan(CS_TEAM_T, view_as<int>(g_buyState), view_as<int>(g_plan), g_attackA ? 0 : 1, count);
 }
 
 void PlanAttackStage()
@@ -678,6 +721,7 @@ void PlanAttackStage()
     AssignTargets(bots, count, Route_Fastest, bombCarrier, count);
     g_phase = TPhase_AttackStage;
     g_phaseStarted = GetGameTime();
+    ExperienceSignal("opening_orders", "attack_stage", g_attackA ? 0 : 1, bombCarrier);
     DebugLog("T attack staging started for %d bots.", count);
 }
 
@@ -730,6 +774,7 @@ void PlanAttackCommit()
     AssignTargets(bots, count, Route_Fastest, bombCarrier, count);
     g_phase = TPhase_AttackCommit;
     g_phaseStarted = GetGameTime();
+    ExperienceSignal("attack_commit", g_attackContact ? "contact" : "stage_ready_or_timeout", g_attackA ? 0 : 1, bombCarrier);
     g_nextAttackReviewAt = g_phaseStarted + g_cvInitialHold.FloatValue;
     DebugLog("Synchronized T attack committed with %d bots still available for orders.", count);
 }
@@ -748,6 +793,7 @@ void PlanBombRecovery()
     AssignTargets(bots, count, Route_Fastest, 0, ordered);
     g_phase = TPhase_RecoverBomb;
     g_phaseStarted = GetGameTime();
+    ExperienceSignal("recover_bomb", "bomb_dropped", g_attackA ? 0 : 1, 0);
     DebugLog("Assigned %d T bots to recover the dropped C4.", ordered);
 }
 
@@ -762,6 +808,7 @@ void PlanPostPlant()
     AssignTargets(bots, count, Route_Safest, 0, count, true);
     g_phase = TPhase_PostPlant;
     g_phaseStarted = GetGameTime();
+    ExperienceSignal("postplant", "bomb_planted", g_attackA ? 0 : 1, 0);
     DebugLog("Assigned %d T bots to post-plant positions.", count);
 }
 
@@ -781,6 +828,7 @@ void AssignTargets(const int bots[MAXPLAYERS + 1], int botCount, RouteType route
         CopyVector(g_targets[0], g_orderGoal[preferredClient]);
         if (postPlantAim) SetPostPlantLook(preferredClient, 0);
         g_orderRoute[preferredClient] = view_as<int>(route);
+        StartOrderProgress(preferredClient);
         for (int index = 0; index < botCount; index++)
             if (bots[index] == preferredClient) used[index] = true;
         firstTarget = 1;
@@ -807,6 +855,7 @@ void AssignTargets(const int bots[MAXPLAYERS + 1], int botCount, RouteType route
             CopyVector(g_targets[target], g_orderGoal[client]);
             if (postPlantAim) SetPostPlantLook(client, target);
             g_orderRoute[client] = view_as<int>(route);
+            StartOrderProgress(client);
         }
     }
 }
@@ -1047,10 +1096,24 @@ int FindLooseC4()
 void ReleaseOrder(int client, const char[] reason)
 {
     if (client < 1 || client > MaxClients || !g_hasOrder[client] || !IsClientInGame(client) || !IsFakeClient(client)) return;
+    ExperienceSignal("order_release", reason, g_attackA ? 0 : 1, client);
     g_hasOrder[client] = false;
     g_hasLook[client] = false;
     g_combatReleased[client] = true;
     DebugLog("Released %N to native combat AI: %s", client, reason);
+}
+
+int NearestSiteForExperience(int client)
+{
+    float position[3];
+    GetClientAbsOrigin(client, position);
+    return Distance2D(position, g_siteA) <= Distance2D(position, g_siteB) ? 0 : 1;
+}
+
+void ExperienceSignal(const char[] kind, const char[] detail, int site, int actor)
+{
+    if (GetFeatureStatus(FeatureType_Native, "BotExperience_RecordSignal") == FeatureStatus_Available)
+        BotExperience_RecordSignal(CS_TEAM_T, kind, detail, site, actor);
 }
 
 void ClearOrders()
@@ -1059,6 +1122,60 @@ void ClearOrders()
     {
         g_hasOrder[client] = false;
         g_hasLook[client] = false;
+        g_orderArrived[client] = false;
+        g_orderStallReported[client] = false;
+    }
+}
+
+void StartOrderProgress(int client)
+{
+    float position[3];
+    GetClientAbsOrigin(client, position);
+    g_orderLastDistance[client] = Distance2D(position, g_orderGoal[client]);
+    g_orderLastProgressAt[client] = GetGameTime();
+    g_orderArrived[client] = false;
+    g_orderStallReported[client] = false;
+    CopyVector(position, g_orderLastPosition[client]);
+}
+
+void ObserveOrderProgress()
+{
+    float now = GetGameTime();
+    char phase[20];
+    GetPhaseName(g_phase, phase, sizeof(phase));
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!IsTBot(client) || !g_hasOrder[client] || g_combatReleased[client])
+            continue;
+        float position[3];
+        GetClientAbsOrigin(client, position);
+        float distance = Distance2D(position, g_orderGoal[client]);
+        if (distance <= 128.0)
+        {
+            if (!g_orderArrived[client])
+                ExperienceSignal("order_arrived", phase, g_attackA ? 0 : 1, client);
+            g_orderArrived[client] = true;
+            g_orderLastDistance[client] = distance;
+            g_orderLastProgressAt[client] = now;
+            CopyVector(position, g_orderLastPosition[client]);
+            continue;
+        }
+        if (g_orderArrived[client] && distance <= 256.0)
+            continue; // A settled stage/post-plant position is not a stalled route.
+        g_orderArrived[client] = false;
+        float displacement = Distance2D(position, g_orderLastPosition[client]);
+        if (distance <= g_orderLastDistance[client] - 48.0 || displacement >= 64.0)
+        {
+            g_orderLastDistance[client] = distance;
+            g_orderLastProgressAt[client] = now;
+            CopyVector(position, g_orderLastPosition[client]);
+            continue;
+        }
+        if (!g_orderStallReported[client] && now - g_orderLastProgressAt[client] >= 4.0)
+        {
+            g_orderStallReported[client] = true;
+            ExperienceSignal("route_stall", phase, g_attackA ? 0 : 1, client);
+        }
     }
 }
 void ClearCombatReleases() { for (int client = 1; client <= MaxClients; client++) g_combatReleased[client] = false; }

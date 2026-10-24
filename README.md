@@ -66,7 +66,7 @@ connect 192.168.x.x:27016
 - 默认执行 `mr15.cfg`：MR15、MR3 加时、加时 `$10,000`、完整 CS:GO Legacy 经济
 - `exec mr12`：MR12、MR3 加时、加时 `$10,000`、完整 CS2 经济；`exec mr15` 可完整恢复
 - CS2 模式可用 `!refund` 选择退款，或用 `!refund last` 退还最近一件仍符合条件的本回合未使用物品
-- 队标使用 CS:GO Legacy 原始 SVG 与标准 ID；每张地图仅向客户端下载当前两个队标，避免无 FastDL 时下载全部素材
+- 队标使用 CS:GO Legacy 原始 SVG 与标准 ID；每张地图仅向客户端下载当前两个队标。启动脚本自动开启局域网 HTTP 资源下载（TCP `27080`），修复缺失 SVG 时卡在 0% 的问题；设置见 [docs/LAN_RESOURCES.md](docs/LAN_RESOURCES.md)
 - BOT 启用可回滚战术调度：CT 标准防守、守包、回防、前压和堵点；T 默认进攻、Rush、分推、护包、掉包回收和下包后站位；双方按逐人装备分类协调起枪、发枪和捡枪；输入层仅抑制已入位原地跳，移动寻路、NAV 必需跳跃及道具回放不受限制
 
 部署前务必修改 `config/server.cfg` 中的 `rcon_password`。

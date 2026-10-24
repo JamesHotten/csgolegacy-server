@@ -39,11 +39,14 @@ if (Test-Path -LiteralPath $backupProfileConfig) {
 }
 
 $directorFiles = @(
+    (Join-Path $smRoot "plugins\000_bot_tactical_experience.smx"),
     (Join-Path $smRoot "plugins\001_bot_ct_tactics.smx"),
     (Join-Path $smRoot "plugins\002_bot_t_tactics.smx"),
     (Join-Path $smRoot "scripting\bot_ct_tactics.sp"),
+    (Join-Path $smRoot "scripting\bot_tactical_experience.sp"),
     (Join-Path $smRoot "scripting\bot_t_tactics.sp"),
     (Join-Path $ServerDir "csgo\cfg\sourcemod\bot_ct_tactics.cfg"),
+    (Join-Path $ServerDir "csgo\cfg\sourcemod\bot_tactical_experience.cfg"),
     (Join-Path $ServerDir "csgo\cfg\sourcemod\bot_t_tactics.cfg")
 )
 foreach ($file in $directorFiles) {
