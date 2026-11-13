@@ -50,8 +50,9 @@ foreach ($map in $profiles.Keys) {
         }
     }
 }
-if ($source.Contains('StrEqual(map, "de_cache", false)')) {
-    throw 'Cache is intentionally out of scope and must use the generic fallback.'
+if (-not $source.Contains('StrEqual(map, "de_cache", false) && g_cvEntranceWatch.BoolValue)') -or
+    -not $source.Contains('SetAnchorProfile("BombsiteA", "Forklift", "BombsiteB", "Rafters")')) {
+    throw 'Cache must have independently reversible CT anchors for its embedded NAV.'
 }
 if (-not $source.Contains('NavMeshArea_GetPlace(') -or
     -not $source.Contains('TryAppendNamedAnchor(') -or

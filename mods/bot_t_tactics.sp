@@ -6,7 +6,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.0"
+#define PLUGIN_VERSION "0.1.1"
 #define MAX_CANDIDATES 256
 #define TEAM_ANY -2
 
@@ -16,10 +16,19 @@ native void NavMesh_CollectSurroundingAreas(ArrayStack stack, int startArea, flo
 native bool NavMeshArea_GetCenter(int areaIndex, float buffer[3]);
 native void NavMeshArea_GetHidingSpots(ArrayStack stack, int areaIndex);
 native void NavHidingSpot_GetPosition(int hidingSpotIndex, float buffer[3]);
+native void NavMeshArea_GetPlaceCanonical(int areaIndex, char[] buffer, int maxlen);
+native int NavMeshArea_GetCostSoFar(int areaIndex);
+native int NavMesh_WorldToGridX(float x);
+native int NavMesh_WorldToGridY(float y);
+native void NavMesh_GetAreasOnGrid(ArrayStack areas, int x, int y);
+typedef TMapPathCost = function int(int area, int from, int ladder, any data);
+native bool NavMesh_BuildPath(int startArea, int goalArea, const float goalPos[3], TMapPathCost cost,
+    any data, int &closest, float maxLength, float maxStep);
 native void BotExperience_RecordOpeningPlan(int team, int buy, int plan, int site, int botCount);
 native void BotExperience_RecordSignal(int team, const char[] kind, const char[] detail, int site, int actor);
 
 #include <bot_tactical_angles>
+#include "include/bot_tactical_map_profiles.inc"
 
 enum TPhase
 {
@@ -81,6 +90,9 @@ ConVar g_cvEcoSplitChance;
 ConVar g_cvPlantUrgency;
 ConVar g_cvMidRotate;
 ConVar g_cvRoundTimeDefuse;
+ConVar g_cvMapRoutes, g_cvCarrierSync;
+int g_mapProfile = -1;
+bool g_profileStage;
 
 TPhase g_phase = TPhase_Idle;
 TBuyState g_buyState = TBuy_Full;
@@ -134,6 +146,12 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     MarkNativeAsOptional("NavMeshArea_GetCenter");
     MarkNativeAsOptional("NavMeshArea_GetHidingSpots");
     MarkNativeAsOptional("NavHidingSpot_GetPosition");
+    MarkNativeAsOptional("NavMeshArea_GetPlaceCanonical");
+    MarkNativeAsOptional("NavMeshArea_GetCostSoFar");
+    MarkNativeAsOptional("NavMesh_WorldToGridX");
+    MarkNativeAsOptional("NavMesh_WorldToGridY");
+    MarkNativeAsOptional("NavMesh_GetAreasOnGrid");
+    MarkNativeAsOptional("NavMesh_BuildPath");
     MarkNativeAsOptional("BotExperience_RecordOpeningPlan");
     MarkNativeAsOptional("BotExperience_RecordSignal");
     return APLRes_Success;
@@ -158,6 +176,8 @@ public void OnPluginStart()
     g_cvEcoSplitChance = CreateConVar("sm_bot_t_eco_split_chance", "10", "Eco chance for a split attack.", _, true, 0.0, true, 100.0);
     g_cvPlantUrgency = CreateConVar("sm_bot_t_plant_urgency_seconds", "40.0", "Remaining seconds at which the bomb carrier and escort take the direct plant route.", _, true, 15.0, true, 80.0);
     g_cvMidRotate = CreateConVar("sm_bot_t_mid_rotate_enable", "1", "Allow one evidence-based mid-round T site rotation per round.", _, true, 0.0, true, 1.0);
+    g_cvMapRoutes = CreateConVar("sm_bot_t_map_routes", "1", "Use named map entrances for opening attack staging.", _, true, 0.0, true, 1.0);
+    g_cvCarrierSync = CreateConVar("sm_bot_t_sync_carrier_ready", "1", "Require the bot carrying C4 to be ready before an early attack commit.", _, true, 0.0, true, 1.0);
     g_cvRoundTimeDefuse = FindConVar("mp_roundtime_defuse");
 
     g_cvEnabled.AddChangeHook(OnEnabledChanged);
@@ -182,6 +202,9 @@ public void OnPluginStart()
 
 public void OnMapStart()
 {
+    char map[64];
+    GetCurrentMap(map, sizeof(map));
+    g_mapProfile = TacticalMap_Find(map);
     ResetDirector();
     ClearCombatReleases();
     g_geometryReady = false;
@@ -493,7 +516,8 @@ public Action Timer_Update(Handle timer)
     float elapsed = GetGameTime() - g_phaseStarted;
     if (g_phase == TPhase_AttackStage
         && (g_attackContact
-            || (elapsed >= g_cvSyncStageMin.FloatValue && OrdersMeetReadyPercent(180.0, g_cvSyncMinReady.IntValue))
+            || (elapsed >= g_cvSyncStageMin.FloatValue && OrdersMeetReadyPercent(180.0, g_cvSyncMinReady.IntValue)
+                && CarrierReadyForCommit())
             || elapsed >= g_cvSyncStageTimeout.FloatValue))
     {
         ExperienceSignal("stage_exit",
@@ -707,22 +731,186 @@ void PlanAttackStage()
     Normalize2D(dirX, dirY);
 
     g_targetCount = 0;
+    g_profileStage = TryBuildNamedAttackStage(site, count);
     // AssignTargets reserves target 0 for the C4 carrier. Give that player
     // the central approach, not the leftmost flank of a five-player fan.
-    BuildAround(site, 1, 520.0, 900.0, true, dirX, dirY);
-    if (g_plan == TPlan_Rush)
-        BuildAround(site, count - 1, 520.0, 900.0, true, dirX, dirY);
-    else if (g_plan == TPlan_Split)
-        BuildAround(site, count - 1, 500.0, 1050.0, true, dirX, dirY);
-    else
-        BuildAround(site, count - 1, 520.0, 950.0, true, dirX, dirY);
-    FillMissingTargetsAt(count, g_tSpawn);
+    if (!g_profileStage)
+    {
+        BuildAround(site, 1, 520.0, 900.0, true, dirX, dirY);
+        if (g_plan == TPlan_Rush)
+            BuildAround(site, count - 1, 520.0, 900.0, true, dirX, dirY);
+        else if (g_plan == TPlan_Split)
+            BuildAround(site, count - 1, 500.0, 1050.0, true, dirX, dirY);
+        else
+            BuildAround(site, count - 1, 520.0, 950.0, true, dirX, dirY);
+        FillMissingTargetsAt(count, g_tSpawn);
+    }
     int bombCarrier = FindBombCarrier();
     AssignTargets(bots, count, Route_Fastest, bombCarrier, count);
     g_phase = TPhase_AttackStage;
     g_phaseStarted = GetGameTime();
     ExperienceSignal("opening_orders", "attack_stage", g_attackA ? 0 : 1, bombCarrier);
     DebugLog("T attack staging started for %d bots.", count);
+}
+
+bool TryBuildNamedAttackStage(const float site[3], int count)
+{
+    if (!g_cvMapRoutes.BoolValue || g_mapProfile < 0 || count < 1 || count > 5
+        || !NativeAvailable("NavMeshArea_GetPlaceCanonical") || !NativeAvailable("NavMesh_BuildPath")
+        || !NativeAvailable("NavMeshArea_GetCostSoFar") || !NativeAvailable("NavMesh_WorldToGridX")
+        || !NativeAvailable("NavMesh_WorldToGridY") || !NativeAvailable("NavMesh_GetAreasOnGrid")) return false;
+    int spawnArea = NavMesh_GetNearestArea(g_tSpawn, false, 600.0, false, true, TEAM_ANY);
+    if (spawnArea < 0) return false;
+    char main[32], split[32];
+    int siteId = g_attackA ? 0 : 1;
+    if (!TacticalMap_GetPlace(g_mapProfile, siteId, 3, main, sizeof(main))) return false;
+    int wing = g_plan == TPlan_Split && count >= 4
+        && TacticalMap_GetPlace(g_mapProfile, siteId, 4, split, sizeof(split)) ? 2 : 0;
+    ArrayStack areas = new ArrayStack();
+    int minX = NavMesh_WorldToGridX(site[0] - 2400.0), maxX = NavMesh_WorldToGridX(site[0] + 2400.0);
+    int minY = NavMesh_WorldToGridY(site[1] - 2400.0), maxY = NavMesh_WorldToGridY(site[1] + 2400.0);
+    for (int x = minX; x <= maxX; x++)
+        for (int y = minY; y <= maxY; y++)
+            NavMesh_GetAreasOnGrid(areas, x, y);
+    float siteGoal[3];
+    int siteArea = FindNamedPlantArea(areas, site, siteId, siteGoal);
+    if (siteArea < 0) { delete areas; return false; }
+    // A site's nearest NAV cell may be a blocked or one-way pocket. Pick
+    // the local cell from the spawn-reachable graph, not just by proximity.
+    int closest = -1;
+    if (!NavMesh_BuildPath(spawnArea, siteArea, siteGoal, TMap_TravelCost, 8200, closest, 0.0, 0.0))
+    {
+        if (closest < 0 || !NavMeshArea_GetCenter(closest, siteGoal)
+            || GetVectorDistance(site, siteGoal) > 280.0 || FloatAbs(site[2] - siteGoal[2]) > 96.0)
+        { delete areas; return false; }
+        siteArea = closest;
+    }
+    int mainCount = AppendNamedStages(areas, spawnArea, siteArea, site, siteGoal, main, count - wing);
+    if (mainCount == 0 && TacticalMap_GetPlace(g_mapProfile, siteId, 4, split, sizeof(split)))
+    {
+        strcopy(main, sizeof(main), split);
+        wing = 0;
+        mainCount = AppendNamedStages(areas, spawnArea, siteArea, site, siteGoal, main, count);
+    }
+    if (mainCount > 0 && wing > 0)
+    {
+        int splitCount = AppendNamedStages(areas, spawnArea, siteArea, site, siteGoal, split, wing);
+        mainCount += AppendNamedStages(areas, spawnArea, siteArea, site, siteGoal, main, count - mainCount - splitCount);
+    }
+    delete areas;
+    if (mainCount == 0)
+    {
+        DebugLog("T named staging unavailable: site=%s main=%s assigned=%d/%d", g_attackA ? "A" : "B", main, g_targetCount, count);
+        g_targetCount = 0;
+        return false;
+    }
+    // Narrow entrances may expose only one or two distinct safe NAV centers.
+    // Keep the carrier there and use nearby original approach positions for
+    // the remaining escorts rather than abandoning the whole named route.
+    float approachX = g_targets[0][0] - site[0], approachY = g_targets[0][1] - site[1];
+    Normalize2D(approachX, approachY);
+    if (g_targetCount < count)
+        BuildAround(site, count - g_targetCount, 380.0, 1050.0, true, approachX, approachY);
+    FillMissingTargetsAt(count, g_tSpawn);
+    DebugLog("T named staging: site=%s main=%s split=%s main_count=%d", g_attackA ? "A" : "B",
+        main, wing > 0 && mainCount < count ? split : "-", mainCount);
+    return true;
+}
+
+int FindNamedPlantArea(ArrayStack areas, const float site[3], int siteId, float goal[3])
+{
+    int best = -1;
+    float closest = 450.0;
+    ArrayStack scan = areas.Clone();
+    while (!scan.Empty)
+    {
+        int area = scan.Pop();
+        float center[3];
+        if (!NavMeshArea_GetCenter(area, center)) continue;
+        float distance = GetVectorDistance(site, center);
+        if (distance >= closest) continue;
+        char place[32];
+        NavMeshArea_GetPlaceCanonical(area, place, sizeof(place));
+        if (!StrEqual(place, siteId == 0 ? "BombsiteA" : "BombsiteB", false)) continue;
+        best = area;
+        closest = distance;
+        CopyVector(center, goal);
+    }
+    delete scan;
+    if (best >= 0) return best;
+    best = NavMesh_GetNearestArea(site, false, 600.0, false, true, TEAM_ANY);
+    if (best >= 0 && NavMeshArea_GetCenter(best, goal)) return best;
+    return -1;
+}
+
+int AppendNamedStages(ArrayStack areas, int spawnArea, int siteArea, const float site[3],
+    const float siteGoal[3], const char[] place, int wanted)
+{
+    if (wanted <= 0) return 0;
+    ArrayStack scan = areas.Clone();
+    StringMap seen = new StringMap();
+    float centers[MAX_CANDIDATES][3], scores[MAX_CANDIDATES];
+    int indices[MAX_CANDIDATES], found;
+    while (!scan.Empty && found < MAX_CANDIDATES)
+    {
+        int area = scan.Pop();
+        char key[16];
+        IntToString(area, key, sizeof(key));
+        if (!seen.SetValue(key, 1, false)) continue;
+        char name[32];
+        NavMeshArea_GetPlaceCanonical(area, name, sizeof(name));
+        if (!StrEqual(name, place, false) || !NavMeshArea_GetCenter(area, centers[found])) continue;
+        float distance = GetVectorDistance(site, centers[found]);
+        if (distance < 140.0 || distance > 2400.0 || FloatAbs(site[2] - centers[found][2]) > 640.0) continue;
+        indices[found] = area;
+        scores[found++] = FloatAbs(distance - 720.0);
+    }
+    delete scan;
+    delete seen;
+    int added, attempts, hullRejected, spawnRejected, siteRejected;
+    while (added < wanted && attempts++ < wanted + 8)
+    {
+        int best = -1;
+        float bestScore = 999999.0;
+        for (int i = 0; i < found; i++)
+        {
+            if (scores[i] >= bestScore) continue;
+            bool distinct = true;
+            for (int j = 0; j < g_targetCount; j++)
+                if (GetVectorDistance(centers[i], g_targets[j]) < 88.0) { distinct = false; break; }
+            if (!distinct) continue;
+            best = i;
+            bestScore = scores[i];
+        }
+        if (best < 0) break;
+        scores[best] = 999999.0;
+        float foot[3], mins[3] = {-16.0, -16.0, 0.0}, maxs[3] = {16.0, 16.0, 72.0};
+        CopyVector(centers[best], foot);
+        foot[2] += 3.0;
+        Handle hull = TR_TraceHullFilterEx(foot, foot, mins, maxs, MASK_PLAYERSOLID, TacticalAngles_TraceFilter, 0);
+        bool fits = !TR_DidHit(hull) && !TR_StartSolid(hull);
+        delete hull;
+        int closest = -1;
+        if (!fits) { hullRejected++; continue; }
+        if (!NavMesh_BuildPath(spawnArea, indices[best], foot, TMap_TravelCost, 6800, closest, 0.0, 0.0))
+        { spawnRejected++; continue; }
+        if (!NavMesh_BuildPath(indices[best], siteArea, siteGoal, TMap_TravelCost, 5200, closest, 0.0, 0.0))
+        { siteRejected++; continue; }
+        AppendTarget(centers[best]);
+        added++;
+    }
+    if (added < wanted) DebugLog("T stage %s candidates=%d hull_rejected=%d spawn_rejected=%d site_rejected=%d added=%d/%d",
+        place, found, hullRejected, spawnRejected, siteRejected, added, wanted);
+    return added;
+}
+
+public int TMap_TravelCost(int area, int from, int ladder, any data)
+{
+    if (from < 0) return 0;
+    float previous[3], next[3];
+    if (!NavMeshArea_GetCenter(from, previous) || !NavMeshArea_GetCenter(area, next)) return -1;
+    int total = NavMeshArea_GetCostSoFar(from) + RoundToCeil(GetVectorDistance(previous, next));
+    return total <= data ? total : -1;
 }
 
 void PlanAttackCommit()
@@ -741,10 +929,11 @@ void PlanAttackCommit()
     float dirX = g_tSpawn[0] - site[0];
     float dirY = g_tSpawn[1] - site[1];
     Normalize2D(dirX, dirY);
-    if (g_midRotationActive)
+    if (g_midRotationActive || (g_phase == TPhase_AttackStage && g_profileStage && g_cvMapRoutes.BoolValue))
     {
-        // Keep the C4 and every available escort on the new site. The
-        // default split's old-site flank is inappropriate after a rotation.
+        // After a rotation, or once split groups have staged on their named
+        // approaches, converge on this site instead of redistributing to
+        // another distant flank or sending an escort to the opposite site.
         BuildAround(site, count - 1, 180.0, 520.0, true, dirX, dirY);
     }
     else if (g_plan == TPlan_Rush)
@@ -1179,7 +1368,7 @@ void ObserveOrderProgress()
     }
 }
 void ClearCombatReleases() { for (int client = 1; client <= MaxClients; client++) g_combatReleased[client] = false; }
-void ResetDirector() { ClearOrders(); g_phase = TPhase_Idle; g_phaseStarted = 0.0; g_nextAttackReviewAt = 0.0; g_targetCount = 0; g_attackContact = false; g_midRotationActive = false; }
+void ResetDirector() { ClearOrders(); g_phase = TPhase_Idle; g_phaseStarted = 0.0; g_nextAttackReviewAt = 0.0; g_targetCount = 0; g_attackContact = false; g_midRotationActive = false; g_profileStage = false; }
 
 void GetOrderProgress(float distanceLimit, int &ready, int &ordered)
 {
@@ -1192,9 +1381,22 @@ void GetOrderProgress(float distanceLimit, int &ready, int &ordered)
         ordered++;
         float position[3];
         GetClientAbsOrigin(client, position);
-        if (Distance2D(position, g_orderGoal[client]) <= distanceLimit)
+        float distance = g_cvCarrierSync.BoolValue ? GetVectorDistance(position, g_orderGoal[client])
+            : Distance2D(position, g_orderGoal[client]);
+        if (distance <= distanceLimit)
             ready++;
     }
+}
+
+bool CarrierReadyForCommit()
+{
+    if (!g_cvCarrierSync.BoolValue) return true;
+    int carrier = FindBombCarrier();
+    if (!IsTBot(carrier)) return true; // Never wait for a human to follow a BOT order.
+    if (!g_hasOrder[carrier] || g_combatReleased[carrier]) return false;
+    float position[3];
+    GetClientAbsOrigin(carrier, position);
+    return GetVectorDistance(position, g_orderGoal[carrier]) <= 180.0;
 }
 
 bool OrdersMeetReadyPercent(float distanceLimit, int requiredPercent)

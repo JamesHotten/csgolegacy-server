@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.3"
+#define PLUGIN_VERSION "0.1.5"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -33,7 +33,9 @@ native bool BotStuff_CanSeeLooseC4(int client, int bomb);
 native bool BotStuff_HasVisibleEnemy(int client);
 
 #include <bot_tactical_angles>
+#include "include/bot_tactical_map_profiles.inc"
 #include <bot_ct_entrance_watch>
+#include "include/bot_ct_inferno_watch.inc"
 
 enum TacticalPhase
 {
@@ -79,6 +81,10 @@ public Plugin myinfo =
 ConVar g_cvEnabled;
 ConVar g_cvDebug;
 ConVar g_cvEntranceWatch;
+ConVar g_cvClearOpeningWatch;
+ConVar g_cvInfernoWatch;
+bool g_infernoMap;
+int g_mapProfile = -1;
 ConVar g_cvInitialHold;
 ConVar g_cvRetakeStage;
 ConVar g_cvRetakeCommit;
@@ -130,6 +136,7 @@ float g_carrierLastPosition[3];
 
 bool g_hasOrder[MAXPLAYERS + 1];
 bool g_hasLook[MAXPLAYERS + 1];
+bool g_infernoPreciseOrder[MAXPLAYERS + 1];
 bool g_combatReleased[MAXPLAYERS + 1];
 float g_orderGoal[MAXPLAYERS + 1][3];
 float g_orderLook[MAXPLAYERS + 1][3];
@@ -154,6 +161,7 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     RegPluginLibrary("bot_ct_tactics");
     CreateNative("BotCTTactics_GetOrder", Native_GetOrder);
     CreateNative("BotCTTactics_GetAim", Native_GetAim);
+    CreateNative("BotCTTactics_GetHoldRadius", Native_GetHoldRadius);
     CreateNative("BotCTTactics_ReportContact", Native_ReportContact);
 
     MarkNativeAsOptional("NavMesh_Exists");
@@ -179,8 +187,11 @@ public void OnPluginStart()
 {
     g_cvEnabled = CreateConVar("sm_bot_ct_tactics_enable", "1", "Enable the reversible CT tactical director.", _, true, 0.0, true, 1.0);
     g_cvDebug = CreateConVar("sm_bot_ct_tactics_debug", "0", "Log CT tactical plans and assignments.", _, true, 0.0, true, 1.0);
-    g_cvEntranceWatch = CreateConVar("sm_bot_ct_entrance_watch", "1", "Use visible named entrances for standard Mirage/Dust2 opening holds; otherwise use generic angles.", _, true, 0.0, true, 1.0);
+    g_cvEntranceWatch = CreateConVar("sm_bot_ct_entrance_watch", "1", "Use visible named entrances for standard opening holds on profiled maps.", _, true, 0.0, true, 1.0);
     g_cvEntranceWatch.AddChangeHook(OnEntranceWatchChanged);
+    g_cvClearOpeningWatch = CreateConVar("sm_bot_ct_clear_opening_watch", "1", "Never lock a standard CT opening hold onto an obstructed sightline.", _, true, 0.0, true, 1.0);
+    g_cvInfernoWatch = CreateConVar("sm_bot_ct_inferno_watch", "1", "Use validated Inferno opening positions and reject blocked CT watch angles.", _, true, 0.0, true, 1.0);
+    g_cvInfernoWatch.AddChangeHook(OnEntranceWatchChanged);
     g_cvInitialHold = CreateConVar("sm_bot_ct_tactics_initial_hold", "70.0", "Seconds between CT setup reviews; intact anchors remain in place.", _, true, 5.0, true, 105.0);
     g_cvRetakeStage = CreateConVar("sm_bot_ct_tactics_retake_stage", "6.0", "Minimum seconds spent taking distinct retake approaches.", _, true, 0.5, true, 12.0);
     g_cvRetakeCommit = CreateConVar("sm_bot_ct_tactics_retake_commit", "14.0", "Maximum seconds to push the planted bomb after staging.", _, true, 2.0, true, 25.0);
@@ -227,6 +238,10 @@ public void OnPluginStart()
 
 public void OnMapStart()
 {
+    char map[64];
+    GetCurrentMap(map, sizeof(map));
+    g_infernoMap = StrEqual(map, "de_inferno", false);
+    g_mapProfile = TacticalMap_Find(map);
     ResetDirector();
     ClearCombatReleases();
     g_bombPlanted = false;
@@ -242,13 +257,16 @@ public void OnEntranceWatchChanged(ConVar convar, const char[] oldValue, const c
 
 void CTWatch_GetPlace(int area, char[] place, int length)
 {
-    char map[64];
-    GetCurrentMap(map, sizeof(map));
-    if (g_cvEntranceWatch.BoolValue && (StrEqual(map, "de_mirage") || StrEqual(map, "de_dust2"))
+    if ((InfernoWatchEnabled() || (g_cvEntranceWatch.BoolValue && g_mapProfile >= 0 && !g_infernoMap))
         && NativeAvailable("NavMeshArea_GetPlaceCanonical"))
         NavMeshArea_GetPlaceCanonical(area, place, length);
     else
         NavMeshArea_GetPlace(area, place, length);
+}
+
+bool InfernoWatchEnabled()
+{
+    return g_infernoMap && g_cvInfernoWatch.BoolValue;
 }
 
 public void OnClientPutInServer(int client)
@@ -365,6 +383,20 @@ public any Native_GetAim(Handle plugin, int numParams)
 
     SetNativeArray(2, g_orderLook[client], 3);
     return true;
+}
+
+public any Native_GetHoldRadius(Handle plugin, int numParams)
+{
+    int client = GetNativeCell(1);
+    return view_as<any>(GetCTHoldRadius(client));
+}
+
+float GetCTHoldRadius(int client)
+{
+    if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && InfernoWatchEnabled()
+        && g_hasOrder[client] && g_hasLook[client] && g_infernoPreciseOrder[client] && !g_combatReleased[client])
+        return 32.0;
+    return 128.0;
 }
 
 public any Native_ReportContact(Handle plugin, int numParams)
@@ -726,8 +758,13 @@ void PlanInitialDefense()
     g_planSite = -1;
     g_targetCount = 0;
 
+    float infernoAims[5][3];
+    bool infernoProfile = false;
     if (g_plan == Plan_Standard)
-        BuildStandardTargets(count);
+    {
+        if (InfernoWatchEnabled()) infernoProfile = TryBuildInfernoOpening(count, infernoAims);
+        if (!infernoProfile) BuildStandardTargets(count);
+    }
     else if (g_plan == Plan_SingleSitePush)
         BuildPushTargets(count);
     else
@@ -738,6 +775,7 @@ void PlanInitialDefense()
     // accumulated danger weights. SAFEST_ROUTE can send an A defender through
     // B/T spawn; FASTEST_ROUTE keeps the setup on its intended side of the map.
     AssignTargets(bots, count, Route_Fastest, -1, true);
+    if (infernoProfile) ApplyInfernoOpeningAims(count, infernoAims);
     g_phase = Phase_Initial;
     g_phaseStarted = GetGameTime();
     ExperienceSignal("opening_orders", "initial_defense", g_planSite, 0);
@@ -747,6 +785,42 @@ void PlanInitialDefense()
     DebugLog("Initial CT plan: buy=%s plan=%s bots=%d", buy, plan, count);
     if (GetFeatureStatus(FeatureType_Native, "BotExperience_RecordOpeningPlan") == FeatureStatus_Available)
         BotExperience_RecordOpeningPlan(CS_TEAM_CT, view_as<int>(g_buyState), view_as<int>(g_plan), g_planSite, count);
+}
+
+bool TryBuildInfernoOpening(int count, float aims[5][3])
+{
+    if (count < 1 || count > 5) return false;
+    float holds[5][3];
+    for (int slot = 0; slot < count; slot++)
+    {
+        int role = CTInferno_GetRole(slot, count);
+        if (!CTInferno_GetPair(role, holds[slot], aims[slot]))
+        {
+            DebugLog("Inferno opening pair %d unavailable; using validated generic fallback.", role);
+            return false;
+        }
+    }
+    for (int slot = 0; slot < count; slot++) AppendTarget(holds[slot]);
+    return true;
+}
+
+void ApplyInfernoOpeningAims(int count, const float aims[5][3])
+{
+    // AssignTargets still owns BOT selection and movement. Match the exact
+    // selected position rather than duplicating team/client assignment.
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!g_hasOrder[client]) continue;
+        for (int slot = 0; slot < count; slot++)
+        {
+            if (GetVectorDistance(g_orderGoal[client], g_targets[slot]) > 1.0) continue;
+            CopyVector(aims[slot], g_orderLook[client]);
+            g_hasLook[client] = true;
+            g_infernoPreciseOrder[client] = true;
+            DebugLog("Inferno watch %N: role=%d", client, CTInferno_GetRole(slot, count));
+            break;
+        }
+    }
 }
 
 void BuildStandardTargets(int count)
@@ -869,6 +943,8 @@ void ConfigureMapAnchorProfile()
         SetAnchorProfile("BombsiteA", "SideHall", "BombsiteB", "Ruins");
     else if (StrEqual(map, "de_anubis", false))
         SetAnchorProfile("BombsiteA", "Heaven", "BombsiteB", "BackofB");
+    else if (StrEqual(map, "de_cache", false) && g_cvEntranceWatch.BoolValue)
+        SetAnchorProfile("BombsiteA", "Forklift", "BombsiteB", "Rafters");
 }
 
 void SetAnchorProfile(const char[] aPrimary, const char[] aSecondary,
@@ -1321,16 +1397,35 @@ void AssignTargets(const int bots[MAXPLAYERS + 1], int botCount, RouteType route
                 SetOrderLook(client, g_tSpawn, sector, siteLocalWatch);
                 // No new movement/order lifecycle: refine only the cached aim
                 // of a standard opening hold, retaining generic fallback.
-                if (siteLocalWatch && g_plan == Plan_Standard && g_cvEntranceWatch.BoolValue)
+                bool namedWatch = g_cvEntranceWatch.BoolValue && g_mapProfile >= 0 && (!g_infernoMap || InfernoWatchEnabled());
+                if (siteLocalWatch && g_plan == Plan_Standard && g_cvEntranceWatch.BoolValue && namedWatch)
                 {
                     char entrance[32];
                     float look[3];
-                    if (CTEntrance_SelectLook(client, g_orderGoal[client], site, usedEntrances[site], look, entrance, sizeof(entrance)))
+                    bool selected;
+                    if (g_infernoMap)
+                        selected = CTEntrance_SelectLook(client, g_mapProfile, g_orderGoal[client], site, usedEntrances[site], look, entrance, sizeof(entrance));
+                    else
+                        selected = CTEntrance_ResolveWatch(client, g_mapProfile, g_orderGoal[client], site, usedEntrances[site],
+                            look, entrance, sizeof(entrance), g_targets, g_targetCount, target);
+                    if (selected)
                     {
+                        if (!g_infernoMap) CopyVector(g_orderGoal[client], g_targets[target]);
                         CopyVector(look, g_orderLook[client]);
                         DebugLog("Watch %N: site=%s entrance=%s", client, site == 0 ? "A" : "B", entrance);
                     }
                 }
+                if (siteLocalWatch && InfernoWatchEnabled())
+                {
+                    float eye[3];
+                    CopyVector(g_orderGoal[client], eye);
+                    eye[2] += 64.0;
+                    // Keep navigation, but never publish an occluded fixed
+                    // direction for an Inferno opening fallback/pressure order.
+                    g_hasLook[client] = CTInferno_ClearSight(eye, g_orderLook[client]);
+                }
+                else if (siteLocalWatch && g_plan == Plan_Standard && g_cvClearOpeningWatch.BoolValue)
+                    g_hasLook[client] = TacticalAngles_RequireClearWatch(g_orderGoal[client], g_orderLook[client]);
             }
             g_orderRoute[client] = view_as<int>(route);
             g_orderExpires[client] = 0.0;
@@ -1637,6 +1732,7 @@ void ClearOrders()
     {
         g_hasOrder[client] = false;
         g_hasLook[client] = false;
+        g_infernoPreciseOrder[client] = false;
         g_orderExpires[client] = 0.0;
         g_orderLastProgressDistance[client] = 0.0;
         g_orderLastProgressAt[client] = 0.0;
@@ -1646,6 +1742,7 @@ void ClearOrders()
 
 void StartOrderProgress(int client)
 {
+    g_infernoPreciseOrder[client] = false;
     float position[3];
     GetClientAbsOrigin(client, position);
     g_orderLastProgressDistance[client] = Distance2D(position, g_orderGoal[client]);
@@ -1664,12 +1761,14 @@ void ReleaseStalledOrders()
 
         float position[3];
         GetClientAbsOrigin(client, position);
-        float distance = Distance2D(position, g_orderGoal[client]);
+        float holdRadius = GetCTHoldRadius(client);
+        bool precise = holdRadius < 128.0;
+        float distance = precise ? GetVectorDistance(position, g_orderGoal[client]) : Distance2D(position, g_orderGoal[client]);
         float displacement = Distance2D(position, g_orderLastProgressPosition[client]);
-        if (distance <= 128.0)
+        if (distance <= holdRadius)
         {
             if (!g_orderArrived[client])
-                ExperienceSignal("order_arrived", "within_128", g_geometryReady ? NearestSite(g_orderGoal[client]) : -1, client);
+                ExperienceSignal("order_arrived", precise ? "within_32" : "within_128", g_geometryReady ? NearestSite(g_orderGoal[client]) : -1, client);
             g_orderArrived[client] = true;
             g_orderLastProgressDistance[client] = distance;
             g_orderLastProgressAt[client] = now;
@@ -1679,7 +1778,7 @@ void ReleaseStalledOrders()
 
         // Do not release a settled initial defender merely because the
         // engine's idle movement displaced it a few steps from its cover.
-        if ((g_phase == Phase_Initial || g_phase == Phase_GuardLooseBomb) && g_orderArrived[client] && distance <= 256.0)
+        if ((g_phase == Phase_Initial || g_phase == Phase_GuardLooseBomb) && g_orderArrived[client] && distance <= holdRadius * 2.0)
         {
             g_orderLastProgressDistance[client] = distance;
             g_orderLastProgressAt[client] = now;
@@ -1691,7 +1790,9 @@ void ReleaseStalledOrders()
         // A valid NAV route can temporarily move sideways or away from the
         // destination. Count real displacement as progress as well as a direct
         // reduction in distance, while stationary turning satisfies neither.
-        if (distance <= g_orderLastProgressDistance[client] - 48.0 || displacement >= 64.0)
+        float progressStep = precise && distance <= 128.0 ? 12.0 : 48.0;
+        float displacementStep = precise ? 32.0 : 64.0;
+        if (distance <= g_orderLastProgressDistance[client] - progressStep || displacement >= displacementStep)
         {
             g_orderLastProgressDistance[client] = distance;
             g_orderLastProgressAt[client] = now;
@@ -1699,7 +1800,11 @@ void ReleaseStalledOrders()
             continue;
         }
 
-        if (now - g_orderLastProgressAt[client] >= g_cvNavigationStallTimeout.FloatValue)
+        // Inferno's A route can turn tightly around a doorway or queue briefly
+        // behind another defender. Still relinquish genuinely stalled orders.
+        float timeout = g_cvNavigationStallTimeout.FloatValue;
+        if (precise && timeout < 5.0) timeout = 5.0;
+        if (now - g_orderLastProgressAt[client] >= timeout)
             ReleaseOrder(client, "navigation stalled");
     }
 }

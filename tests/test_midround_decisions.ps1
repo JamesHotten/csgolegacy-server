@@ -23,7 +23,7 @@ if (-not $tDecision.Contains('g_midRotationUsed') -or
     -not $tDecision.Contains('Distance2D(carrierPosition, g_attackA ? g_siteA : g_siteB) < 800.0') -or
     -not $tDecision.Contains('aliveT < 3') -or
     -not $tDecision.Contains('g_attackA = !g_attackA;') -or
-    -not $t.Contains('if (g_midRotationActive)') -or
+    -not $t.Contains('if (g_midRotationActive || (g_phase == TPhase_AttackStage && g_profileStage && g_cvMapRoutes.BoolValue))') -or
     -not $t.Contains('g_phase == TPhase_UrgentPlant || g_midRotationActive')) {
     throw 'T rotation must require distinct defenders, spare time, a recoverable C4 and a single committed destination.'
 }

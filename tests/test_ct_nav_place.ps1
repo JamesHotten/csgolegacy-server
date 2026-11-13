@@ -11,6 +11,6 @@ foreach ($required in @('NavMeshArea_PlaceID) - 1', 'index >= 0 && index < g_hNa
 }
 if ($canonical -match '\.Set\(|SetEnt|BotMoveTo|TeleportEntity') { throw 'Canonical reader must not mutate NAV or BOT state.' }
 if (-not $ct.Contains('MarkNativeAsOptional("NavMeshArea_GetPlaceCanonical")') -or
-    -not $ct.Contains('g_cvEntranceWatch.BoolValue && (StrEqual(map, "de_mirage") || StrEqual(map, "de_dust2"))') -or
-    -not $ct.Contains('NavMeshArea_GetPlace(area, place, length);')) { throw 'Canonical decoding must be optional and scoped to the two rollout maps, with legacy fallback.' }
+    -not $ct.Contains('InfernoWatchEnabled() || (g_cvEntranceWatch.BoolValue && g_mapProfile >= 0 && !g_infernoMap)') -or
+    -not $ct.Contains('NavMeshArea_GetPlace(area, place, length);')) { throw 'Canonical decoding must be optional and scoped to the rollout maps, with legacy fallback.' }
 Write-Host 'Optional one-based NAV directory reader scope and bounds wiring checks passed.'

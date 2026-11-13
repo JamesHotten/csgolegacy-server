@@ -1,11 +1,13 @@
 param(
     [string]$CTDirectorSource = "$PSScriptRoot\..\mods\bot_ct_tactics.sp",
     [string]$EntranceSource = "$PSScriptRoot\..\mods\include\bot_ct_entrance_watch.inc",
+    [string]$MapProfilesSource = "$PSScriptRoot\..\mods\include\bot_tactical_map_profiles.inc",
     [string]$NavDirectory
 )
 $ErrorActionPreference = 'Stop'
 $ct = Get-Content -LiteralPath $CTDirectorSource -Raw
 $source = Get-Content -LiteralPath $EntranceSource -Raw
+$profiles = Get-Content -LiteralPath $MapProfilesSource -Raw
 foreach ($required in @('TacticalAngles_IsVisible(eye, target, client, fraction)',
     'distance < 128.0', 'distance > 1800.0', 'FloatAbs(candidate[2] - hold[2]) > 400.0',
     'usedEntrances & (1 << entry)', 'delete areas;', 'return false;')) {
@@ -35,7 +37,7 @@ if ($NavDirectory) {
             }
             $expected = if ($map -eq 'de_mirage') { @('TRamp','PalaceInterior','Connector','Apartments','Catwalk') } else { @('LongA','Short','UpperTunnel','BDoors') }
             foreach ($place in $expected) {
-                if ($names -cnotcontains $place -or -not $source.Contains('"' + $place + '"')) { throw "$map entrance missing: $place" }
+                if ($names -cnotcontains $place -or -not $profiles.Contains('"' + $place + '"')) { throw "$map entrance missing: $place" }
             }
         } finally { $reader.Dispose() }
     }

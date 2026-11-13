@@ -10,8 +10,9 @@ $director = Get-Content -LiteralPath $CTDirectorSource -Raw
 $watchdog = [regex]::Match($director, '(?s)void ReleaseStalledOrders\(\).*?void SetOrderLook\(').Value
 
 if (-not $run.Contains('g_bTacticalHoldReached[iClient]') -or
-    -not $run.Contains('fDistanceToTacticalGoal <= 128.0') -or
-    -not $run.Contains('fDistanceToTacticalGoal <= 256.0') -or
+    -not $run.Contains('float fCTHoldRadius = 128.0;') -or
+    -not $run.Contains('fDistanceToTacticalGoal <= fCTHoldRadius') -or
+    -not $run.Contains('fDistanceToTacticalGoal <= fCTReleaseRadius') -or
     -not $run.Contains('!g_bBombPlanted')) {
     throw 'CT initial defense must have an arrival/release buffer, without holding during bomb retakes.'
 }
@@ -28,8 +29,8 @@ if (-not $run.Contains('(bHoldInitialCTPosition || bHoldTAttackStage || bHoldTPo
     throw 'CT hold must yield to visible combat and urgent native tasks.'
 }
 if (-not $watchdog.Contains('g_orderArrived[client]') -or
-    -not $watchdog.Contains('distance <= 128.0') -or
-    -not $watchdog.Contains('distance <= 256.0') -or
+    -not $watchdog.Contains('distance <= holdRadius') -or
+    -not $watchdog.Contains('distance <= holdRadius * 2.0') -or
     -not $watchdog.Contains('g_phase == Phase_Initial')) {
     throw 'The CT director must not release a settled initial defender inside the hold buffer.'
 }

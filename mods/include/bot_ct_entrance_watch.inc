@@ -6,50 +6,9 @@
 // Named NAV places, not guessed world coordinates. Opening CT orders only.
 // An entrance must have a directly visible candidate from the assigned hold;
 // otherwise the caller retains the established generic angle planner.
-stock bool CTEntrance_Profile(const char[] map, int site, int entrance, char[] place, int length)
+stock bool CTEntrance_Profile(int profile, int site, int entrance, char[] place, int length)
 {
-    place[0] = '\0';
-    if (site < 0 || site > 1 || entrance < 0 || entrance > 2) return false;
-    if (StrEqual(map, "de_mirage", false))
-    {
-        if (site == 0)
-        {
-            switch (entrance)
-            {
-                case 0: strcopy(place, length, "TRamp");
-                case 1: strcopy(place, length, "PalaceInterior");
-                case 2: strcopy(place, length, "Connector");
-            }
-        }
-        else
-        {
-            switch (entrance)
-            {
-                case 0: strcopy(place, length, "Apartments");
-                case 1: strcopy(place, length, "Catwalk");
-            }
-        }
-    }
-    else if (StrEqual(map, "de_dust2", false))
-    {
-        if (site == 0)
-        {
-            switch (entrance)
-            {
-                case 0: strcopy(place, length, "LongA");
-                case 1: strcopy(place, length, "Short");
-            }
-        }
-        else
-        {
-            switch (entrance)
-            {
-                case 0: strcopy(place, length, "UpperTunnel");
-                case 1: strcopy(place, length, "BDoors");
-            }
-        }
-    }
-    return place[0] != '\0';
+    return TacticalMap_GetPlace(profile, site, entrance, place, length);
 }
 
 stock void CTEntrance_Consider(int client, const float hold[3], const float eye[3],
@@ -69,18 +28,17 @@ stock void CTEntrance_Consider(int client, const float hold[3], const float eye[
     }
 }
 
-stock bool CTEntrance_SelectLook(int client, const float hold[3], int site,
+stock bool CTEntrance_SelectLook(int client, int profile, const float hold[3], int site,
     int &usedEntrances, float result[3], char[] selectedPlace, int length)
 {
     selectedPlace[0] = '\0';
     if (GetFeatureStatus(FeatureType_Native, "NavMeshArea_GetPlaceCanonical") != FeatureStatus_Available) return false;
     if (!NativeAvailable("NavMesh_WorldToGridX") || !NativeAvailable("NavMesh_WorldToGridY")
         || !NativeAvailable("NavMesh_GetAreasOnGrid")) return false;
-    char map[64], places[3][32];
-    GetCurrentMap(map, sizeof(map));
-    if (!CTEntrance_Profile(map, site, 0, places[0], 32)) return false;
+    char places[3][32];
+    if (!CTEntrance_Profile(profile, site, 0, places[0], 32)) return false;
     for (int entry = 1; entry < 3; entry++)
-        CTEntrance_Profile(map, site, entry, places[entry], 32);
+        CTEntrance_Profile(profile, site, entry, places[entry], 32);
     ArrayStack areas = new ArrayStack();
     // Visibility is spatial, not walk connectivity: CT cannot walk up a
     // one-way palace/apartments drop, but must still cover that entrance.
@@ -135,6 +93,43 @@ stock bool CTEntrance_SelectLook(int client, const float hold[3], int site,
             strcopy(selectedPlace, length, places[entry]);
             return true;
         }
+    }
+    return false;
+}
+
+stock bool CTEntrance_ResolveWatch(int client, int profile, float hold[3], int site,
+    int &usedEntrances, float look[3], char[] entrance, int length,
+    const float targets[][3], int targetCount, int currentTarget)
+{
+    if (CTEntrance_SelectLook(client, profile, hold, site, usedEntrances, look, entrance, length)) return true;
+    // A labeled anchor can face the wrong side of a nearby wall. Try up to
+    // four local NAV points before giving up, without rotating to another site.
+    float trial[3];
+    for (int step = 0; step < 4; step++)
+    {
+        CopyVector(hold, trial);
+        trial[step / 2] += step % 2 == 0 ? 144.0 : -144.0;
+        int area = NavMesh_GetNearestArea(trial, true, 110.0, false, true, TEAM_ANY);
+        if (area < 0 || !NavMeshArea_GetCenter(area, trial)
+            || Distance2D(hold, trial) < 60.0 || Distance2D(hold, trial) > 210.0
+            || FloatAbs(hold[2] - trial[2]) > 48.0 || NearestSite(trial) != site) continue;
+        bool separate = true;
+        for (int target = 0; target < targetCount; target++)
+            if (target != currentTarget && GetVectorDistance(targets[target], trial) < 140.0) separate = false;
+        if (!separate) continue;
+        float foot[3], mins[3] = {-16.0, -16.0, 0.0}, maxs[3] = {16.0, 16.0, 72.0};
+        CopyVector(trial, foot);
+        foot[2] += 3.0;
+        Handle hull = TR_TraceHullFilterEx(foot, foot, mins, maxs, MASK_PLAYERSOLID, TacticalAngles_TraceFilter, 0);
+        bool fits = !TR_DidHit(hull) && !TR_StartSolid(hull);
+        delete hull;
+        if (!fits) continue;
+        int used = usedEntrances;
+        if (!CTEntrance_SelectLook(client, profile, trial, site, used, look, entrance, length)
+            || !TacticalAngles_RequireClearWatch(trial, look)) continue;
+        usedEntrances = used;
+        CopyVector(trial, hold);
+        return true;
     }
     return false;
 }

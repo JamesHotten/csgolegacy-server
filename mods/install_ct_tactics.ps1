@@ -47,8 +47,10 @@ $looseC4Source = Join-Path $PSScriptRoot "include\bot_loose_c4_perception.inc"
 $fixedWatchSource = Join-Path $PSScriptRoot "include\bot_ct_fixed_watch.inc"
 $watchSectorsSource = Join-Path $PSScriptRoot "include\bot_ct_watch_sectors.inc"
 $entranceWatchSource = Join-Path $PSScriptRoot "include\bot_ct_entrance_watch.inc"
+$infernoWatchSource = Join-Path $PSScriptRoot "include\bot_ct_inferno_watch.inc"
+$mapProfilesSource = Join-Path $PSScriptRoot "include\bot_tactical_map_profiles.inc"
 
-foreach ($required in @($compiler, $botSource, $botPlugin, $directorSource, $tDirectorSource, $sideStatsSource, $experienceSource, $compatSource, $navmeshSource, $rosterSource, $purchaseSource, $equipmentSource, $anglesSource, $looseC4Source, $fixedWatchSource, $watchSectorsSource, $entranceWatchSource)) {
+foreach ($required in @($compiler, $botSource, $botPlugin, $directorSource, $tDirectorSource, $sideStatsSource, $experienceSource, $compatSource, $navmeshSource, $rosterSource, $purchaseSource, $equipmentSource, $anglesSource, $looseC4Source, $fixedWatchSource, $watchSectorsSource, $entranceWatchSource, $infernoWatchSource, $mapProfilesSource)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required CT tactics installation file was not found: '$required'"
     }
@@ -1702,6 +1704,34 @@ if (-not $text.Contains('fNow + (bFixedCTWatch ? 0.1 : 0.5)')) {
         'renew settled CT attention before native expiry without accelerating T updates'
 }
 
+# Only a live Inferno precision order opts into the smaller CT arrival band.
+# Keep the shared T movement cutoff and all other CT defaults unchanged.
+if (-not $text.Contains('// BEGIN CT_INFERNO_PRECISE_HOLD')) {
+    $aimNative = 'native bool BotCTTactics_GetAim(int client, float lookAt[3]);'
+    $text = Replace-Once $text $aimNative ($aimNative + $newline + 'native float BotCTTactics_GetHoldRadius(int client);') 'optional CT hold radius declaration'
+    $aimOptional = 'MarkNativeAsOptional("BotCTTactics_GetAim");'
+    $text = Replace-Once $text $aimOptional ($aimOptional + $newline + "`t" + 'MarkNativeAsOptional("BotCTTactics_GetHoldRadius");') 'optional CT hold radius registration'
+    $ctHold = [regex]::Match($text, '(?s)// BEGIN CT_INITIAL_HOLD\r?\n.*?// END CT_INITIAL_HOLD').Value
+    if (-not $ctHold) { throw 'Expected CT initial hold block missing.' }
+    $preciseHold = @(
+        '// BEGIN CT_INFERNO_PRECISE_HOLD',
+        '        float fCTHoldRadius = 128.0;',
+        '        if (GetClientTeam(iClient) == CS_TEAM_CT && bHasTacticalAim && !g_bBombPlanted',
+        '            && GetFeatureStatus(FeatureType_Native, "BotCTTactics_GetHoldRadius") == FeatureStatus_Available)',
+        '            fCTHoldRadius = BotCTTactics_GetHoldRadius(iClient);',
+        '        float fCTReleaseRadius = fCTHoldRadius * 2.0;',
+        '        float fTacticalMoveStopDistance = fCTHoldRadius < 128.0 ? fCTHoldRadius : 96.0;',
+        '        // END CT_INFERNO_PRECISE_HOLD'
+    ) -join $newline
+    $newHold = $ctHold.Replace('fDistanceToTacticalGoal <= 128.0', 'fDistanceToTacticalGoal <= fCTHoldRadius')
+    $newHold = $newHold.Replace('fDistanceToTacticalGoal > 256.0', 'fDistanceToTacticalGoal > fCTReleaseRadius')
+    $newHold = $newHold.Replace('fDistanceToTacticalGoal <= 256.0', 'fDistanceToTacticalGoal <= fCTReleaseRadius')
+    $text = Replace-Once $text $ctHold ($preciseHold + $newline + "`t`t" + $newHold) 'Inferno precise arrival and release buffer'
+    $text = Replace-Once $text 'if (!bEnemyVisible && !bHoldInitialCTPosition && !bHoldTAttackStage && !bHoldTPostPlantPosition && fDistanceToTacticalGoal > 96.0)' `
+        'if (!bEnemyVisible && !bHoldInitialCTPosition && !bHoldTAttackStage && !bHoldTPostPlantPosition && fDistanceToTacticalGoal > fTacticalMoveStopDistance)' `
+        'allow precision defenders to reach the actual sightline'
+}
+
 $candidateBotSource = Join-Path $buildDir "bot_stuff.sp"
 $candidateBotPlugin = Join-Path $buildDir "bot_stuff.smx"
 $candidateDirectorPlugin = Join-Path $buildDir "001_bot_ct_tactics.smx"
@@ -1721,6 +1751,8 @@ try {
     Copy-Item -LiteralPath $fixedWatchSource -Destination (Join-Path $includeDir "bot_ct_fixed_watch.inc") -Force
     Copy-Item -LiteralPath $watchSectorsSource -Destination (Join-Path $includeDir "bot_ct_watch_sectors.inc") -Force
     Copy-Item -LiteralPath $entranceWatchSource -Destination (Join-Path $includeDir "bot_ct_entrance_watch.inc") -Force
+    Copy-Item -LiteralPath $infernoWatchSource -Destination (Join-Path $includeDir "bot_ct_inferno_watch.inc") -Force
+    Copy-Item -LiteralPath $mapProfilesSource -Destination (Join-Path $includeDir "bot_tactical_map_profiles.inc") -Force
 
     & $compiler "-o$candidateDirectorPlugin" $directorSource
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateDirectorPlugin)) {

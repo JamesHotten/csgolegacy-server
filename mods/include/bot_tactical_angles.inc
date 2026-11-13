@@ -57,6 +57,28 @@ stock bool TacticalAngles_IsVisible(const float start[3], const float target[3],
     return fraction >= 0.90;
 }
 
+stock bool TacticalAngles_RequireClearWatch(const float hold[3], float look[3])
+{
+    float eye[3], ray[3];
+    CopyVector(hold, eye);
+    eye[2] += 64.0;
+    MakeVectorFromPoints(eye, look, ray);
+    float distance = GetVectorLength(ray);
+    if (distance < 128.0) return false;
+    Handle trace = TR_TraceRayFilterEx(eye, look, MASK_VISIBLE, RayType_EndPoint, TacticalAngles_TraceFilter, 0);
+    bool clear = !TR_StartSolid(trace) && !TR_DidHit(trace);
+    float visibleDistance = distance * TR_GetFraction(trace);
+    bool canShorten = !TR_StartSolid(trace) && visibleDistance >= 256.0;
+    delete trace;
+    if (clear) return true;
+    if (!canShorten) return false;
+    // The far end might be solid even though the actual line of fire is
+    // usable. Aim just short of the surface, without inventing another sector.
+    ScaleVector(ray, (visibleDistance - 24.0) / distance);
+    AddVectors(eye, ray, look);
+    return true;
+}
+
 stock bool TacticalAngles_SelectLook(int client, const float hold[3], const float threat[3], int slot, float result[3], bool constrainSector = false)
 {
     float baseX = threat[0] - hold[0];
