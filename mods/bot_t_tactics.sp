@@ -6,7 +6,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.6"
+#define PLUGIN_VERSION "0.1.7"
 #define MAX_CANDIDATES 256
 #define TEAM_ANY -2
 
@@ -96,6 +96,8 @@ ConVar g_cvRouteTiming;
 ConVar g_cvRouteRetry;
 ConVar g_cvPostPlantSectors;
 ConVar g_cvClearWatch;
+ConVar g_cvObjectiveWatch;
+ConVar g_cvRouteRecovery;
 ConVar g_cvFakeChance;
 bool g_fakeOpening;
 bool g_fakeBot[MAXPLAYERS + 1];
@@ -137,6 +139,9 @@ bool g_combatReleased[MAXPLAYERS + 1];
 float g_orderGoal[MAXPLAYERS + 1][3];
 float g_orderLook[MAXPLAYERS + 1][3];
 int g_orderRoute[MAXPLAYERS + 1];
+
+#include <bot_tactical_recovery>
+#include <bot_objective_watch>
 float g_orderLastDistance[MAXPLAYERS + 1];
 float g_orderLastPosition[MAXPLAYERS + 1][3];
 float g_orderLastProgressAt[MAXPLAYERS + 1];
@@ -203,6 +208,8 @@ public void OnPluginStart()
     g_cvRouteRetry = CreateConVar("sm_bot_t_route_retry", "1", "Retry a confirmed stalled opening route once on Mirage, Inferno and Nuke.", _, true, 0.0, true, 1.0);
     g_cvPostPlantSectors = CreateConVar("sm_bot_t_postplant_sectors", "1", "Keep a close bomb watcher and distribute the other post-plant angles.", _, true, 0.0, true, 1.0);
     g_cvClearWatch = CreateConVar("sm_bot_t_clear_watch", "1", "Reject nearby obstructions from the T BOT's actual eye before applying a tactical look.", _, true, 0.0, true, 1.0);
+    g_cvObjectiveWatch = CreateConVar("sm_bot_t_objective_watch", "1", "Use visible retake entrances for plant cover and post-plant holds.", _, true, 0.0, true, 1.0);
+    g_cvRouteRecovery = CreateConVar("sm_bot_t_route_recovery", "1", "Try one local same-lane recovery when an actively driven T order stalls.", _, true, 0.0, true, 1.0);
     g_cvFakeChance = CreateConVar("sm_bot_t_fake_opening_chance", "0", "Mirage: chance to add one decoy runner to a default attack; 0 disables.", _, true, 0.0, true, 100.0);
     g_cvRoundTimeDefuse = FindConVar("mp_roundtime_defuse");
 
@@ -247,12 +254,21 @@ public void OnClientPutInServer(int client)
     g_orderStallReported[client] = false;
     g_routeRetryUsed[client] = false;
     g_routeDriveAt[client] = g_routePausedAt[client] = 0.0;
+    g_recoveryDriveAt[client] = 0.0;
+    g_recoveryTried[client] = false;
+    g_objectiveNamed[client] = false;
 }
 
 public any Native_ReportRouteDrive(Handle plugin, int numParams)
 {
     int client = GetNativeCell(1);
-    if (!g_cvRouteRetry.BoolValue || !g_routeRetryMap || !IsTBot(client) || !g_hasOrder[client]
+    if (!IsTBot(client) || !g_hasOrder[client]) return 0;
+    if (numParams >= 3 && GetNativeCell(3) != 0)
+    {
+        if (g_cvRouteRecovery.BoolValue) TacticalRecovery_Report(client, GetNativeCell(2) != 0);
+        return 0;
+    }
+    if (!g_cvRouteRetry.BoolValue || !g_routeRetryMap
         || (g_phase != TPhase_AttackStage && !IsManagedPlantApproach(client))) return 0;
     if (GetNativeCell(2)) g_routeDriveAt[client] = GetGameTime();
     else g_routePausedAt[client] = GetGameTime();
@@ -349,7 +365,17 @@ public any Native_GetAim(Handle plugin, int numParams)
     if (!g_cvEnabled.BoolValue || client < 1 || client > MaxClients || !g_hasOrder[client]
         || !g_hasLook[client] || g_combatReleased[client] || !IsTBot(client))
         return false;
-    if (numParams >= 3 && GetNativeCell(3) != 0 && g_cvClearWatch.BoolValue)
+    bool live = numParams >= 3 && GetNativeCell(3) != 0;
+    if (live && g_cvObjectiveWatch.BoolValue && g_objectiveNamed[client]
+        && (g_phase == TPhase_PlantCover || g_phase == TPhase_PostPlant))
+    {
+        float eye[3];
+        GetClientEyePosition(client, eye);
+        if (!TacticalAngles_ClearExactRay(eye, g_orderLook[client])) return false;
+        SetNativeArray(2, g_orderLook[client], 3);
+        return true;
+    }
+    if (live && g_cvClearWatch.BoolValue)
     {
         float look[3];
         if (!TacticalAngles_SelectLiveWatch(client, g_orderGoal[client], g_orderLook[client], view_as<int>(g_phase), look))
@@ -816,6 +842,7 @@ void PlanPlantCover(int planter, const float position[3])
     ClearCombatReleases();
     AssignTargets(bots, count, Route_Safest, 0, count, true);
     g_phase = TPhase_PlantCover;
+    AssignObjectiveWatch(position, false);
     g_phaseStarted = GetGameTime();
     ExperienceSignal("plant_cover", "plant_started", g_attackA ? 0 : 1, planter);
     DebugLog("Plant cover assigned for %d T bots.", count);
@@ -1354,12 +1381,13 @@ void PlanPostPlant()
     int count = CollectTBots(bots);
     if (count == 0 || !NavMeshReady()) return;
     g_targetCount = 0;
-    if (g_cvPostPlantSectors.BoolValue && g_routeRetryMap)
+    if (g_cvPostPlantSectors.BoolValue && (g_routeRetryMap || (g_cvObjectiveWatch.BoolValue && g_mapProfile >= 0)))
         BuildAround(g_bombPosition, 1, 145.0, 235.0, false, 0.0, 0.0);
     BuildAround(g_bombPosition, count - g_targetCount, 220.0, 720.0, false, 0.0, 0.0);
     FillMissingTargetsAt(count, g_bombPosition);
     AssignTargets(bots, count, Route_Safest, 0, count, true);
     g_phase = TPhase_PostPlant;
+    AssignObjectiveWatch(g_bombPosition, true);
     g_phaseStarted = GetGameTime();
     ExperienceSignal("postplant", "bomb_planted", g_attackA ? 0 : 1, 0);
     DebugLog("Assigned %d T bots to post-plant positions.", count);
@@ -1417,7 +1445,8 @@ void SetPostPlantLook(int client, int slot)
 {
     // Plant-cover orders still use the previous angles; after the plant one
     // close player can watch the device itself if the actual ray is clear.
-    if (g_bombPlanted && g_cvPostPlantSectors.BoolValue && g_routeRetryMap && slot == 0)
+    if (g_bombPlanted && g_cvPostPlantSectors.BoolValue
+        && (g_routeRetryMap || (g_cvObjectiveWatch.BoolValue && g_mapProfile >= 0)) && slot == 0)
     {
         float eye[3], bomb[3], fraction;
         CopyVector(g_orderGoal[client], eye);
@@ -1428,11 +1457,26 @@ void SetPostPlantLook(int client, int slot)
         {
             CopyVector(bomb, g_orderLook[client]);
             g_hasLook[client] = true;
+            g_objectiveNamed[client] = true; // Keep the designated bomb watcher.
             return;
         }
     }
     TacticalAngles_SelectLook(client, g_orderGoal[client], g_ctSpawn, slot, g_orderLook[client]);
     g_hasLook[client] = true;
+}
+
+void AssignObjectiveWatch(const float objective[3], bool planted)
+{
+    if (!g_cvObjectiveWatch.BoolValue || g_mapProfile < 0) return;
+    int site = GetVectorDistance(objective, g_siteA) <= GetVectorDistance(objective, g_siteB) ? 0 : 1;
+    ArrayList lanes = ObjectiveWatch_Collect(g_mapProfile, site, true, objective);
+    int used;
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!g_hasOrder[client] || !g_hasLook[client] || (planted && g_objectiveNamed[client])) continue;
+        g_objectiveNamed[client] = ObjectiveWatch_Select(lanes, g_orderGoal[client], used, g_orderLook[client]);
+    }
+    delete lanes;
 }
 
 void BuildAround(const float origin[3], int wanted, float minRadius, float maxRadius, bool directional, float dirX, float dirY)
@@ -1698,7 +1742,11 @@ void ClearOrders()
         g_utilityOrderLane[client] = 0;
         g_fakeBot[client] = false;
         g_routeDriveAt[client] = g_routePausedAt[client] = 0.0;
+        g_recoveryDriveAt[client] = 0.0;
+        g_recoveryTried[client] = false;
+        g_objectiveNamed[client] = false;
     }
+    g_recoverySearchAt = 0.0;
 }
 
 void StartOrderProgress(int client)
@@ -1788,6 +1836,47 @@ void ObserveOrderProgress()
             }
             else DebugLog("T route retry: bot=%N no safe alternative", client);
         }
+        bool oldStageRetry = g_phase == TPhase_AttackStage && g_cvRouteRetry.BoolValue && g_routeRetryMap && g_profileStage;
+        if (!g_cvRouteRecovery.BoolValue || !TacticalRecovery_Driving(client, now))
+        {
+            // Intentional waits do not spend a recovery budget.
+            if (g_cvRouteRecovery.BoolValue && !oldStageRetry && !plantApproach)
+            {
+                g_orderLastProgressAt[client] = now;
+                g_orderLastDistance[client] = distance;
+                CopyVector(position, g_orderLastPosition[client]);
+            }
+            continue;
+        }
+        if (now - g_orderLastProgressAt[client] < 5.0 || distance <= 160.0 || g_fakeBot[client]) continue;
+        if (IsManagedPlantApproach(client))
+        {
+            g_plantOrderClient = -client; // Never move the validated plant point.
+            ExperienceSignal("plant_route_handoff", "stalled_approach", g_attackA ? 0 : 1, client);
+            continue;
+        }
+        // The existing three-map opening retry owns this lane if enabled.
+        // Do not grant another alternate; a stalled retry now has a handoff.
+        if (oldStageRetry && !g_routeRetryUsed[client] && !g_routeRetryStageSpent) continue;
+        if (oldStageRetry && g_routeRetryUsed[client] && now - g_orderLastProgressAt[client] < 8.0) continue;
+        if (!oldStageRetry && !g_recoveryTried[client] && g_phase != TPhase_RecoverBomb)
+        {
+            if (now < g_recoverySearchAt) continue;
+            g_recoverySearchAt = now + 0.30;
+            g_recoveryTried[client] = true;
+            float alternate[3];
+            if (TacticalRecovery_Find(client, position, alternate))
+            {
+                CopyVector(alternate, g_orderGoal[client]);
+                g_orderLastDistance[client] = GetVectorDistance(position, alternate);
+                g_orderLastProgressAt[client] = now;
+                CopyVector(position, g_orderLastPosition[client]);
+                ExperienceSignal("route_retry", "same_lane", g_attackA ? 0 : 1, client);
+                DebugLog("T route retry: bot=%N local same lane", client);
+                continue;
+            }
+        }
+        ReleaseOrder(client, "navigation stalled");
     }
 }
 

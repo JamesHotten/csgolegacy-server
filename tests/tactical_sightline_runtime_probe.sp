@@ -8,6 +8,9 @@ native bool BotCTTactics_GetOrder(int client, float goal[3], int &route);
 native bool BotCTTactics_GetAim(int client, float look[3], bool live = false);
 native bool BotTTactics_GetOrder(int client, float goal[3], int &route);
 native bool BotTTactics_GetAim(int client, float look[3], bool live = false);
+native int NavMesh_GetNearestArea(const float pos[3], bool anyZ=false, float maxDist=10000.0, bool checkLOS=false, bool checkGround=true, int team=-2);
+native void NavMeshArea_GetPlaceCanonical(int area, char[] name, int length);
+#include "../mods/include/bot_tactical_map_profiles.inc"
 
 public Plugin myinfo = {name = "Isolated objective sightline survey", version = "1.1"};
 ConVar g_on;
@@ -192,7 +195,8 @@ float WallDist(const float eye[3], const float look[3])
 
 void Measure(const char[] phase, bool ct, int onlyRoute = -1)
 {
-    int orders, aims, close, samples, offsetClose;
+    int orders, aims, close, samples, offsetClose, named, namedMask;
+    bool retakeWatch = StrEqual(phase, "t_cover") || StrEqual(phase, "t_postplant");
     float minGoal = 99999.0, minOffset = 99999.0;
     for (int i = 1; i <= MaxClients; i++)
     {
@@ -205,7 +209,9 @@ void Measure(const char[] phase, bool ct, int onlyRoute = -1)
         if (SafeFloor(goal, feet))
         {
             samples++;
-            if (MeasureAt(i, ct, feet, minGoal, aims)) close++;
+            int lane;
+            if (MeasureAt(i, ct, feet, minGoal, aims, retakeWatch ? g_site : -1, lane)) close++;
+            if (lane >= 0) { named++; namedMask |= 1 << lane; }
         }
         for (int step = 0; step < 8; step++)
         {
@@ -215,11 +221,14 @@ void Measure(const char[] phase, bool ct, int onlyRoute = -1)
             point[1] += 64.0 * Sine(float(step) * 0.785398163);
             if (!SafeFloor(point, feet)) continue;
             samples++;
-            if (MeasureAt(i, ct, feet, minOffset, aims)) offsetClose++;
+            int unused;
+            if (MeasureAt(i, ct, feet, minOffset, aims, -1, unused)) offsetClose++;
         }
         TeleportEntity(i, original, NULL_VECTOR, NULL_VECTOR);
     }
     PrintToServer("ANGLE_SUMMARY map=%s site=%d phase=%s orders=%d aims=%d near=%d samples=%d offset_near=%d min=%.1f offset_min=%.1f",Maps[g_map],g_site,phase,orders,aims,close,samples,offsetClose,minGoal,minOffset);
+    if (retakeWatch)
+        PrintToServer("ENTRANCE_RESULT map=%s site=%d phase=%s assigned=%d lanes=%d", Maps[g_map],g_site,phase,named,namedMask);
 }
 bool SafeFloor(const float point[3], float feet[3])
 {
@@ -235,14 +244,30 @@ bool SafeFloor(const float point[3], float feet[3])
     return clear;
 }
 
-bool MeasureAt(int client, bool ct, const float feet[3], float &nearestWall, int &aims)
+bool MeasureAt(int client, bool ct, const float feet[3], float &nearestWall, int &aims, int checkSite, int &lane)
 {
+    lane = -1;
     TeleportEntity(client, feet, NULL_VECTOR, NULL_VECTOR);
     float eye[3], look[3];
     if (!(ct ? BotCTTactics_GetAim(client, look, true) : BotTTactics_GetAim(client, look, true))) return false;
     GetClientEyePosition(client, eye);
     aims++;
     float distance = WallDist(eye, look);
+    if (checkSite >= 0 && distance < 0.0)
+    {
+        float nav[3];
+        nav = look;
+        nav[2] -= 64.0;
+        int area = NavMesh_GetNearestArea(nav, false, 30.0, false, true);
+        if (area >= 0)
+        {
+            char actual[32], expected[32];
+            NavMeshArea_GetPlaceCanonical(area, actual, sizeof(actual));
+            for (int i = 0; i < 3; i++)
+                if (TacticalMap_GetWatchPlace(g_map, checkSite, i, true, expected, sizeof(expected)) && StrEqual(actual, expected, false))
+                { lane = i; break; }
+        }
+    }
     if (distance < 0.0 || distance >= 128.0) return false;
     if (distance < nearestWall) nearestWall = distance;
     return true;

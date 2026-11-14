@@ -33,6 +33,30 @@ static const char g_TacticalMapPlaces[10][2][5][32] = {
      {"Bricks", "MidDoors", "PalaceInterior", "Bricks", "MidDoors"}}               // Anubis
 };
 
+// The opposite approaches: used by T after starting to plant.
+static const char g_TacticalRetakePlaces[10][2][3][32] = {
+    {{"Library", "Arch", "Pit"}, {"CTSpawn", "Ruins", "Banana"}},
+    {{"CTSpawn", "Connector", "Ivy"}, {"Connector", "BackofB", "BPlatform"}},
+    {{"TicketBooth", "Jungle", "Connector"}, {"Shop", "Catwalk", "Truck"}},
+    {{"Mini", "Heaven", "Hut"}, {"Ramp", "Decon", "Secret"}},
+    {{"CTSpawn", "Short", "LongA"}, {"BDoors", "Hole", "UpperTunnel"}},
+    {{"BackofA", "UnderA", "Stairs"}, {"Construction", "Bridge", "Water"}},
+    {{"BackofA", "Elevator", "Side"}, {"BackofB", "CTSpawn", "TopofMid"}},
+    {{"CTSpawn", "Catwalk", "LongA"}, {"CTSpawn", "Ducts", "LongHall"}},
+    {{"CTSpawn", "SideEntrance", "TopofMid"}, {"CTSpawn", "Alley", "SideHall"}},
+    {{"Heaven", "Fountain", "Connector"}, {"BackofB", "CTSpawn", "MidDoors"}}
+};
+
+stock bool TacticalMap_GetWatchPlace(int profile, int site, int entry, bool retake, char[] place, int length)
+{
+    if (!retake) return TacticalMap_GetPlace(profile, site, entry, place, length);
+    place[0] = '\0';
+    if (profile < 0 || profile >= sizeof(g_TacticalMapNames) || site < 0 || site > 1
+        || entry < 0 || entry >= 3) return false;
+    strcopy(place, length, g_TacticalRetakePlaces[profile][site][entry]);
+    return place[0] != '\0';
+}
+
 stock int TacticalMap_Find(const char[] map)
 {
     for (int index = 0; index < sizeof(g_TacticalMapNames); index++)

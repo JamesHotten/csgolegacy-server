@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.10"
+#define PLUGIN_VERSION "0.1.11"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -98,6 +98,8 @@ ConVar g_cvClearSiteDefuse;
 ConVar g_cvRetakeRoles;
 ConVar g_cvNukeGuardWatch;
 ConVar g_cvClearWatch;
+ConVar g_cvObjectiveWatch;
+ConVar g_cvRouteRecovery;
 bool g_nukeMap;
 float g_nukeGuardAimCheckAt[MAXPLAYERS + 1];
 float g_nukeGuardEye[MAXPLAYERS + 1][3];
@@ -164,6 +166,9 @@ bool g_infernoPreciseOrder[MAXPLAYERS + 1];
 bool g_combatReleased[MAXPLAYERS + 1];
 float g_orderGoal[MAXPLAYERS + 1][3];
 float g_orderLook[MAXPLAYERS + 1][3];
+
+#include <bot_tactical_recovery>
+#include <bot_objective_watch>
 int g_orderRoute[MAXPLAYERS + 1];
 float g_orderExpires[MAXPLAYERS + 1];
 float g_orderLastProgressDistance[MAXPLAYERS + 1];
@@ -185,6 +190,7 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     RegPluginLibrary("bot_ct_tactics");
     CreateNative("BotCTTactics_GetOrder", Native_GetOrder);
     CreateNative("BotCTTactics_GetAim", Native_GetAim);
+    CreateNative("BotCTTactics_ReportRouteDrive", Native_ReportRouteDrive);
     CreateNative("BotCTTactics_GetHoldRadius", Native_GetHoldRadius);
     CreateNative("BotCTTactics_ReportContact", Native_ReportContact);
 
@@ -227,6 +233,8 @@ public void OnPluginStart()
     g_cvRetakeRoles = CreateConVar("sm_bot_ct_retake_roles", "1", "Use named approaches and prioritize a reachable defuser on Mirage, Inferno and Nuke.", _, true, 0.0, true, 1.0);
     g_cvNukeGuardWatch = CreateConVar("sm_bot_ct_nuke_guard_clear_watch", "1", "Nuke loose-C4 guards use visible approach sightlines instead of a blind fixed aim.", _, true, 0.0, true, 1.0);
     g_cvClearWatch = CreateConVar("sm_bot_ct_clear_watch", "1", "Reject nearby obstructions from the CT BOT's actual eye before applying a tactical look.", _, true, 0.0, true, 1.0);
+    g_cvObjectiveWatch = CreateConVar("sm_bot_ct_objective_watch", "1", "Prefer distinct visible map entrances around a dropped bomb.", _, true, 0.0, true, 1.0);
+    g_cvRouteRecovery = CreateConVar("sm_bot_ct_route_recovery", "1", "Try one local same-lane recovery for an actively driven CT order.", _, true, 0.0, true, 1.0);
     g_cvPairedPressure = CreateConVar("sm_bot_ct_pair_pressure_chance", "0", "Mirage: chance to add a short two-BOT probe to a standard setup; 0 disables.", _, true, 0.0, true, 100.0);
     g_cvCoverSpacing = CreateConVar("sm_bot_ct_cover_spacing", "1", "Avoid overlapping generic opening positions when clear alternate holds are available.", _, true, 0.0, true, 1.0);
     g_cvSyncMinReady = CreateConVar("sm_bot_ct_tactics_sync_min_ready", "50", "Percent of active ordered CT bots required at retake staging goals.", _, true, 20.0, true, 100.0);
@@ -313,6 +321,9 @@ public void OnClientPutInServer(int client)
     g_blindUntil[client] = 0.0;
     g_hasOrder[client] = false;
     g_hasLook[client] = false;
+    g_recoveryDriveAt[client] = 0.0;
+    g_recoveryTried[client] = false;
+    g_objectiveNamed[client] = false;
 }
 
 public void OnEnabledChanged(ConVar convar, const char[] oldValue, const char[] newValue)
@@ -422,6 +433,15 @@ public any Native_GetAim(Handle plugin, int numParams)
         return false;
 
     bool live = numParams >= 3 && GetNativeCell(3) != 0;
+    if (live && g_cvObjectiveWatch.BoolValue && g_objectiveNamed[client] && g_phase == Phase_GuardLooseBomb)
+    {
+        float eye[3];
+        GetClientEyePosition(client, eye);
+        if (GetVectorDistance(eye, g_orderLook[client]) < 150.0 || !TacticalAngles_ClearExactRay(eye, g_orderLook[client]))
+            return false;
+        SetNativeArray(2, g_orderLook[client], 3);
+        return true;
+    }
     if (live && NukeGuardWatchEnabled())
     {
         // The movement bridge stops a short distance from the nominal slot.
@@ -465,6 +485,14 @@ public any Native_GetAim(Handle plugin, int numParams)
     }
     SetNativeArray(2, g_orderLook[client], 3);
     return true;
+}
+
+public any Native_ReportRouteDrive(Handle plugin, int numParams)
+{
+    int client = GetNativeCell(1);
+    if (g_cvRouteRecovery.BoolValue && IsCTBot(client) && g_hasOrder[client])
+        TacticalRecovery_Report(client, GetNativeCell(2) != 0);
+    return 0;
 }
 
 public any Native_GetHoldRadius(Handle plugin, int numParams)
@@ -1321,6 +1349,9 @@ void PlanLooseBombGuard(int bomb, int spotter)
     // Reserve a stable slot for EVERY guard, including bots currently fighting
     // and those released earlier in the round. Publish only after combat ends.
     bool used[MAXPLAYERS + 1];
+    ArrayList watchLanes = null;
+    int usedLanes;
+    if (g_cvObjectiveWatch.BoolValue) watchLanes = ObjectiveWatch_Collect(g_mapProfile, RetakeSite(), false, g_bombPosition);
     for (int target = 0; target < guardCount; target++)
     {
         int selected;
@@ -1339,8 +1370,10 @@ void PlanLooseBombGuard(int bomb, int spotter)
         g_guardSlot[selected] = target;
         CopyVector(g_targets[target], g_orderGoal[selected]);
         SetOrderLook(selected, g_tSpawn, target);
-        if (NukeGuardWatchEnabled()) ResolveNukeGuardLook(selected);
+        g_objectiveNamed[selected] = watchLanes != null && ObjectiveWatch_Select(watchLanes, g_orderGoal[selected], usedLanes, g_orderLook[selected]);
+        if (!g_objectiveNamed[selected] && NukeGuardWatchEnabled()) ResolveNukeGuardLook(selected);
     }
+    delete watchLanes;
     ExperienceSignal("guard_bomb", "loose_c4_seen", NearestSite(g_bombPosition), spotter);
     DebugLog("%N saw dropped C4; reserved %d CT guard positions.", spotter, guardCount);
 }
@@ -1356,13 +1389,13 @@ void ResumeLooseBombGuards()
             ReleaseOrder(client, "enemy spotted");
             continue;
         }
-        if (g_hasOrder[client] || g_guardStalls[client] >= 3 || g_blindUntil[client] > now
+        if (g_hasOrder[client] || g_guardStalls[client] >= (g_cvRouteRecovery.BoolValue ? 1 : 3) || g_blindUntil[client] > now
             || now - g_lastCombatAt[client] < 2.5 || now - g_guardReleasedAt[client] < 2.5)
             continue;
         g_combatReleased[client] = false;
         g_hasOrder[client] = true;
         g_hasLook[client] = true;
-        if (NukeGuardWatchEnabled()) ResolveNukeGuardLook(client);
+        if (!g_objectiveNamed[client] && NukeGuardWatchEnabled()) ResolveNukeGuardLook(client);
         g_orderRoute[client] = view_as<int>(Route_Fastest);
         g_orderExpires[client] = 0.0;
         StartOrderProgress(client);
@@ -2231,7 +2264,11 @@ void ClearOrders()
         g_orderLastProgressDistance[client] = 0.0;
         g_orderLastProgressAt[client] = 0.0;
         g_orderArrived[client] = false;
+        g_objectiveNamed[client] = false;
+        g_recoveryTried[client] = false;
+        g_recoveryDriveAt[client] = 0.0;
     }
+    g_recoverySearchAt = 0.0;
 }
 
 void StartOrderProgress(int client)
@@ -2257,8 +2294,14 @@ void ReleaseStalledOrders()
         GetClientAbsOrigin(client, position);
         float holdRadius = GetCTHoldRadius(client);
         bool precise = holdRadius < 128.0;
-        float distance = precise ? GetVectorDistance(position, g_orderGoal[client]) : Distance2D(position, g_orderGoal[client]);
+        float distance = (precise || g_cvRouteRecovery.BoolValue) ? GetVectorDistance(position, g_orderGoal[client]) : Distance2D(position, g_orderGoal[client]);
         float displacement = Distance2D(position, g_orderLastProgressPosition[client]);
+        if (g_cvRouteRecovery.BoolValue && !TacticalRecovery_Driving(client, now))
+        {
+            g_orderLastProgressAt[client] = now;
+            g_orderLastProgressDistance[client] = distance;
+            CopyVector(position, g_orderLastProgressPosition[client]);
+        }
         if (distance <= holdRadius)
         {
             if (!g_orderArrived[client])
@@ -2298,8 +2341,26 @@ void ReleaseStalledOrders()
         // behind another defender. Still relinquish genuinely stalled orders.
         float timeout = g_cvNavigationStallTimeout.FloatValue;
         if (precise && timeout < 5.0) timeout = 5.0;
-        if (now - g_orderLastProgressAt[client] >= timeout)
-            ReleaseOrder(client, "navigation stalled");
+        if (now - g_orderLastProgressAt[client] < timeout) continue;
+        if (g_cvRouteRecovery.BoolValue && !g_recoveryTried[client] && g_phase != Phase_RetakeCommit
+            && client != GetClientOfUserId(g_defuserUserId))
+        {
+            if (now < g_recoverySearchAt) continue;
+            g_recoverySearchAt = now + 0.30;
+            g_recoveryTried[client] = true;
+            float alternate[3];
+            if (TacticalRecovery_Find(client, position, alternate))
+            {
+                CopyVector(alternate, g_orderGoal[client]);
+                g_orderLastProgressDistance[client] = GetVectorDistance(position, alternate);
+                g_orderLastProgressAt[client] = now;
+                CopyVector(position, g_orderLastProgressPosition[client]);
+                ExperienceSignal("route_retry", "same_lane", NearestSite(alternate), client);
+                DebugLog("CT route retry: bot=%N same lane", client);
+                continue;
+            }
+        }
+        ReleaseOrder(client, "navigation stalled");
     }
 }
 

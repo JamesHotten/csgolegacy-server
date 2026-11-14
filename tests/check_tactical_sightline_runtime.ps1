@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory)] [string]$Log,
-    [switch]$ExpectBlocked
+    [switch]$ExpectBlocked,
+    [switch]$RequireNamedEntrances
 )
 $ErrorActionPreference = 'Stop'
 $maps = 'inferno','train','mirage','nuke','dust2','overpass','vertigo','cache','ancient','anubis'
@@ -39,4 +40,17 @@ if ($ExpectBlocked) {
 } else {
     if ($blocked -ne 0) { throw "Near-wall aim still present: $blocked" }
     Write-Output "SIGHTLINE_RUNTIME_PASS cases=$($rows.Count) samples=$samples aims=$aims near_wall=0"
+}
+if ($RequireNamedEntrances) {
+    $named = @($content -match '^ENTRANCE_RESULT map=de_')
+    $covered = @($named -match 'assigned=[1-9]').Count
+    $distinct = @($named -match 'lanes=(3|5|6|7)$').Count
+    foreach ($map in $maps) {
+        if (@($named -match "^ENTRANCE_RESULT map=de_$map ").Count -ne 4 -or
+            !($named -match "^ENTRANCE_RESULT map=de_$map .*assigned=[1-9]")) {
+            throw "Incomplete objective entrance evidence for $map."
+        }
+    }
+    if ($covered -lt 36 -or $distinct -lt 10) { throw "Insufficient named entrance coverage: $covered/40; multi-entrance examples: $distinct." }
+    Write-Output "OBJECTIVE_ENTRANCE_PASS covered=$covered/40 multi_entrance=$distinct"
 }

@@ -14,7 +14,7 @@ if ($drop.Contains('PlanLooseBombGuard(') -or $drop.Contains('CreateTimer(')) {
 foreach ($expected in @('g_roundLive', 'g_blindUntil[client]', 'BotStuff_CanSeeLooseC4(client, bomb)',
     'EntRefToEntIndex(g_guardBombRef)', 'guardCount == 0', 'g_guardSlot[selected] = target',
     'BotStuff_HasVisibleEnemy(client)', 'now - g_lastCombatAt[client] < 2.5',
-    'g_guardStalls[client] >= 3', 'ClearLooseBombGuard();')) {
+    'g_guardStalls[client] >= (g_cvRouteRecovery.BoolValue ? 1 : 3)', 'ClearLooseBombGuard();')) {
     if (-not $ct.Contains($expected)) { throw "Missing loose-C4 lifecycle safeguard: $expected" }
 }
 $reinforce = [regex]::Match($ct, '(?s)int RequestReinforcement\(.*?void ReleaseOrder\(').Value

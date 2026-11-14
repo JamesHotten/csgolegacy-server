@@ -1883,6 +1883,31 @@ if (-not $text.Contains('BEGIN TACTICAL_LIVE_SIGHTLINE')) {
     $text = Replace-Once $text $old '!BotCTWatch_IsEssentialLook(szDesc, hParams.Get(7) != 0) && BotCTWatch_IsQuietHold(iClient)' 'preserve essential engine look requests before querying watch geometry'
 }
 
+if (-not $text.Contains('BEGIN TACTICAL_RECOVERY_DRIVE')) {
+    $old = 'native void BotTTactics_ReportRouteDrive(int client, bool driving);'
+    $text = Replace-Once $text $old ('native void BotTTactics_ReportRouteDrive(int client, bool driving, bool general = false);' + $newline +
+        'native void BotCTTactics_ReportRouteDrive(int client, bool driving);') 'optional recovery drive bridge'
+    $old = 'MarkNativeAsOptional("BotTTactics_ReportRouteDrive");'
+    $text = Replace-Once $text $old ($old + $newline + '    MarkNativeAsOptional("BotCTTactics_ReportRouteDrive");') 'optional CT recovery drive bridge'
+    $old = 'if (!bEnemyVisible && !bHoldInitialCTPosition && !bHoldTAttackStage && !bHoldTPostPlantPosition && fDistanceToTacticalGoal > fTacticalMoveStopDistance)'
+    $block = @(
+        '// BEGIN TACTICAL_RECOVERY_DRIVE',
+        '        bool bTacticalTravel = !bEnemyVisible && !bHoldInitialCTPosition && !bHoldTAttackStage && !bHoldTPostPlantPosition',
+        '            && fDistanceToTacticalGoal > fTacticalMoveStopDistance;',
+        '        bool bRecoveryDrive = bTacticalTravel && !g_bThrowGrenade[iClient] && eItems_GetWeaponSlotByDefIndex(iDefIndex) != CS_SLOT_GRENADE',
+        '            && GetEntityMoveType(iClient) != MOVETYPE_LADDER && (GetEntityFlags(iClient) & FL_ONGROUND) != 0',
+        '            && GetTask(iClient) != ESCAPE_FROM_FLAMES && GetTask(iClient) != ESCAPE_FROM_BOMB',
+        '            && GetTask(iClient) != PLANT_BOMB && GetTask(iClient) != DEFUSE_BOMB;',
+        '        if (GetClientTeam(iClient) == CS_TEAM_CT && GetFeatureStatus(FeatureType_Native, "BotCTTactics_ReportRouteDrive") == FeatureStatus_Available)',
+        '            BotCTTactics_ReportRouteDrive(iClient, bRecoveryDrive);',
+        '        else if (GetClientTeam(iClient) == CS_TEAM_T && GetFeatureStatus(FeatureType_Native, "BotTTactics_ReportRouteDrive") == FeatureStatus_Available)',
+        '            BotTTactics_ReportRouteDrive(iClient, bRecoveryDrive, true);',
+        '        // END TACTICAL_RECOVERY_DRIVE',
+        ('        ' + $old)
+    ) -join $newline
+    $text = Replace-Once $text $old $block 'observe only actual tactical travel'
+}
+
 $candidateExperiencePlugin = Join-Path $buildDir "000_bot_tactical_experience.smx"
 
 try {
@@ -1901,6 +1926,9 @@ try {
     Copy-Item -LiteralPath $mapProfilesSource -Destination (Join-Path $includeDir "bot_tactical_map_profiles.inc") -Force
     Copy-Item -LiteralPath $mirageUtilitySource -Destination (Join-Path $includeDir "bot_mirage_utility.inc") -Force
     Copy-Item -LiteralPath $jumpRepetitionSource -Destination (Join-Path $includeDir "bot_jump_repetition.inc") -Force
+    foreach ($file in @('bot_tactical_recovery.inc', 'bot_objective_watch.inc')) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot "include\$file") -Destination (Join-Path $includeDir $file) -Force
+    }
 
     & $compiler "-o$candidateDirectorPlugin" $directorSource
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateDirectorPlugin)) {

@@ -116,6 +116,15 @@ stock bool TacticalAngles_ClipWatchRay(const float eye[3], float look[3])
     return true;
 }
 
+stock bool TacticalAngles_ClearExactRay(const float eye[3], const float look[3])
+{
+    Handle trace = TR_TraceRayFilterEx(eye, look, MASK_VISIBLE, RayType_EndPoint,
+        TacticalAngles_TraceFilter, 0);
+    bool clear = !TR_StartSolid(trace) && !TR_DidHit(trace);
+    delete trace;
+    return clear;
+}
+
 stock bool TacticalAngles_SelectLiveWatch(int client, const float goal[3], const float planned[3], int phase, float look[3])
 {
     float eye[3], now = GetGameTime();

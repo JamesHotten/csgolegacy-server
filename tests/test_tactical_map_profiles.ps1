@@ -10,8 +10,9 @@ $installer = Get-Content -LiteralPath (Join-Path $mods 'install_ct_tactics.ps1')
 $maps = @('de_inferno','de_train','de_mirage','de_nuke','de_dust2','de_overpass','de_vertigo','de_cache','de_ancient','de_anubis')
 $declared = @([regex]::Matches($profiles, '"(de_[a-z0-9]+)"') | ForEach-Object { $_.Groups[1].Value })
 if (($maps -join ',') -cne ($declared -join ',')) { throw 'Unexpected map profile coverage or order.' }
-$rows = [regex]::Matches($profiles, '\{\{([^{}]+)\},\s*\{([^{}]+)\}\}')
-if ($rows.Count -ne $maps.Count) { throw 'Each of the ten maps requires exactly two site profiles.' }
+$rows = [regex]::Matches(($profiles -split 'g_TacticalRetakePlaces',2)[0], '\{\{([^{}]+)\},\s*\{([^{}]+)\}\}')
+$retakeRows = [regex]::Matches(($profiles -split 'g_TacticalRetakePlaces',2)[1], '\{\{([^{}]+)\},\s*\{([^{}]+)\}\}')
+if ($rows.Count -ne $maps.Count -or $retakeRows.Count -ne $maps.Count) { throw 'Each of the ten maps requires exactly two site profiles.' }
 for ($index = 0; $index -lt $maps.Count; $index++) {
     $map = $maps[$index]
     $navNames = $null
@@ -37,6 +38,12 @@ for ($index = 0; $index -lt $maps.Count; $index++) {
         }
         foreach ($place in $places) {
             if ($place -and $navNames -and $navNames -cnotcontains $place) { throw "$map NAV lacks $place." }
+        }
+        $retake = @([regex]::Matches($retakeRows[$index].Groups[$site].Value, '"([^"]+)"') |
+            ForEach-Object { $_.Groups[1].Value })
+        if ($retake.Count -ne 3 -or @($retake | Sort-Object -Unique).Count -ne 3) { throw "$map needs three distinct retake entrances." }
+        foreach ($name in $retake) {
+            if ($navNames -and $navNames -cnotcontains $name) { throw "$map retake NAV lacks $name." }
         }
     }
 }

@@ -42,8 +42,8 @@ if (-not $ct.Contains('ExperienceSignal("order_arrived"') -or
 
 $observe = [regex]::Match($t, '(?s)void ObserveOrderProgress\(\).*?void ClearCombatReleases\(').Value
 if (-not $observe.Contains('g_orderStallReported[client] = true;') -or
-    $observe.Contains('ReleaseOrder(client') -or $observe.Contains('PlanAttackCommit();')) {
-    throw 'T route-stall observation must remain once-per-order and read-only.'
+    $observe.Contains('PlanAttackCommit();') -or !$observe.Contains('TacticalRecovery_Driving(client, now)')) {
+    throw 'T stall telemetry must remain once per order; recovery must be per BOT and require active route drive.'
 }
 
 Write-Host 'BOT tactical experience signal regression checks passed.'
