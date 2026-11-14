@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.5"
+#define PLUGIN_VERSION "0.1.7"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -89,6 +89,8 @@ ConVar g_cvInitialHold;
 ConVar g_cvRetakeStage;
 ConVar g_cvRetakeCommit;
 ConVar g_cvRetakeStageTimeout;
+ConVar g_cvRetakeClockAware;
+ConVar g_cvClearSiteDefuse;
 ConVar g_cvSyncMinReady;
 ConVar g_cvGuardCount;
 ConVar g_cvFullPushChance;
@@ -124,6 +126,8 @@ float g_lastCombatAt[MAXPLAYERS + 1];
 float g_guardReleasedAt[MAXPLAYERS + 1];
 float g_blindUntil[MAXPLAYERS + 1];
 bool g_retakeContact;
+bool g_retakeUnopposed;
+int g_retakeBombRef = INVALID_ENT_REFERENCE;
 float g_lastContactAt[2];
 int g_siteEnemyUserId[2][4];
 float g_siteEnemySeenAt[2][4];
@@ -196,6 +200,8 @@ public void OnPluginStart()
     g_cvRetakeStage = CreateConVar("sm_bot_ct_tactics_retake_stage", "6.0", "Minimum seconds spent taking distinct retake approaches.", _, true, 0.5, true, 12.0);
     g_cvRetakeCommit = CreateConVar("sm_bot_ct_tactics_retake_commit", "14.0", "Maximum seconds to push the planted bomb after staging.", _, true, 2.0, true, 25.0);
     g_cvRetakeStageTimeout = CreateConVar("sm_bot_ct_tactics_retake_stage_timeout", "12.0", "Hard timeout before committing the retake.", _, true, 2.0, true, 20.0);
+    g_cvRetakeClockAware = CreateConVar("sm_bot_ct_retake_clock_aware", "1", "Skip CT retake staging with 20 seconds or less left, or for a solo BOT, and reject vertically separated arrivals.", _, true, 0.0, true, 1.0);
+    g_cvClearSiteDefuse = CreateConVar("sm_bot_ct_clear_site_defuse", "1", "Yield to native defuse AI when all attackers are eliminated.", _, true, 0.0, true, 1.0);
     g_cvSyncMinReady = CreateConVar("sm_bot_ct_tactics_sync_min_ready", "50", "Percent of active ordered CT bots required at retake staging goals.", _, true, 20.0, true, 100.0);
     g_cvGuardCount = CreateConVar("sm_bot_ct_tactics_guard_count", "0", "Dropped C4 guards: 0 = all alive CT bots; positive values cap the count.", _, true, 0.0, true, 5.0);
 
@@ -357,6 +363,8 @@ public any Native_GetOrder(Handle plugin, int numParams)
     int client = GetNativeCell(1);
     if (!g_cvEnabled.BoolValue || client < 1 || client > MaxClients || !g_hasOrder[client]
         || g_combatReleased[client] || !IsCTBot(client))
+        return false;
+    if (g_cvClearSiteDefuse.BoolValue && g_phase == Phase_RetakeCommit && g_retakeUnopposed)
         return false;
 
     if (g_orderExpires[client] > 0.0 && GetGameTime() >= g_orderExpires[client])
@@ -613,6 +621,7 @@ public Action Timer_PlanRetake(Handle timer)
         return Plugin_Stop;
 
     GetEntPropVector(bomb, Prop_Send, "m_vecOrigin", g_bombPosition);
+    g_retakeBombRef = EntIndexToEntRef(bomb);
     PlanRetake(false);
     return Plugin_Stop;
 }
@@ -715,6 +724,14 @@ public Action Timer_Update(Handle timer)
     UpdateLooseBombGuard();
     if (g_phase == Phase_Idle)
         return Plugin_Continue;
+    if (g_cvClearSiteDefuse.BoolValue && g_bombPlanted
+        && (g_phase == Phase_RetakeStage || g_phase == Phase_RetakeCommit) && RetakeIsUnopposed())
+    {
+        g_retakeUnopposed = true;
+        if (g_phase == Phase_RetakeStage) PlanRetake(true);
+        return Plugin_Continue;
+    }
+    g_retakeUnopposed = false;
     ReleaseStalledOrders();
     float elapsed = GetGameTime() - g_phaseStarted;
     if (g_phase == Phase_Initial && elapsed >= g_cvInitialHold.FloatValue)
@@ -726,6 +743,7 @@ public Action Timer_Update(Handle timer)
     }
     else if (g_phase == Phase_RetakeStage
         && (g_retakeContact
+            || RetakeClockUrgent()
             || (elapsed >= g_cvRetakeStage.FloatValue && OrdersMeetReadyPercent(180.0, g_cvSyncMinReady.IntValue))
             || elapsed >= g_cvRetakeStageTimeout.FloatValue))
     {
@@ -1178,6 +1196,24 @@ void ClearLooseBombGuard()
     }
 }
 
+bool RetakeIsUnopposed()
+{
+    for (int i = 1; i <= MaxClients; i++)
+        if (IsClientInGame(i) && IsPlayerAlive(i) && GetClientTeam(i) == CS_TEAM_T) return false;
+    return true;
+}
+
+bool RetakeClockUrgent()
+{
+    if (!g_cvRetakeClockAware.BoolValue) return false;
+    int bomb = EntRefToEntIndex(g_retakeBombRef);
+    if (bomb == INVALID_ENT_REFERENCE || !HasEntProp(bomb, Prop_Send, "m_flC4Blow")
+        || !HasEntProp(bomb, Prop_Send, "m_bBombTicking") || !GetEntProp(bomb, Prop_Send, "m_bBombTicking")) return false;
+    float remaining = GetEntPropFloat(bomb, Prop_Send, "m_flC4Blow") - GetGameTime();
+    // Reserve time for the final approach and a ten-second kitless defuse.
+    return remaining > 0.0 && remaining <= 20.0;
+}
+
 void PlanRetake(bool commit)
 {
     int bots[MAXPLAYERS + 1];
@@ -1185,6 +1221,11 @@ void PlanRetake(bool commit)
     if (count == 0 || !NavMeshReady())
         return;
 
+    if (!commit && g_cvRetakeClockAware.BoolValue && (count == 1 || RetakeClockUrgent()))
+    {
+        ExperienceSignal("retake_skip_stage", count == 1 ? "solo_bot" : "bomb_clock", NearestSite(g_bombPosition), 0);
+        commit = true;
+    }
     g_targetCount = 0;
     if (commit)
         BuildAround(g_bombPosition, count, 40.0, 260.0, false, 0.0, 0.0);
@@ -1832,7 +1873,9 @@ void GetOrderProgress(float distanceLimit, int &ready, int &ordered)
         ordered++;
         float position[3];
         GetClientAbsOrigin(client, position);
-        if (Distance2D(position, g_orderGoal[client]) <= distanceLimit)
+        bool retake = g_cvRetakeClockAware.BoolValue && (g_phase == Phase_RetakeStage || g_phase == Phase_RetakeCommit);
+        float distance = retake ? GetVectorDistance(position, g_orderGoal[client]) : Distance2D(position, g_orderGoal[client]);
+        if (distance <= distanceLimit && (!retake || FloatAbs(position[2] - g_orderGoal[client][2]) <= 96.0))
             ready++;
     }
 }
@@ -1862,6 +1905,8 @@ void ResetDirector()
     g_phaseStarted = 0.0;
     g_targetCount = 0;
     g_retakeContact = false;
+    g_retakeUnopposed = false;
+    g_retakeBombRef = INVALID_ENT_REFERENCE;
 }
 
 void FillMissingTargets(int wanted)

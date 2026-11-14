@@ -1022,6 +1022,13 @@ if (-not $text.Contains("BEGIN BOT_PURCHASE_POLICY")) {
 }
 
 # Coordinate decisions with each player's actual primary weapon, armor and cash.
+# Expose the frozen purchase plan to the optional read-only recorder.
+if (-not $text.Contains('CreateNative("BotEquipment_GetBuyPlan"')) {
+    $loadMatch = [regex]::Match($text, '(?m)^public APLRes AskPluginLoad2\([^\r\n]*\)\r?\n\{')
+    if (-not $loadMatch.Success) { throw 'BetterBots AskPluginLoad2 not found for purchase-plan telemetry.' }
+    $planRegistration = $loadMatch.Value + $newline + '    CreateNative("BotEquipment_GetBuyPlan", Native_BotEquipment_GetBuyPlan);'
+    $text = Replace-Once $text $loadMatch.Value $planRegistration 'purchase-plan telemetry native'
+}
 # The original BetterBots drop path is preserved, with safer donor reserves,
 # recipient priority and delivery verification added around it.
 if (-not $text.Contains("BEGIN BOT_EQUIPMENT_POLICY")) {
@@ -1737,6 +1744,23 @@ $candidateBotPlugin = Join-Path $buildDir "bot_stuff.smx"
 $candidateDirectorPlugin = Join-Path $buildDir "001_bot_ct_tactics.smx"
 $candidateTDirectorPlugin = Join-Path $buildDir "002_bot_t_tactics.smx"
 $candidateSideStatsPlugin = Join-Path $buildDir "000_bot_side_win_stats.smx"
+# Only the C4 carrier outside the plant trigger needs the shorter cutoff.
+if (-not $text.Contains('BEGIN T_SAFE_PLANT_APPROACH')) {
+    $old = 'native bool BotTTactics_IsUrgentPlant();'
+    $text = Replace-Once $text $old ($old + $newline + 'native bool BotTTactics_IsPlantApproach(int client);') 'T safe plant native'
+    $old = 'MarkNativeAsOptional("BotTTactics_IsUrgentPlant");'
+    $text = Replace-Once $text $old ($old + $newline + '    MarkNativeAsOptional("BotTTactics_IsPlantApproach");') 'T safe plant optional native'
+    $old = 'float fTacticalMoveStopDistance = fCTHoldRadius < 128.0 ? fCTHoldRadius : 96.0;'
+    $approach = @(
+        $old,
+        '        // BEGIN T_SAFE_PLANT_APPROACH',
+        '        if (GetFeatureStatus(FeatureType_Native, "BotTTactics_IsPlantApproach") == FeatureStatus_Available',
+        '            && BotTTactics_IsPlantApproach(iClient)) fTacticalMoveStopDistance = 8.0;',
+        '        // END T_SAFE_PLANT_APPROACH'
+    ) -join $newline
+    $text = Replace-Once $text $old $approach 'T carrier approach cutoff'
+}
+
 $candidateExperiencePlugin = Join-Path $buildDir "000_bot_tactical_experience.smx"
 
 try {

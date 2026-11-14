@@ -98,6 +98,11 @@ public Action StartProbe(int client, int args)
         g_settings[i].IntValue = (i == 3 || i == 5) ? 0 : (i == 4 ? 8 : 1);
     }
     g_running = true;
+    // A bot kicked during setup can leave a second loose C4. The director
+    // only tracks one loose bomb, so start the synthetic fixture clean.
+    int loose = -1;
+    while ((loose = FindEntityByClassname(loose, "weapon_c4")) != -1)
+        if (GetEntPropEnt(loose, Prop_Send, "m_hOwnerEntity") <= 0) RemoveEntity(loose);
     g_failures = 0;
     g_stage = 0;
     g_faceBomb = false;
@@ -113,16 +118,35 @@ public Action StartProbe(int client, int args)
     }
     int spawn = FindEntityByClassname(-1, "info_player_counterterrorist");
     if (spawn == -1) SetFailState("No CT spawn for probe");
-    GetEntPropVector(spawn, Prop_Data, "m_vecOrigin", g_bombPosition);
-    g_bombPosition[0] += 100.0;
-    g_bombPosition[2] += 10.0;
+    float start[3];
+    GetEntPropVector(spawn, Prop_Data, "m_vecOrigin", start);
+    // The first spawn and its +X side are not guaranteed to have clear LOS.
+    // Put the synthetic loose C4 on an explicitly clear line from the spotter.
+    float eye[3], spot[3];
+    CopyVec(start, eye);
+    eye[2] += 64.0;
+    bool found;
+    for (int direction = 0; direction < 8; direction++)
+    {
+        float angle = float(direction) * 0.785398163;
+        CopyVec(start, spot);
+        spot[0] += 100.0 * Cosine(angle);
+        spot[1] += 100.0 * Sine(angle);
+        spot[2] += 14.0;
+        Handle trace = TR_TraceRayFilterEx(eye, spot, MASK_VISIBLE, RayType_EndPoint, TestWorldOnly);
+        found = !TR_DidHit(trace) && !TR_StartSolid(trace);
+        delete trace;
+        if (found) break;
+    }
+    if (!found) SetFailState("No clear test line near CT spawn");
+    CopyVec(spot, g_bombPosition);
+    g_bombPosition[2] -= 8.0;
     // Cluster CTs in this clear local area and pin their view away from C4.
     for (int n = 0; n < g_count; n++)
     {
         float position[3];
-        position[0] = g_bombPosition[0] - 100.0;
-        position[1] = g_bombPosition[1] + float(n) * 35.0;
-        position[2] = g_bombPosition[2] - 10.0;
+        CopyVec(start, position);
+        position[1] += float(n) * 34.0;
         TeleportEntity(g_bots[n], position, NULL_VECTOR, NULL_VECTOR);
         AimProbeBot(g_bots[n]);
     }
@@ -149,6 +173,13 @@ public Action StartProbe(int client, int args)
     ReplyToCommand(client, "CT_GUARD_PROBE_STARTED ct=%d", g_count);
     return Plugin_Handled;
 }
+
+void CopyVec(const float src[3], float dest[3])
+{
+    for (int i = 0; i < 3; i++) dest[i] = src[i];
+}
+
+public bool TestWorldOnly(int entity, int contentsMask, any unused) { return entity > MaxClients; }
 
 public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3], float angles[3])
 {
@@ -233,7 +264,13 @@ public Action CheckProbe(Handle timer)
         int bomb = EntRefToEntIndex(g_bombRef);
         float position[3];
         if (bomb != INVALID_ENT_REFERENCE) GetEntPropVector(bomb, Prop_Send, "m_vecOrigin", position);
+        int visible;
+        if (bomb != INVALID_ENT_REFERENCE && GetFeatureStatus(FeatureType_Native, "BotStuff_CanSeeLooseC4") == FeatureStatus_Available)
+            for (int n = 0; n < g_count; n++)
+                if (BotStuff_CanSeeLooseC4(g_bots[n], bomb)) visible++;
         PrintToServer("CT_GUARD_PROBE c4=%d at %.0f %.0f %.0f", bomb, position[0], position[1], position[2]);
+        PrintToServer("CT_GUARD_PROBE visible=%d", visible);
+        ServerCommand("sm_ct_tactics_status");
         PrintToServer("CT_GUARD_PROBE guards=%d expected=%d", count, g_count);
         Check("all_alive_cts_include_previously_released_bot", count == g_count);
         CheckReinforcementPriority();

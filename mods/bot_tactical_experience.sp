@@ -8,6 +8,27 @@
 #define MAX_RECORDED_EVENTS 64
 #define MAX_RECORDED_SIGNALS 96
 
+native int BotEquipment_GetBuyPlan(int team);
+
+enum struct OpeningGear
+{
+    int players;
+    int bots;
+    int rifles;
+    int snipers;
+    int smgs;
+    int shotguns;
+    int otherPrimary;
+    int pistolsOnly;
+    int armored;
+    int helmets;
+    int kits;
+    int utility;
+    int smokes;
+    int flashes;
+    int purchasePlan;
+}
+
 enum struct RecordedEvent
 {
     int kind;
@@ -40,7 +61,7 @@ public Plugin myinfo =
     name = "BetterBots Tactical Experience Recorder",
     author = "JamesHotten server project",
     description = "Records rounds and opening BOT tactics without changing decisions",
-    version = "0.1.0",
+    version = "0.1.1",
     url = "https://github.com/JamesHotten/csgolegacy-server"
 };
 
@@ -65,12 +86,18 @@ int g_signalCount;
 float g_roundStartedGameTime;
 bool g_firstDamage[4];
 bool g_firstSight[4];
+OpeningGear g_openingGear[4];
+bool g_gearCaptured;
+bool g_recordGear;
+bool g_planted, g_defused;
+int g_plantMs, g_defuseBeginMs, g_retakeStageMs, g_retakeCommitMs, g_kitAtDefuse;
 
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMax)
 {
     RegPluginLibrary("bot_tactical_experience");
     CreateNative("BotExperience_RecordOpeningPlan", Native_RecordOpeningPlan);
     CreateNative("BotExperience_RecordSignal", Native_RecordSignal);
+    MarkNativeAsOptional("BotEquipment_GetBuyPlan");
     return APLRes_Success;
 }
 
@@ -130,12 +157,27 @@ public void OnPluginStart()
         g_database = null;
         return;
     }
+    g_recordGear = SQL_FastQuery(g_database,
+        "CREATE TABLE IF NOT EXISTS opening_gear ("
+        ... "round_id INTEGER NOT NULL, team INTEGER NOT NULL, purchase_plan TEXT NOT NULL, "
+        ... "players INTEGER NOT NULL, bots INTEGER NOT NULL, rifles INTEGER NOT NULL, snipers INTEGER NOT NULL, "
+        ... "smgs INTEGER NOT NULL, shotguns INTEGER NOT NULL, other_primary INTEGER NOT NULL, pistols_only INTEGER NOT NULL, "
+        ... "armored INTEGER NOT NULL, helmets INTEGER NOT NULL, kits INTEGER NOT NULL, utility INTEGER NOT NULL, "
+        ... "smokes INTEGER NOT NULL, flashes INTEGER NOT NULL, PRIMARY KEY (round_id, team));")
+        && SQL_FastQuery(g_database,
+        "CREATE TABLE IF NOT EXISTS retake_outcomes ("
+        ... "round_id INTEGER PRIMARY KEY, plant_ms INTEGER NOT NULL, stage_ms INTEGER, commit_ms INTEGER, "
+        ... "defuse_begin_ms INTEGER, kit_at_defuse INTEGER, defused INTEGER NOT NULL);");
+    if (!g_recordGear) LogDatabaseError("initialize optional equipment and retake telemetry");
     GetCurrentMap(g_map, sizeof(g_map));
     HookEvent("round_start", Event_RoundStart, EventHookMode_PostNoCopy);
+    HookEvent("round_freeze_end", Event_FreezeEnd, EventHookMode_PostNoCopy);
     HookEvent("round_end", Event_RoundEnd, EventHookMode_Post);
     HookEvent("player_death", Event_PlayerDeath, EventHookMode_Post);
     HookEvent("player_hurt", Event_PlayerHurt, EventHookMode_Post);
     HookEvent("bomb_planted", Event_BombPlanted, EventHookMode_Post);
+    HookEvent("bomb_begindefuse", Event_BombBeginDefuse, EventHookMode_Post);
+    HookEvent("bomb_defused", Event_BombDefused, EventHookMode_Post);
     HookEvent("bomb_beginplant", Event_BombBeginPlant, EventHookMode_Post);
     HookEvent("bomb_abortplant", Event_BombAbortPlant, EventHookMode_Post);
     HookEventEx("grenade_thrown", Event_GrenadeThrown, EventHookMode_Post);
@@ -179,11 +221,105 @@ public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
     g_eventCount = 0;
     g_signalCount = 0;
     g_roundStartedGameTime = GetGameTime();
+    g_gearCaptured = false;
+    g_planted = false;
+    g_defused = false;
+    g_plantMs = -1;
+    g_defuseBeginMs = -1;
+    g_retakeStageMs = -1;
+    g_retakeCommitMs = -1;
+    g_kitAtDefuse = -1;
     for (int team = 0; team < 4; team++)
     {
         g_firstDamage[team] = false;
         g_firstSight[team] = false;
     }
+}
+
+int RoundElapsedMs() { return RoundToNearest((GetGameTime() - g_roundStartedGameTime) * 1000.0); }
+
+// Use classnames, including MP5-SD and both M4 variants, independent of prices.
+void CountPrimary(int entity, int secondary, OpeningGear gear)
+{
+    if (entity <= MaxClients || !IsValidEntity(entity))
+    {
+        if (secondary > MaxClients && IsValidEntity(secondary)) gear.pistolsOnly++;
+        return;
+    }
+    char name[40];
+    GetEntityClassname(entity, name, sizeof(name));
+    if (StrEqual(name, "weapon_ak47") || StrEqual(name, "weapon_m4a1") || StrEqual(name, "weapon_m4a1_silencer")
+        || StrEqual(name, "weapon_famas") || StrEqual(name, "weapon_galilar") || StrEqual(name, "weapon_aug")
+        || StrEqual(name, "weapon_sg556")) gear.rifles++;
+    else if (StrEqual(name, "weapon_awp") || StrEqual(name, "weapon_ssg08")
+        || StrEqual(name, "weapon_scar20") || StrEqual(name, "weapon_g3sg1")) gear.snipers++;
+    else if (StrEqual(name, "weapon_mp9") || StrEqual(name, "weapon_mac10") || StrEqual(name, "weapon_mp7")
+        || StrEqual(name, "weapon_mp5sd") || StrEqual(name, "weapon_ump45")
+        || StrEqual(name, "weapon_p90") || StrEqual(name, "weapon_bizon")) gear.smgs++;
+    else if (StrEqual(name, "weapon_nova") || StrEqual(name, "weapon_mag7") || StrEqual(name, "weapon_sawedoff")
+        || StrEqual(name, "weapon_xm1014")) gear.shotguns++;
+    else gear.otherPrimary++;
+}
+
+public void Event_FreezeEnd(Event event, const char[] name, bool dontBroadcast)
+{
+    if (!g_roundActive || !g_recordGear || g_gearCaptured) return;
+    g_gearCaptured = true;
+    for (int team = CS_TEAM_T; team <= CS_TEAM_CT; team++)
+    {
+        OpeningGear gear;
+        gear.purchasePlan = GetFeatureStatus(FeatureType_Native, "BotEquipment_GetBuyPlan") == FeatureStatus_Available
+            ? BotEquipment_GetBuyPlan(team) : -1;
+        for (int client = 1; client <= MaxClients; client++)
+        {
+            if (!IsClientInGame(client) || !IsPlayerAlive(client) || GetClientTeam(client) != team) continue;
+            gear.players++;
+            if (IsFakeClient(client)) gear.bots++;
+            CountPrimary(GetPlayerWeaponSlot(client, CS_SLOT_PRIMARY), GetPlayerWeaponSlot(client, CS_SLOT_SECONDARY), gear);
+            if (GetEntProp(client, Prop_Data, "m_ArmorValue") > 0) gear.armored++;
+            if (GetEntProp(client, Prop_Send, "m_bHasHelmet")) gear.helmets++;
+            if (team == CS_TEAM_CT && GetEntProp(client, Prop_Send, "m_bHasDefuser")) gear.kits++;
+            if (!HasEntProp(client, Prop_Send, "m_iAmmo") || !HasEntProp(client, Prop_Send, "m_hMyWeapons")) continue;
+            // Inventory contains one entity per grenade type; ammo includes
+            // the second flash, so count the type only once.
+            bool counted[32];
+            for (int index = 0; index < GetEntPropArraySize(client, Prop_Send, "m_hMyWeapons"); index++)
+            {
+                int weapon = GetEntPropEnt(client, Prop_Send, "m_hMyWeapons", index);
+                if (weapon <= MaxClients || !IsValidEntity(weapon)) continue;
+                char classname[32];
+                GetEntityClassname(weapon, classname, sizeof(classname));
+                bool smoke = StrEqual(classname, "weapon_smokegrenade");
+                bool flash = StrEqual(classname, "weapon_flashbang");
+                if (!smoke && !flash && !StrEqual(classname, "weapon_hegrenade")
+                    && !StrEqual(classname, "weapon_molotov") && !StrEqual(classname, "weapon_incgrenade")
+                    && !StrEqual(classname, "weapon_decoy")) continue;
+                int ammo = GetEntProp(weapon, Prop_Send, "m_iPrimaryAmmoType");
+                if (ammo < 0 || ammo >= sizeof(counted) || counted[ammo]) continue;
+                counted[ammo] = true;
+                if (ammo >= GetEntPropArraySize(client, Prop_Send, "m_iAmmo")) continue;
+                int amount = GetEntProp(client, Prop_Send, "m_iAmmo", 4, ammo);
+                if (amount < 1) continue;
+                gear.utility += amount;
+                if (smoke) gear.smokes += amount;
+                if (flash) gear.flashes += amount;
+            }
+        }
+        g_openingGear[team] = gear;
+    }
+}
+
+public void Event_BombBeginDefuse(Event event, const char[] name, bool dontBroadcast)
+{
+    if (!g_roundActive || !g_planted || g_defuseBeginMs >= 0) return;
+    g_defuseBeginMs = RoundElapsedMs();
+    int client = GetClientOfUserId(event.GetInt("userid"));
+    if (client > 0 && IsClientInGame(client)) g_kitAtDefuse = GetEntProp(client, Prop_Send, "m_bHasDefuser") ? 1 : 0;
+}
+
+public void Event_BombDefused(Event event, const char[] name, bool dontBroadcast)
+{
+    if (g_roundActive && g_planted) g_defused = true;
 }
 
 public void Event_PlayerHurt(Event event, const char[] name, bool dontBroadcast)
@@ -271,6 +407,11 @@ public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast
 
 public void Event_BombPlanted(Event event, const char[] name, bool dontBroadcast)
 {
+    if (g_roundActive && !g_planted)
+    {
+        g_planted = true;
+        g_plantMs = RoundElapsedMs();
+    }
     if (!g_roundActive || g_eventCount >= MAX_RECORDED_EVENTS)
         return;
     int planter = GetClientOfUserId(event.GetInt("userid"));
@@ -353,6 +494,11 @@ public any Native_RecordSignal(Handle plugin, int numParams)
     if ((team != CS_TEAM_CT && team != CS_TEAM_T) || kind[0] == '\0'
         || site < -1 || site > 1)
         return 0;
+    if (g_roundActive && g_planted && team == CS_TEAM_CT)
+    {
+        if (StrEqual(kind, "retake_stage") && g_retakeStageMs < 0) g_retakeStageMs = RoundElapsedMs();
+        if (StrEqual(kind, "retake_commit") && g_retakeCommitMs < 0) g_retakeCommitMs = RoundElapsedMs();
+    }
     if (StrEqual(kind, "first_sight"))
     {
         if (g_firstSight[team])
@@ -445,11 +591,68 @@ public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast)
             return;
         }
     }
+    if (g_recordGear && SQL_FastQuery(g_database, "SAVEPOINT opening_telemetry;"))
+    {
+        // A telemetry write failure must not lose the existing match data.
+        bool saved = InsertOpeningTelemetry(roundId);
+        if ((!saved && !SQL_FastQuery(g_database, "ROLLBACK TO opening_telemetry;"))
+            || !SQL_FastQuery(g_database, "RELEASE opening_telemetry;"))
+        {
+            LogDatabaseError("close opening telemetry savepoint");
+            SQL_FastQuery(g_database, "ROLLBACK;");
+            return;
+        }
+    }
+    else if (g_recordGear) LogDatabaseError("begin opening telemetry savepoint");
     if (!SQL_FastQuery(g_database, "COMMIT;"))
     {
         LogDatabaseError("commit round transaction");
         SQL_FastQuery(g_database, "ROLLBACK;");
     }
+}
+
+bool InsertOpeningTelemetry(int roundId)
+{
+    char query[768];
+    if (g_gearCaptured)
+    {
+        for (int team = CS_TEAM_T; team <= CS_TEAM_CT; team++)
+        {
+            OpeningGear gear;
+            gear = g_openingGear[team];
+            char plan[12];
+            if (gear.purchasePlan == 3) strcopy(plan, sizeof(plan), "reset");
+            else if (gear.purchasePlan == 4) strcopy(plan, sizeof(plan), "must_buy");
+            else if (gear.purchasePlan < 0) strcopy(plan, sizeof(plan), "unknown");
+            else GetBuyLabel(gear.purchasePlan, plan, sizeof(plan));
+            Format(query, sizeof(query),
+                "INSERT INTO opening_gear (round_id,team,purchase_plan,players,bots,rifles,snipers,smgs,shotguns,"
+                ... "other_primary,pistols_only,armored,helmets,kits,utility,smokes,flashes) "
+                ... "VALUES (%d,%d,'%s',%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d);",
+                roundId, team, plan, gear.players, gear.bots, gear.rifles, gear.snipers, gear.smgs, gear.shotguns,
+                gear.otherPrimary, gear.pistolsOnly, gear.armored, gear.helmets, gear.kits, gear.utility, gear.smokes, gear.flashes);
+            if (!SQL_FastQuery(g_database, query)) { LogDatabaseError("save opening gear"); return false; }
+        }
+    }
+    if (g_planted)
+    {
+        char stage[16], commit[16], began[16], kit[16];
+        OptionalInteger(g_retakeStageMs, stage, sizeof(stage));
+        OptionalInteger(g_retakeCommitMs, commit, sizeof(commit));
+        OptionalInteger(g_defuseBeginMs, began, sizeof(began));
+        OptionalInteger(g_kitAtDefuse, kit, sizeof(kit));
+        Format(query, sizeof(query),
+            "INSERT INTO retake_outcomes (round_id,plant_ms,stage_ms,commit_ms,defuse_begin_ms,kit_at_defuse,defused) "
+            ... "VALUES (%d,%d,%s,%s,%s,%s,%d);", roundId, g_plantMs, stage, commit, began, kit, g_defused);
+        if (!SQL_FastQuery(g_database, query)) { LogDatabaseError("save retake outcome"); return false; }
+    }
+    return true;
+}
+
+void OptionalInteger(int value, char[] buffer, int length)
+{
+    if (value < 0) strcopy(buffer, length, "NULL");
+    else IntToString(value, buffer, length);
 }
 
 bool InsertSignal(int roundId, int index)

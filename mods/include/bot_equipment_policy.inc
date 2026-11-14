@@ -83,6 +83,8 @@ BotEquipmentTier BotEquipment_ClassifyTeam(int team)
 #if defined BOT_EQUIPMENT_CORE
 BotEquipmentTier g_BotEquipmentRoundPlan[4];
 BotEquipmentTier g_BotEquipmentPreviousPlan[4];
+bool g_BotEquipmentPlanReady;
+int g_BotEquipmentPlanLabel[4];
 int g_BotEquipmentForceChoice[MAXPLAYERS + 1]; // 0: unset, 1: rifle, 2: SMG
 int g_BotEquipmentForceChoiceUserId[MAXPLAYERS + 1];
 bool g_BotEquipmentRoutingBuy[MAXPLAYERS + 1];
@@ -104,7 +106,19 @@ void BotEquipment_BeginRound(bool resetRound, bool forceT, bool forceCT)
             plan = BotEquip_Eco;
         g_BotEquipmentRoundPlan[team] = plan;
         g_BotEquipmentPreviousPlan[team] = plan;
+        // Reset and must-spend are budget overrides, not actual full gear.
+        g_BotEquipmentPlanLabel[team] = resetRound ? 3
+            : ((team == CS_TEAM_T ? forceT : forceCT) ? 4 : view_as<int>(plan));
     }
+    g_BotEquipmentPlanReady = true;
+}
+
+// Read-only telemetry; consumers must not use this as actual loadout.
+public any Native_BotEquipment_GetBuyPlan(Handle plugin, int numParams)
+{
+    int team = GetNativeCell(1);
+    if (!g_BotEquipmentPlanReady || (team != CS_TEAM_CT && team != CS_TEAM_T)) return -1;
+    return g_BotEquipmentPlanLabel[team];
 }
 
 BotEquipmentTier BotEquipment_GetRoundPlan(int team)

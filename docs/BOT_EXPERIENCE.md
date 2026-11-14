@@ -14,12 +14,18 @@
 
 记录在回合内暂存、回合结束时一次事务写入，避免每次交火同步写盘。最多暂存 64 个击杀／下包事件和 96 个诊断节点；超出上限的后续节点不记录，但不影响回合或 BOT 行为。若数据库不可用，记录器写错误日志，BOT 原有行为不受影响。调度器与记录器通过可选 native 解耦，移除或关闭记录器时原有战术保持不变。
 
+`opening_gear` 每回合每阵营一行，在冻结结束时记录已锁定的 BOT 购买计划（`eco`、`force`、`full`；重置局 `reset`、必须花钱局 `must_buy`，旧核心缺少接口时为 `unknown`）。装备数是当时全队存活玩家的实际库存，包含真人和 BOT，并分别保存总人数及 BOT 数。步枪、狙击、冲锋枪、霰弹枪、其他主武器和仅手枪按实际类别统计，不按价格推断；同时统计甲、头盔、钳、道具总数、烟及闪（双闪算两颗）。旧回合不会补造快照。旧列 `rounds.ct_buy/t_buy` 仍是旧战术经济档，不是本表的购买计划。
+
+`retake_outcomes` 每个已下包且正常结束的回合一行，保存下包、首次集合、首次推进、首次开始拆包的回合内毫秒数，首次尝试是否有钳，以及是否收到拆除成功事件。未发生的节点为 `NULL`，不受 `signals` 数量上限影响。首次尝试和实际拆掉的人可能不同。两个新表是增量记录，不改变买枪、战术或旧表。
+
 查询示例（在服务器目录执行）：
 
 ```powershell
 sqlite3 csgo/addons/sourcemod/data/sqlite/bot_tactical_experience.sq3 "SELECT id,map,ct_plan,ct_site,t_plan,t_site,winner FROM rounds ORDER BY id DESC LIMIT 10;"
 sqlite3 csgo/addons/sourcemod/data/sqlite/bot_tactical_experience.sq3 "SELECT round_id,kind,actor_team,victim_team,weapon,site FROM events ORDER BY id DESC LIMIT 20;"
 sqlite3 csgo/addons/sourcemod/data/sqlite/bot_tactical_experience.sq3 "SELECT round_id,elapsed_ms,team,kind,detail,site FROM signals ORDER BY id DESC LIMIT 30;"
+sqlite3 csgo/addons/sourcemod/data/sqlite/bot_tactical_experience.sq3 "SELECT * FROM opening_gear ORDER BY round_id DESC, team LIMIT 10;"
+sqlite3 csgo/addons/sourcemod/data/sqlite/bot_tactical_experience.sq3 "SELECT r.map,g.purchase_plan,g.kits,count(*) rounds,sum(o.defused) defuses,round(avg(o.commit_ms-o.plant_ms)/1000.0,1) avg_commit_seconds FROM retake_outcomes o JOIN rounds r ON r.id=o.round_id JOIN opening_gear g ON g.round_id=r.id AND g.team=3 GROUP BY r.map,g.purchase_plan,g.kits;"
 ```
 
 暂停后续记录：`sm_bot_experience_record_enable 0`。这不会删除已有数据，也不会关闭 CT/T 战术。

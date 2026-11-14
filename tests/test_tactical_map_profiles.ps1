@@ -45,7 +45,7 @@ foreach ($token in @('sm_bot_ct_clear_opening_watch', 'TacticalAngles_RequireCle
     if (!$ct.Contains($token)) { throw "Missing CT scope or fallback: $token" }
 }
 foreach ($token in @('sm_bot_t_map_routes', 'sm_bot_t_sync_carrier_ready', 'CarrierReadyForCommit()',
-    'g_attackContact', 'elapsed >= g_cvSyncStageTimeout.FloatValue', 'MarkNativeAsOptional("NavMesh_BuildPath")',
+    'g_attackContact', 'elapsed >= stageTimeout', 'MarkNativeAsOptional("NavMesh_BuildPath")',
     'if (mainCount == 0)', 'AssignTargets(bots, count, Route_Fastest, bombCarrier, count)')) {
     if (!$t.Contains($token)) { throw "Missing T scope or fallback: $token" }
 }
