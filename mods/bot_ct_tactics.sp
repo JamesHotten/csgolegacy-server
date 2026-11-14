@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.7"
+#define PLUGIN_VERSION "0.1.8"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -31,6 +31,10 @@ native void BotExperience_RecordOpeningPlan(int team, int buy, int plan, int sit
 native void BotExperience_RecordSignal(int team, const char[] kind, const char[] detail, int site, int actor);
 native bool BotStuff_CanSeeLooseC4(int client, int bomb);
 native bool BotStuff_HasVisibleEnemy(int client);
+typedef CTPathCost = function int(int area, int from, int ladder, any maxCost);
+native bool NavMesh_BuildPath(int start, int goal, const float point[3], CTPathCost cost,
+    any maxCost, int &closest, float maxLength, float maxStep);
+native int NavMeshArea_GetCostSoFar(int area);
 
 #include <bot_tactical_angles>
 #include "include/bot_tactical_map_profiles.inc"
@@ -91,6 +95,15 @@ ConVar g_cvRetakeCommit;
 ConVar g_cvRetakeStageTimeout;
 ConVar g_cvRetakeClockAware;
 ConVar g_cvClearSiteDefuse;
+ConVar g_cvRetakeRoles;
+ConVar g_cvPairedPressure;
+ConVar g_cvCoverSpacing;
+int g_pressureUsers[2];
+float g_pressureReturnAt;
+float g_pressureHomes[2][3], g_pressureAims[2][3];
+bool g_pressureHasAim[2];
+int g_defuserUserId;
+float g_defuserHandoffUntil;
 ConVar g_cvSyncMinReady;
 ConVar g_cvGuardCount;
 ConVar g_cvFullPushChance;
@@ -175,6 +188,8 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     MarkNativeAsOptional("NavMeshArea_GetClosestPointOnArea");
     MarkNativeAsOptional("NavMeshArea_GetPlace");
     MarkNativeAsOptional("NavMeshArea_GetPlaceCanonical");
+    MarkNativeAsOptional("NavMesh_BuildPath");
+    MarkNativeAsOptional("NavMeshArea_GetCostSoFar");
     MarkNativeAsOptional("NavMesh_WorldToGridX");
     MarkNativeAsOptional("NavMesh_WorldToGridY");
     MarkNativeAsOptional("NavMesh_GetAreasOnGrid");
@@ -202,6 +217,9 @@ public void OnPluginStart()
     g_cvRetakeStageTimeout = CreateConVar("sm_bot_ct_tactics_retake_stage_timeout", "12.0", "Hard timeout before committing the retake.", _, true, 2.0, true, 20.0);
     g_cvRetakeClockAware = CreateConVar("sm_bot_ct_retake_clock_aware", "1", "Skip CT retake staging with 20 seconds or less left, or for a solo BOT, and reject vertically separated arrivals.", _, true, 0.0, true, 1.0);
     g_cvClearSiteDefuse = CreateConVar("sm_bot_ct_clear_site_defuse", "1", "Yield to native defuse AI when all attackers are eliminated.", _, true, 0.0, true, 1.0);
+    g_cvRetakeRoles = CreateConVar("sm_bot_ct_retake_roles", "1", "Use named approaches and prioritize a reachable defuser on Mirage, Inferno and Nuke.", _, true, 0.0, true, 1.0);
+    g_cvPairedPressure = CreateConVar("sm_bot_ct_pair_pressure_chance", "0", "Mirage: chance to add a short two-BOT probe to a standard setup; 0 disables.", _, true, 0.0, true, 100.0);
+    g_cvCoverSpacing = CreateConVar("sm_bot_ct_cover_spacing", "1", "Avoid overlapping generic opening positions when clear alternate holds are available.", _, true, 0.0, true, 1.0);
     g_cvSyncMinReady = CreateConVar("sm_bot_ct_tactics_sync_min_ready", "50", "Percent of active ordered CT bots required at retake staging goals.", _, true, 20.0, true, 100.0);
     g_cvGuardCount = CreateConVar("sm_bot_ct_tactics_guard_count", "0", "Dropped C4 guards: 0 = all alive CT bots; positive values cap the count.", _, true, 0.0, true, 5.0);
 
@@ -365,7 +383,11 @@ public any Native_GetOrder(Handle plugin, int numParams)
         || g_combatReleased[client] || !IsCTBot(client))
         return false;
     if (g_cvClearSiteDefuse.BoolValue && g_phase == Phase_RetakeCommit && g_retakeUnopposed)
-        return false;
+    {
+        int defuser = GetClientOfUserId(g_defuserUserId);
+        if (!RetakeRolesEnabled() || !IsCTBot(defuser) || client == defuser || GetGameTime() > g_defuserHandoffUntil)
+            return false;
+    }
 
     if (g_orderExpires[client] > 0.0 && GetGameTime() >= g_orderExpires[client])
     {
@@ -629,6 +651,11 @@ public Action Timer_PlanRetake(Handle timer)
 public void Event_BombBeginDefuse(Event event, const char[] name, bool dontBroadcast)
 {
     int client = GetClientOfUserId(event.GetInt("userid"));
+    if (RetakeRolesEnabled() && IsCTBot(client))
+    {
+        g_defuserUserId = GetClientUserId(client);
+        g_defuserHandoffUntil = GetGameTime() + (GetEntProp(client, Prop_Send, "m_bHasDefuser") ? 5.5 : 10.5);
+    }
     ReleaseOrder(client, "defusing");
 }
 
@@ -727,11 +754,14 @@ public Action Timer_Update(Handle timer)
     if (g_cvClearSiteDefuse.BoolValue && g_bombPlanted
         && (g_phase == Phase_RetakeStage || g_phase == Phase_RetakeCommit) && RetakeIsUnopposed())
     {
+        bool firstClear = !g_retakeUnopposed;
         g_retakeUnopposed = true;
         if (g_phase == Phase_RetakeStage) PlanRetake(true);
+        if (firstClear && RetakeRolesEnabled()) SelectDefuser();
         return Plugin_Continue;
     }
     g_retakeUnopposed = false;
+    ReviewPairedPressure();
     ReleaseStalledOrders();
     float elapsed = GetGameTime() - g_phaseStarted;
     if (g_phase == Phase_Initial && elapsed >= g_cvInitialHold.FloatValue)
@@ -795,6 +825,10 @@ void PlanInitialDefense()
     AssignTargets(bots, count, Route_Fastest, -1, true);
     if (infernoProfile) ApplyInfernoOpeningAims(count, infernoAims);
     g_phase = Phase_Initial;
+    g_pressureReturnAt = 0.0;
+    if (g_mapProfile == 2 && g_plan == Plan_Standard && count >= 4
+        && g_cvPairedPressure.IntValue > 0 && GetRandomInt(1, 100) <= g_cvPairedPressure.IntValue)
+        BeginPairedPressure();
     g_phaseStarted = GetGameTime();
     ExperienceSignal("opening_orders", "initial_defense", g_planSite, 0);
     char buy[12], plan[24];
@@ -803,6 +837,103 @@ void PlanInitialDefense()
     DebugLog("Initial CT plan: buy=%s plan=%s bots=%d", buy, plan, count);
     if (GetFeatureStatus(FeatureType_Native, "BotExperience_RecordOpeningPlan") == FeatureStatus_Available)
         BotExperience_RecordOpeningPlan(CS_TEAM_CT, view_as<int>(g_buyState), view_as<int>(g_plan), g_planSite, count);
+}
+
+void BeginPairedPressure()
+{
+    if (!NativeAvailable("NavMesh_BuildPath") || !NativeAvailable("NavMeshArea_GetCostSoFar")) return;
+    int pair[2];
+    for (int i = 1; i <= MaxClients && pair[1] == 0; i++)
+    {
+        if (!IsCTBot(i) || !g_hasOrder[i] || !g_hasLook[i] || NearestSite(g_orderGoal[i]) != 0) continue;
+        if (!pair[0]) pair[0] = i;
+        else pair[1] = i;
+    }
+    if (!pair[1]) return;
+    float goals[2][3], pressureLook[2][3];
+    for (int slot = 0; slot < 2; slot++)
+    {
+        int client = pair[slot];
+        float direction[3], desired[3];
+        MakeVectorFromPoints(g_orderGoal[client], g_orderLook[client], direction);
+        direction[2] = 0.0;
+        NormalizeVector(direction, direction);
+        ScaleVector(direction, slot == 0 ? 190.0 : 120.0);
+        AddVectors(g_orderGoal[client], direction, desired);
+        int from = NavMesh_GetNearestArea(g_orderGoal[client], false, 120.0, false, true, TEAM_ANY);
+        if (from < 0) return;
+        ArrayStack areas = new ArrayStack();
+        NavMesh_CollectSurroundingAreas(areas, from, 460.0, 18.0, 32.0);
+        float best = 999999.0;
+        while (!areas.Empty)
+        {
+            int to = areas.Pop();
+            float point[3], toward[3], look[3], eye[3], other[3], fraction;
+            if (to == from || !NavMeshArea_GetCenter(to, point) || NearestSite(point) != 0
+                || FloatAbs(point[2] - g_orderGoal[client][2]) > 36.0) continue;
+            MakeVectorFromPoints(g_orderGoal[client], point, toward);
+            float move = GetVectorLength(toward), score = GetVectorDistance(point, desired);
+            if (move < 65.0 || move > 380.0 || score >= best || GetVectorDotProduct(toward, direction) < 45.0) continue;
+            CopyVector(g_orderLook[client], look);
+            if (!TacticalAngles_RequireClearWatch(point, look)) continue;
+            if (slot == 1)
+            {
+                float spacing = GetVectorDistance(point, goals[0]);
+                if (spacing < 115.0 || spacing > 625.0) continue;
+                CopyVector(point, eye);
+                CopyVector(goals[0], other);
+                eye[2] += 60.0;
+                other[2] += 60.0;
+                if (!TacticalAngles_IsVisible(eye, other, 0, fraction)) continue;
+            }
+            int closest;
+            if (!NavMesh_BuildPath(to, from, g_orderGoal[client], RetakeTravelCost, 500, closest, 0.0, 0.0)) continue;
+            best = score;
+            CopyVector(point, goals[slot]);
+            CopyVector(look, pressureLook[slot]);
+        }
+        delete areas;
+        if (best >= 999999.0) return;
+    }
+    for (int slot = 0; slot < 2; slot++)
+    {
+        int client = pair[slot];
+        g_pressureUsers[slot] = GetClientUserId(client);
+        CopyVector(g_orderGoal[client], g_pressureHomes[slot]);
+        CopyVector(g_orderLook[client], g_pressureAims[slot]);
+        g_pressureHasAim[slot] = g_hasLook[client];
+        CopyVector(goals[slot], g_orderGoal[client]);
+        CopyVector(pressureLook[slot], g_orderLook[client]);
+        g_hasLook[client] = true;
+        StartOrderProgress(client);
+    }
+    g_pressureReturnAt = GetGameTime() + 8.0;
+    ExperienceSignal("opening_pair_pressure", "mirage_a", 0, pair[0]);
+    DebugLog("CT paired pressure: %N and %N", pair[0], pair[1]);
+}
+
+void ReviewPairedPressure()
+{
+    if (g_pressureReturnAt <= 0.0) return;
+    if (g_phase != Phase_Initial || g_bombPlanted) { g_pressureReturnAt = 0.0; return; }
+    bool abort = g_cvPairedPressure.IntValue == 0 || GetGameTime() >= g_pressureReturnAt;
+    for (int slot = 0; slot < 2 && !abort; slot++)
+    {
+        int client = GetClientOfUserId(g_pressureUsers[slot]);
+        if (!IsCTBot(client) || !g_hasOrder[client] || g_combatReleased[client]) abort = true;
+    }
+    if (!abort) return;
+    g_pressureReturnAt = 0.0;
+    for (int slot = 0; slot < 2; slot++)
+    {
+        int client = GetClientOfUserId(g_pressureUsers[slot]);
+        if (!IsCTBot(client) || !g_hasOrder[client] || g_combatReleased[client]) continue;
+        CopyVector(g_pressureHomes[slot], g_orderGoal[client]);
+        CopyVector(g_pressureAims[slot], g_orderLook[client]);
+        g_hasLook[client] = g_pressureHasAim[slot];
+        StartOrderProgress(client);
+    }
+    DebugLog("CT paired pressure returned to original coverage.");
 }
 
 bool TryBuildInfernoOpening(int count, float aims[5][3])
@@ -1230,7 +1361,10 @@ void PlanRetake(bool commit)
     if (commit)
         BuildAround(g_bombPosition, count, 40.0, 260.0, false, 0.0, 0.0);
     else
-        BuildAround(g_bombPosition, count, 350.0, 900.0, false, 0.0, 0.0);
+    {
+        if (RetakeRolesEnabled()) AppendRetakeEntrances(count);
+        BuildAround(g_bombPosition, count - g_targetCount, 350.0, 900.0, false, 0.0, 0.0);
+    }
 
     FillMissingTargetsAt(count, g_bombPosition);
     AssignTargets(bots, count, commit ? Route_Fastest : Route_Safest);
@@ -1238,6 +1372,126 @@ void PlanRetake(bool commit)
     g_phaseStarted = GetGameTime();
     ExperienceSignal(commit ? "retake_commit" : "retake_stage", "bomb_planted", NearestSite(g_bombPosition), 0);
     DebugLog(commit ? "CT retake committed to the bomb." : "CT retake staging on distinct approaches.");
+}
+
+bool RetakeRolesEnabled()
+{
+    // Inferno, Mirage and Nuke in the shared profile order.
+    return g_cvRetakeRoles.BoolValue && (g_mapProfile == 0 || g_mapProfile == 2 || g_mapProfile == 3)
+        && NativeAvailable("NavMesh_BuildPath") && NativeAvailable("NavMeshArea_GetCostSoFar")
+        && NativeAvailable("NavMeshArea_GetPlaceCanonical");
+}
+
+int RetakeSite()
+{
+    return GetVectorDistance(g_bombPosition, g_siteA) <= GetVectorDistance(g_bombPosition, g_siteB) ? 0 : 1;
+}
+
+void AppendRetakeEntrances(int count)
+{
+    int site = RetakeSite();
+    int bombArea = NavMesh_GetNearestArea(g_bombPosition, false, 180.0, false, true, TEAM_ANY);
+    if (bombArea < 0) return;
+    char lanes[3][32];
+    if (g_mapProfile == 2)
+    {
+        strcopy(lanes[0], sizeof(lanes[]), site == 0 ? "TicketBooth" : "Shop");
+        strcopy(lanes[1], sizeof(lanes[]), site == 0 ? "Jungle" : "Catwalk");
+        strcopy(lanes[2], sizeof(lanes[]), site == 0 ? "Connector" : "Truck");
+    }
+    else if (g_mapProfile == 3)
+    {
+        strcopy(lanes[0], sizeof(lanes[]), site == 0 ? "Mini" : "Ramp");
+        strcopy(lanes[1], sizeof(lanes[]), site == 0 ? "Heaven" : "Decon");
+        strcopy(lanes[2], sizeof(lanes[]), site == 0 ? "Hut" : "Secret");
+    }
+    else
+    {
+        strcopy(lanes[0], sizeof(lanes[]), site == 0 ? "Library" : "Ruins");
+        strcopy(lanes[1], sizeof(lanes[]), site == 0 ? "Arch" : "Banana");
+        strcopy(lanes[2], sizeof(lanes[]), site == 0 ? "Pit" : "CTSpawn");
+    }
+    ArrayStack areas = new ArrayStack();
+    if (NativeAvailable("NavMesh_WorldToGridX") && NativeAvailable("NavMesh_WorldToGridY") && NativeAvailable("NavMesh_GetAreasOnGrid"))
+    {
+        // Some ramps/vents are directed edges. Search the local grid, then
+        // prove entrance -> site, rather than requiring site -> entrance.
+        for (int x = NavMesh_WorldToGridX(g_bombPosition[0] - 1200.0); x <= NavMesh_WorldToGridX(g_bombPosition[0] + 1200.0); x++)
+            for (int y = NavMesh_WorldToGridY(g_bombPosition[1] - 1200.0); y <= NavMesh_WorldToGridY(g_bombPosition[1] + 1200.0); y++)
+                NavMesh_GetAreasOnGrid(areas, x, y);
+    }
+    else
+        NavMesh_CollectSurroundingAreas(areas, bombArea, 1850.0, 22.0, 100.0);
+    StringMap seen = new StringMap();
+    float goals[3][3], scores[3] = {999999.0, 999999.0, 999999.0};
+    while (!areas.Empty)
+    {
+        int area = areas.Pop();
+        char key[16];
+        IntToString(area, key, sizeof(key));
+        if (!seen.SetValue(key, 1, false)) continue;
+        float point[3];
+        if (!NavMeshArea_GetCenter(area, point)) continue;
+        float distance = GetVectorDistance(point, g_bombPosition);
+        if (distance < 190.0 || distance > 1200.0) continue;
+        char place[32];
+        NavMeshArea_GetPlaceCanonical(area, place, sizeof(place));
+        for (int lane = 0; lane < 3; lane++)
+        {
+            float score = FloatAbs(distance - 510.0);
+            if (score >= scores[lane] || !StrEqual(place, lanes[lane], false)) continue;
+            int closest;
+            if (!NavMesh_BuildPath(area, bombArea, g_bombPosition, RetakeTravelCost, 2200, closest, 0.0, 0.0)) continue;
+            scores[lane] = score;
+            CopyVector(point, goals[lane]);
+        }
+    }
+    delete areas;
+    delete seen;
+    for (int lane = 0; lane < 3 && g_targetCount < count; lane++)
+        if (scores[lane] < 999999.0)
+        {
+            AppendTarget(goals[lane]);
+            DebugLog("CT retake lane %s site=%d", lanes[lane], site);
+        }
+}
+
+public int RetakeTravelCost(int area, int from, int ladder, any maxCost)
+{
+    if (from < 0) return 0;
+    float a[3], b[3];
+    if (!NavMeshArea_GetCenter(from, a) || !NavMeshArea_GetCenter(area, b)) return -1;
+    int cost = NavMeshArea_GetCostSoFar(from) + RoundToCeil(GetVectorDistance(a, b));
+    return cost <= maxCost ? cost : -1;
+}
+
+void SelectDefuser()
+{
+    // Leave native arbitration untouched if a human CT is present.
+    for (int i = 1; i <= MaxClients; i++)
+        if (IsClientInGame(i) && !IsFakeClient(i) && IsPlayerAlive(i) && GetClientTeam(i) == CS_TEAM_CT) return;
+    int bomb = EntRefToEntIndex(g_retakeBombRef);
+    int goal = NavMesh_GetNearestArea(g_bombPosition, false, 180.0, false, true, TEAM_ANY);
+    if (bomb == INVALID_ENT_REFERENCE || goal < 0) return;
+    float now = GetGameTime(), left = GetEntPropFloat(bomb, Prop_Send, "m_flC4Blow") - now;
+    float best = left;
+    int chosen;
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!IsCTBot(client)) continue;
+        float position[3];
+        GetClientAbsOrigin(client, position);
+        int start = NavMesh_GetNearestArea(position, false, 160.0, false, true, TEAM_ANY);
+        int closest;
+        if (start < 0 || !NavMesh_BuildPath(start, goal, g_bombPosition, RetakeTravelCost, 6500, closest, 0.0, 0.0)) continue;
+        float distance = start == goal ? GetVectorDistance(position, g_bombPosition) : float(NavMeshArea_GetCostSoFar(goal));
+        float eta = distance / 200.0 + (GetEntProp(client, Prop_Send, "m_bHasDefuser") ? 5.0 : 10.0) + 1.5;
+        if (eta < best) { best = eta; chosen = client; }
+    }
+    if (chosen == 0) return;
+    g_defuserUserId = GetClientUserId(chosen);
+    g_defuserHandoffUntil = now + (best + 2.0 < 8.0 ? best + 2.0 : 8.0);
+    DebugLog("CT retake lead %N estimated finish %.1f s", chosen, best);
 }
 
 void BuildAround(const float origin[3], int wanted, float minRadius, float maxRadius, bool directional, float dirX, float dirY)
@@ -1473,6 +1727,76 @@ void AssignTargets(const int bots[MAXPLAYERS + 1], int botCount, RouteType route
             StartOrderProgress(client);
             DebugLog("Assigned %N to %.0f %.0f %.0f", client, g_orderGoal[client][0], g_orderGoal[client][1], g_orderGoal[client][2]);
         }
+    }
+    if (siteLocalWatch && g_plan == Plan_Standard && g_cvCoverSpacing.BoolValue && (g_mapProfile == 2 || g_mapProfile == 3))
+        SeparateOpeningCoverage();
+}
+
+void SeparateOpeningCoverage()
+{
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!g_hasOrder[client] || !g_hasLook[client] || !IsCTBot(client)) continue;
+        int neighbor, duplicate;
+        int site = NearestSite(g_orderGoal[client]);
+        for (int peer = 1; peer < client; peer++)
+        {
+            if (!g_hasOrder[peer] || !IsCTBot(peer)) continue;
+            if (GetVectorDistance(g_orderGoal[client], g_orderGoal[peer]) < 105.0) neighbor = peer;
+            if (g_hasLook[peer] && NearestSite(g_orderGoal[peer]) == site
+                && GetVectorDistance(g_orderLook[client], g_orderLook[peer]) < 250.0) duplicate = peer;
+        }
+        if (duplicate && g_mapProfile >= 0 && g_cvEntranceWatch.BoolValue)
+        {
+            for (int sector = 1; sector < 3; sector++)
+            {
+                int used = 0x7 & ~(1 << sector);
+                char entrance[32];
+                float look[3];
+                if (!CTEntrance_SelectLook(client, g_mapProfile, g_orderGoal[client], site, used, look, entrance, sizeof(entrance))
+                    || !TacticalAngles_RequireClearWatch(g_orderGoal[client], look)
+                    || GetVectorDistance(look, g_orderLook[duplicate]) < 250.0) continue;
+                CopyVector(look, g_orderLook[client]);
+                DebugLog("CT alternate opening angle for %N: %s", client, entrance);
+                break;
+            }
+        }
+        if (!neighbor) continue;
+        int start = NavMesh_GetNearestArea(g_orderGoal[client], false, 110.0, false, true, TEAM_ANY);
+        if (start < 0) continue;
+        ArrayStack list = new ArrayStack();
+        NavMesh_CollectSurroundingAreas(list, start, 210.0, 18.0, 32.0);
+        float best = 999999.0, chosen[3], chosenLook[3];
+        while (!list.Empty)
+        {
+            float candidate[3], look[3];
+            if (!NavMeshArea_GetCenter(list.Pop(), candidate) || NearestSite(candidate) != NearestSite(g_orderGoal[client])) continue;
+            float move = GetVectorDistance(candidate, g_orderGoal[client]);
+            if (move < 48.0 || move > 185.0 || move >= best || FloatAbs(candidate[2] - g_orderGoal[client][2]) > 26.0) continue;
+            bool spaced = true;
+            for (int peer = 1; peer <= MaxClients; peer++)
+                if (peer != client && g_hasOrder[peer] && GetVectorDistance(candidate, g_orderGoal[peer]) < 105.0)
+                { spaced = false; break; }
+            if (!spaced) continue;
+            CopyVector(g_orderLook[client], look);
+            if (!TacticalAngles_RequireClearWatch(candidate, look)) continue;
+            float foot[3], mins[3] = {-16.0, -16.0, 0.0}, maxs[3] = {16.0, 16.0, 72.0};
+            CopyVector(candidate, foot);
+            foot[2] += 3.0;
+            Handle hull = TR_TraceHullFilterEx(foot, foot, mins, maxs, MASK_PLAYERSOLID, TacticalAngles_TraceFilter, client);
+            bool clear = !TR_DidHit(hull) && !TR_StartSolid(hull);
+            delete hull;
+            if (!clear) continue;
+            best = move;
+            CopyVector(candidate, chosen);
+            CopyVector(look, chosenLook);
+        }
+        delete list;
+        if (best >= 999999.0) continue;
+        CopyVector(chosen, g_orderGoal[client]);
+        CopyVector(chosenLook, g_orderLook[client]);
+        StartOrderProgress(client);
+        DebugLog("CT overlapping coverage separated for %N", client);
     }
 }
 
@@ -1907,6 +2231,9 @@ void ResetDirector()
     g_retakeContact = false;
     g_retakeUnopposed = false;
     g_retakeBombRef = INVALID_ENT_REFERENCE;
+    g_defuserUserId = 0;
+    g_defuserHandoffUntil = 0.0;
+    g_pressureReturnAt = 0.0;
 }
 
 void FillMissingTargets(int wanted)

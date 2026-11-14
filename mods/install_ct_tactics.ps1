@@ -1761,6 +1761,70 @@ if (-not $text.Contains('BEGIN T_SAFE_PLANT_APPROACH')) {
     $text = Replace-Once $text $old $approach 'T carrier approach cutoff'
 }
 
+if (-not $text.Contains('BEGIN T_ROUTE_DRIVE_REPORT')) {
+    $old = 'native bool BotTTactics_IsPlantApproach(int client);'
+    $text = Replace-Once $text $old ($old + $newline + 'native void BotTTactics_ReportRouteDrive(int client, bool driving);') 'T route-drive native'
+    $old = 'MarkNativeAsOptional("BotTTactics_IsPlantApproach");'
+    $text = Replace-Once $text $old ($old + $newline + '    MarkNativeAsOptional("BotTTactics_ReportRouteDrive");') 'T route-drive optional native'
+    $old = '// END TACTICAL_NADE_PRIORITY'
+    $report = @(
+        $old,
+        '    // BEGIN T_ROUTE_DRIVE_REPORT',
+        '    if (bShouldHoldTAttackStage && GetFeatureStatus(FeatureType_Native, "BotTTactics_ReportRouteDrive") == FeatureStatus_Available)',
+        '        BotTTactics_ReportRouteDrive(iClient, bHasTacticalOrder && !bEnemyVisible && !g_bThrowGrenade[iClient]',
+        '            && g_iDoingSmokeNum[iClient] == -1 && !BotMimic_IsPlayerMimicing(iClient)',
+        '            && (GetEntityFlags(iClient) & FL_ONGROUND) != 0 && GetEntityMoveType(iClient) != MOVETYPE_LADDER);',
+        '    // END T_ROUTE_DRIVE_REPORT'
+    ) -join $newline
+    $text = Replace-Once $text $old $report 'report opening T movement suspension'
+}
+
+$mirageUtilitySource = Join-Path $PSScriptRoot 'include\bot_mirage_utility.inc'
+if (-not $text.Contains('#include <bot_mirage_utility>')) {
+    $old = 'native void BotTTactics_ReportRouteDrive(int client, bool driving);'
+    $text = Replace-Once $text $old ($old + $newline + 'native int BotTTactics_GetUtilityLane(int client);') 'Mirage utility lane native'
+    $old = 'MarkNativeAsOptional("BotTTactics_ReportRouteDrive");'
+    $text = Replace-Once $text $old ($old + $newline + '    MarkNativeAsOptional("BotTTactics_GetUtilityLane");') 'Mirage utility optional native'
+    $old = 'public void OnMapStart()'
+    $text = Replace-Once $text $old ('#include <bot_mirage_utility>' + $newline + $old) 'Mirage utility module'
+    $old = 'BotTeams_OnMapStart();'
+    $text = Replace-Once $text $old ($old + $newline + '    MirageUtility_OnMapStart();') 'Mirage map scope'
+    $round = [regex]::Match($text, '(?m)^public void OnRoundStart\([^\r\n]*\)\r?\n\{').Value
+    if (!$round) { throw 'BetterBots round handler missing for Mirage utility.' }
+    $text = Replace-Once $text $round ($round + $newline + '    MirageUtility_Reset();') 'round-local utility assignment'
+    $old = '// BEGIN TACTICAL_NADE_PRIORITY'
+    $text = Replace-Once $text $old ('bool bBeforeMirageUtilityOrder = bHasTacticalOrder;' + $newline + '    ' + $old) 'save tactical movement before utility arbitration'
+    $old = '// END TACTICAL_NADE_PRIORITY'
+    $patch = @(
+        $old,
+        '    if (MirageUtility_Tick(iClient, bEnemyVisible, fNow, bBeforeMirageUtilityOrder))',
+        '        bHasTacticalOrder = false;',
+        '    else if (MirageUtility_Enabled() && bBeforeMirageUtilityOrder && g_iDoingSmokeNum[iClient] == -1 && !BotMimic_IsPlayerMimicing(iClient))',
+        '        bHasTacticalOrder = true;'
+    ) -join $newline
+    $text = Replace-Once $text $old $patch 'Mirage utility timeout and tactical return'
+    $old = 'g_aNades.GetArray(i, sNade);'
+    $selector = [regex]::Match($text, '(?s)public int GetNearestGrenade\(int iClient\).*?(?=\r?\n\})').Value
+    if (!$selector.Contains($old)) { throw 'BetterBots lineup selector missing.' }
+    $filtered = $selector.Replace($old, ($old + $newline + '        if (!MirageUtility_Eligible(iClient, sNade.szReplay)) continue;'))
+    $text = Replace-Once $text $selector $filtered 'match recordings to the assigned Mirage lane'
+}
+
+if (-not $text.Contains('BEGIN T_PLANT_DRIVE_REPORT')) {
+    $old = 'if (bShouldHoldTAttackStage && GetFeatureStatus(FeatureType_Native, "BotTTactics_ReportRouteDrive") == FeatureStatus_Available)'
+    $patch = @(
+        '// BEGIN T_PLANT_DRIVE_REPORT',
+        '    bool bManagedPlantApproach = GetClientTeam(iClient) == CS_TEAM_T && bBeforeMirageUtilityOrder',
+        '        && GetFeatureStatus(FeatureType_Native, "BotTTactics_IsPlantApproach") == FeatureStatus_Available',
+        '        && BotTTactics_IsPlantApproach(iClient);',
+        '    if (bManagedPlantApproach && g_iDoingSmokeNum[iClient] == -1 && !BotMimic_IsPlayerMimicing(iClient))',
+        '        bHasTacticalOrder = true;',
+        '    // END T_PLANT_DRIVE_REPORT',
+        '    if ((bShouldHoldTAttackStage || bManagedPlantApproach) && GetFeatureStatus(FeatureType_Native, "BotTTactics_ReportRouteDrive") == FeatureStatus_Available)'
+    ) -join $newline
+    $text = Replace-Once $text $old $patch 'report verified C4 approach drive'
+}
+
 $candidateExperiencePlugin = Join-Path $buildDir "000_bot_tactical_experience.smx"
 
 try {
@@ -1777,6 +1841,7 @@ try {
     Copy-Item -LiteralPath $entranceWatchSource -Destination (Join-Path $includeDir "bot_ct_entrance_watch.inc") -Force
     Copy-Item -LiteralPath $infernoWatchSource -Destination (Join-Path $includeDir "bot_ct_inferno_watch.inc") -Force
     Copy-Item -LiteralPath $mapProfilesSource -Destination (Join-Path $includeDir "bot_tactical_map_profiles.inc") -Force
+    Copy-Item -LiteralPath $mirageUtilitySource -Destination (Join-Path $includeDir "bot_mirage_utility.inc") -Force
 
     & $compiler "-o$candidateDirectorPlugin" $directorSource
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateDirectorPlugin)) {

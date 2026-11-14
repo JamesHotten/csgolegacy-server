@@ -11,12 +11,22 @@ native bool BotCTTactics_GetOrder(int client, float goal[3], int &route);
 #include "../mods/include/bot_tactical_map_profiles.inc"
 
 public Plugin myinfo = {name = "Plant and retake route probe (isolated only)", version = "1.0"};
-ConVar g_enabled, g_targetB, g_surveyOnly, g_surveyAll, g_split, g_routeSeries;
+ConVar g_enabled, g_targetB, g_surveyOnly, g_surveyAll, g_split, g_routeSeries, g_kit, g_stageOnly;
+ConVar g_clearDelay, g_alternateSites, g_stallProbe, g_utilityProbe, g_comboProbe, g_plantStallProbe;
 bool g_armed, g_live, g_planted, g_completed;
+bool g_stageSeenLive, g_stageSummarized;
+float g_stageLastSample;
+int g_stageReady, g_stageOrdered;
+bool g_carrierStageReady;
+float g_stageLastPosition[MAXPLAYERS + 1][3], g_stageGoal[MAXPLAYERS + 1][3];
+bool g_stageHasGoal[MAXPLAYERS + 1];
 int g_carrier, g_ct;
 float g_start, g_plantedAt;
 float g_siteA[3], g_siteB[3];
 int g_stageSeen, g_commitSeen;
+int g_stallChanges, g_stallPeerChanges;
+float g_stallStarted;
+float g_stallOriginal[MAXPLAYERS + 1][3];
 
 public void OnPluginStart()
 {
@@ -26,11 +36,22 @@ public void OnPluginStart()
     g_surveyAll = CreateConVar("sm_plant_route_probe_survey_all", "0", "Survey A and B across the ten map profiles.");
     g_split = CreateConVar("sm_plant_route_probe_split", "1", "Exercise the split selector in live cases.");
     g_routeSeries = CreateConVar("sm_plant_route_probe_series", "0", "Run Inferno B, Mirage A and Nuke B, automatically.");
+    g_kit = CreateConVar("sm_plant_route_probe_kit", "1", "Give test CTs a defuse kit.");
+    g_stageOnly = CreateConVar("sm_plant_route_probe_stage_only", "0", "Measure staging only, before testing actual retakes.");
+    g_clearDelay = CreateConVar("sm_plant_route_probe_clear_delay", "0.0", "Delay clearing frozen test opponents after plant.", _, true, 0.0, true, 10.0);
+    g_alternateSites = CreateConVar("sm_plant_route_probe_alternate_sites", "0", "Test Mirage B and Nuke A instead of Mirage A and Nuke B.");
+    g_stallProbe = CreateConVar("sm_plant_route_probe_stall", "0", "Freeze the advancing carrier and check one local retry (test only).");
+    g_utilityProbe = CreateConVar("sm_plant_route_probe_utility", "0", "Give the test bots smoke and flash for actual opening throws.");
+    g_comboProbe = CreateConVar("sm_plant_route_probe_combos", "0", "Exercise optional CT/T opening variants on Mirage.");
+    g_plantStallProbe = CreateConVar("sm_plant_route_probe_plant_stall", "0", "Freeze only the carrier immediately after attack commit and verify native handoff.");
     HookEvent("round_freeze_end", FreezeEnd, EventHookMode_PostNoCopy);
     HookEvent("bomb_beginplant", ObjectiveEvent, EventHookMode_Post);
     HookEvent("bomb_planted", ObjectiveEvent, EventHookMode_Post);
     HookEvent("bomb_begindefuse", ObjectiveEvent, EventHookMode_Post);
     HookEvent("bomb_defused", ObjectiveEvent, EventHookMode_Post);
+    HookEvent("round_end", RoundResult, EventHookMode_Post);
+    HookEvent("smokegrenade_detonate", UtilityDetonated, EventHookMode_Post);
+    HookEvent("flashbang_detonate", UtilityDetonated, EventHookMode_Post);
 }
 
 public void OnMapStart()
@@ -43,6 +64,8 @@ public void OnMapStart()
         char map[64];
         GetCurrentMap(map, sizeof(map));
         g_targetB.BoolValue = !StrEqual(map, "de_mirage");
+        if (g_alternateSites.BoolValue && (StrEqual(map, "de_mirage") || StrEqual(map, "de_nuke")))
+            g_targetB.BoolValue = !g_targetB.BoolValue;
     }
     CreateTimer(8.0, Prepare, _, TIMER_FLAG_NO_MAPCHANGE);
 }
@@ -86,7 +109,12 @@ public void Begin(any unused)
         if (!IsClientInGame(i) || !IsPlayerAlive(i)) continue;
         if (GetClientTeam(i) == CS_TEAM_T && GetPlayerWeaponSlot(i, CS_SLOT_C4) > MaxClients) g_carrier = i;
         if (GetClientTeam(i) == CS_TEAM_CT && g_ct == 0) g_ct = i;
-        if (GetClientTeam(i) == CS_TEAM_CT) SetEntityMoveType(i, MOVETYPE_NONE);
+        if (GetClientTeam(i) == CS_TEAM_CT && !g_comboProbe.BoolValue) SetEntityMoveType(i, MOVETYPE_NONE);
+        if (g_utilityProbe.BoolValue && GetClientTeam(i) == CS_TEAM_T)
+        {
+            GivePlayerItem(i, "weapon_smokegrenade");
+            GivePlayerItem(i, "weapon_flashbang");
+        }
     }
     if (g_carrier == 0 || g_ct == 0) SetFailState("Missing C4 carrier or CT");
     if (g_surveyOnly.BoolValue) FindConVar("sm_bot_t_tactics_sync_enable").BoolValue = false;
@@ -97,6 +125,12 @@ public void Begin(any unused)
     }
     FindConVar("sm_bot_ct_tactics_debug").BoolValue = true;
     FindConVar("sm_bot_t_tactics_debug").BoolValue = true;
+    if (g_comboProbe.BoolValue)
+    {
+        ServerCommand("sm_bot_t_eco_rush_chance 0; sm_bot_t_force_rush_chance 0; sm_bot_t_full_rush_chance 0; sm_bot_t_eco_split_chance 0; sm_bot_t_force_split_chance 0; sm_bot_t_full_split_chance 0");
+        ServerCommand("sm_ct_tactics_replan");
+        ServerExecute();
+    }
     bool found;
     float goal[3];
     int route;
@@ -113,6 +147,10 @@ public void Begin(any unused)
     g_live = true;
     g_start = GetGameTime();
     g_stageSeen = g_commitSeen = 0;
+    g_stageSeenLive = g_stageSummarized = g_carrierStageReady = false;
+    g_stageLastSample = 0.0;
+    g_stageReady = g_stageOrdered = 0;
+    for (int i = 1; i <= MaxClients; i++) g_stageHasGoal[i] = false;
     if (g_surveyOnly.BoolValue)
     {
         PrintToServer("PLANT_GOAL %.1f %.1f %.1f", goal[0], goal[1], goal[2]);
@@ -121,7 +159,133 @@ public void Begin(any unused)
         SetEntityMoveType(g_carrier, MOVETYPE_NONE);
         CreateTimer(0.35, Survey, _, TIMER_FLAG_NO_MAPCHANGE);
     }
-    else CreateTimer(2.0, Observe, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+    else
+    {
+        if (g_stallProbe.BoolValue)
+        {
+            CreateTimer(0.2, StartStallProbe, _, TIMER_FLAG_NO_MAPCHANGE);
+            return;
+        }
+        CreateTimer(0.2, ObserveStage, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+        if (!g_stageOnly.BoolValue) CreateTimer(2.0, Observe, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+    }
+}
+
+public void UtilityDetonated(Event event, const char[] name, bool dontBroadcast)
+{
+    if (Safe() && g_live && g_utilityProbe.BoolValue)
+        PrintToServer("MIRAGE_UTILITY actual=%s bot=%d xyz=%.0f %.0f %.0f", name, GetClientOfUserId(event.GetInt("userid")),
+            event.GetFloat("x"), event.GetFloat("y"), event.GetFloat("z"));
+}
+
+public Action StartStallProbe(Handle timer)
+{
+    if (!Safe() || !g_live) return Plugin_Stop;
+    g_stallStarted = GetGameTime();
+    g_stallChanges = g_stallPeerChanges = 0;
+    int route;
+    for (int i = 1; i <= MaxClients; i++)
+        if (BotTTactics_ShouldHoldStage(i)) BotTTactics_GetOrder(i, g_stallOriginal[i], route);
+    SetEntityMoveType(g_carrier, MOVETYPE_NONE);
+    CreateTimer(0.2, PollStallProbe, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+    return Plugin_Stop;
+}
+
+public Action PollStallProbe(Handle timer)
+{
+    if (!Safe() || !g_live) return Plugin_Stop;
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        float goal[3];
+        int route;
+        if (!BotTTactics_ShouldHoldStage(i) || !BotTTactics_GetOrder(i, goal, route)) continue;
+        if (GetVectorDistance(g_stallOriginal[i], goal) < 55.0) continue;
+        g_stallOriginal[i] = goal;
+        if (i == g_carrier) g_stallChanges++;
+        else g_stallPeerChanges++;
+    }
+    if (GetGameTime() - g_stallStarted < 8.5) return Plugin_Continue;
+    SetEntityMoveType(g_carrier, MOVETYPE_WALK);
+    char map[64];
+    GetCurrentMap(map, sizeof(map));
+    PrintToServer("ROUTE_STALL_%s map=%s retries=%d peer_changes=%d", g_stallChanges == 1 && g_stallPeerChanges == 0 ? "PASS" : "FAIL",
+        map, g_stallChanges, g_stallPeerChanges);
+    NextRouteCase();
+    return Plugin_Stop;
+}
+
+public Action ObserveStage(Handle timer)
+{
+    if (!Safe() || !g_live || g_completed || g_planted) return Plugin_Stop;
+    bool stage;
+    int ready, ordered;
+    bool carrierReady;
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (!BotTTactics_ShouldHoldStage(i)) continue;
+        stage = true;
+        float pos[3], goal[3];
+        int route;
+        if (!BotTTactics_GetOrder(i, goal, route)) continue;
+        ordered++;
+        GetClientAbsOrigin(i, pos);
+        g_stageLastPosition[i] = pos;
+        g_stageGoal[i] = goal;
+        g_stageHasGoal[i] = true;
+        if (GetVectorDistance(pos, goal) <= 180.0)
+        {
+            ready++;
+            if (i == g_carrier) carrierReady = true;
+        }
+        if (!g_stageSeenLive)
+            PrintToServer("STAGE_GOAL bot=%d carrier=%d xyz=%.0f %.0f %.0f", i, i == g_carrier, goal[0], goal[1], goal[2]);
+    }
+    float elapsed = GetGameTime() - g_start;
+    if (stage)
+    {
+        g_stageSeenLive = true;
+        g_stageLastSample = elapsed;
+        g_stageReady = ready;
+        g_stageOrdered = ordered;
+        g_carrierStageReady = carrierReady;
+        return Plugin_Continue;
+    }
+    if (!g_stageSeenLive && elapsed < 2.0) return Plugin_Continue;
+    if (!g_stageSummarized)
+    {
+        g_stageSummarized = true;
+        char map[64];
+        GetCurrentMap(map, sizeof(map));
+        PrintToServer("STAGE_RESULT map=%s site=%s elapsed=%.2f ready=%d/%d carrier_ready=%d", map,
+            g_targetB.BoolValue ? "B" : "A", g_stageLastSample, g_stageReady, g_stageOrdered, g_carrierStageReady);
+        for (int i = 1; i <= MaxClients; i++)
+            if (g_stageHasGoal[i])
+                PrintToServer("STAGE_FINAL bot=%d carrier=%d pos=%.0f %.0f %.0f distance=%.0f", i, i == g_carrier,
+                    g_stageLastPosition[i][0], g_stageLastPosition[i][1], g_stageLastPosition[i][2],
+                    GetVectorDistance(g_stageLastPosition[i], g_stageGoal[i]));
+    }
+    if (g_stageOnly.BoolValue) NextRouteCase();
+    else if (g_plantStallProbe.BoolValue && g_stageSeenLive && !g_planted)
+    {
+        float goal[3];
+        int route;
+        if (!BotTTactics_GetOrder(g_carrier, goal, route)) SetFailState("Missing carrier approach order before forced stall");
+        SetEntityMoveType(g_carrier, MOVETYPE_NONE);
+        CreateTimer(7.0, CheckPlantHandoff, GetClientUserId(g_carrier), TIMER_FLAG_NO_MAPCHANGE);
+    }
+    return Plugin_Stop;
+}
+
+public Action CheckPlantHandoff(Handle timer, int userId)
+{
+    int client = GetClientOfUserId(userId);
+    if (!Safe() || !g_live || client == 0 || !IsPlayerAlive(client)) return Plugin_Stop;
+    float goal[3];
+    int route;
+    bool released = !BotTTactics_GetOrder(client, goal, route);
+    SetEntityMoveType(client, MOVETYPE_WALK);
+    PrintToServer("PLANT_HANDOFF_%s", released ? "PASS" : "FAIL");
+    return Plugin_Stop;
 }
 
 public APLRes AskPluginLoad2(Handle plugin, bool late, char[] error, int length)
@@ -223,19 +387,21 @@ public void ObjectiveEvent(Event event, const char[] name, bool dontBroadcast)
     {
         g_planted = true;
         g_plantedAt = GetGameTime();
-        // Remove opponents without faking an objective event. CT starts
-        // from its spawn and has to actually path and defuse in the engine.
-        // Resume CT first so T suicides cannot leave a fake motion state.
+        // CT starts at spawn and runs the engine's actual return route. Keep
+        // the non-shooting opponents for an optional window of real staging.
         for (int i = 1; i <= MaxClients; i++)
             if (IsClientInGame(i) && IsPlayerAlive(i))
             {
-                if (GetClientTeam(i) == CS_TEAM_T) ForcePlayerSuicide(i);
+                if (GetClientTeam(i) == CS_TEAM_T && g_clearDelay.FloatValue > 0.0) SetEntityMoveType(i, MOVETYPE_NONE);
                 else if (GetClientTeam(i) == CS_TEAM_CT)
                 {
                     SetEntityMoveType(i, MOVETYPE_WALK);
-                    SetEntProp(i, Prop_Send, "m_bHasDefuser", 1);
+                    SetEntProp(i, Prop_Send, "m_bHasDefuser", g_kit.BoolValue ? 1 : 0);
                 }
             }
+        if (g_clearDelay.FloatValue > 0.0)
+            CreateTimer(g_clearDelay.FloatValue, ClearTestAttackers, _, TIMER_FLAG_NO_MAPCHANGE);
+        else ClearTestAttackers(null);
     }
     if (StrEqual(name, "bomb_defused"))
     {
@@ -246,6 +412,24 @@ public void ObjectiveEvent(Event event, const char[] name, bool dontBroadcast)
             map, GetGameTime() - g_plantedAt, g_stageSeen, g_commitSeen);
         NextRouteCase();
     }
+}
+
+public Action ClearTestAttackers(Handle timer)
+{
+    if (!Safe() || !g_live || !g_planted || g_completed) return Plugin_Stop;
+    for (int i = 1; i <= MaxClients; i++)
+        if (IsClientInGame(i) && IsPlayerAlive(i) && GetClientTeam(i) == CS_TEAM_T) ForcePlayerSuicide(i);
+    FindConVar("mp_ignore_round_win_conditions").BoolValue = false;
+    PrintToServer("RETAKE_TEST_CLEAR t=%.2f", GetGameTime() - g_plantedAt);
+    return Plugin_Stop;
+}
+
+public void RoundResult(Event event, const char[] name, bool dontBroadcast)
+{
+    if (!Safe() || !g_live || !g_planted) return;
+    char map[64];
+    GetCurrentMap(map, sizeof(map));
+    PrintToServer("RETAKE_ROUND map=%s winner=%d reason=%d", map, event.GetInt("winner"), event.GetInt("reason"));
 }
 
 void NextRouteCase()
