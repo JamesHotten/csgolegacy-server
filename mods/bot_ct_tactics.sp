@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.8"
+#define PLUGIN_VERSION "0.1.10"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -96,6 +96,13 @@ ConVar g_cvRetakeStageTimeout;
 ConVar g_cvRetakeClockAware;
 ConVar g_cvClearSiteDefuse;
 ConVar g_cvRetakeRoles;
+ConVar g_cvNukeGuardWatch;
+ConVar g_cvClearWatch;
+bool g_nukeMap;
+float g_nukeGuardAimCheckAt[MAXPLAYERS + 1];
+float g_nukeGuardEye[MAXPLAYERS + 1][3];
+float g_nukeGuardAim[MAXPLAYERS + 1][3];
+bool g_nukeGuardAimValid[MAXPLAYERS + 1];
 ConVar g_cvPairedPressure;
 ConVar g_cvCoverSpacing;
 int g_pressureUsers[2];
@@ -218,6 +225,8 @@ public void OnPluginStart()
     g_cvRetakeClockAware = CreateConVar("sm_bot_ct_retake_clock_aware", "1", "Skip CT retake staging with 20 seconds or less left, or for a solo BOT, and reject vertically separated arrivals.", _, true, 0.0, true, 1.0);
     g_cvClearSiteDefuse = CreateConVar("sm_bot_ct_clear_site_defuse", "1", "Yield to native defuse AI when all attackers are eliminated.", _, true, 0.0, true, 1.0);
     g_cvRetakeRoles = CreateConVar("sm_bot_ct_retake_roles", "1", "Use named approaches and prioritize a reachable defuser on Mirage, Inferno and Nuke.", _, true, 0.0, true, 1.0);
+    g_cvNukeGuardWatch = CreateConVar("sm_bot_ct_nuke_guard_clear_watch", "1", "Nuke loose-C4 guards use visible approach sightlines instead of a blind fixed aim.", _, true, 0.0, true, 1.0);
+    g_cvClearWatch = CreateConVar("sm_bot_ct_clear_watch", "1", "Reject nearby obstructions from the CT BOT's actual eye before applying a tactical look.", _, true, 0.0, true, 1.0);
     g_cvPairedPressure = CreateConVar("sm_bot_ct_pair_pressure_chance", "0", "Mirage: chance to add a short two-BOT probe to a standard setup; 0 disables.", _, true, 0.0, true, 100.0);
     g_cvCoverSpacing = CreateConVar("sm_bot_ct_cover_spacing", "1", "Avoid overlapping generic opening positions when clear alternate holds are available.", _, true, 0.0, true, 1.0);
     g_cvSyncMinReady = CreateConVar("sm_bot_ct_tactics_sync_min_ready", "50", "Percent of active ordered CT bots required at retake staging goals.", _, true, 20.0, true, 100.0);
@@ -265,6 +274,7 @@ public void OnMapStart()
     char map[64];
     GetCurrentMap(map, sizeof(map));
     g_infernoMap = StrEqual(map, "de_inferno", false);
+    g_nukeMap = StrEqual(map, "de_nuke", false);
     g_mapProfile = TacticalMap_Find(map);
     ResetDirector();
     ClearCombatReleases();
@@ -408,9 +418,51 @@ public any Native_GetAim(Handle plugin, int numParams)
 {
     int client = GetNativeCell(1);
     if (!g_cvEnabled.BoolValue || client < 1 || client > MaxClients || !g_hasOrder[client]
-        || !g_hasLook[client] || g_combatReleased[client] || !IsCTBot(client))
+        || g_combatReleased[client] || !IsCTBot(client))
         return false;
 
+    bool live = numParams >= 3 && GetNativeCell(3) != 0;
+    if (live && NukeGuardWatchEnabled())
+    {
+        // The movement bridge stops a short distance from the nominal slot.
+        // A clear ray from the slot is not proof that the BOT can see it.
+        float position[3];
+        GetClientAbsOrigin(client, position);
+        // Match BetterBots' hold-release buffer, not only its entry radius.
+        if (GetVectorDistance(position, g_orderGoal[client]) <= 256.0)
+        {
+            float eye[3];
+            GetClientEyePosition(client, eye);
+            float now = GetGameTime();
+            if (now >= g_nukeGuardAimCheckAt[client] || GetVectorDistance(eye, g_nukeGuardEye[client]) > 28.0)
+            {
+                CopyVector(eye, g_nukeGuardEye[client]);
+                g_nukeGuardAimCheckAt[client] = now + 0.5;
+                g_nukeGuardAimValid[client] = g_hasLook[client] && NukeGuard_ClearRay(eye, g_orderLook[client]);
+                if (g_nukeGuardAimValid[client]) CopyVector(g_orderLook[client], g_nukeGuardAim[client]);
+                else g_nukeGuardAimValid[client] = NukeGuard_SelectLook(eye, g_guardSlot[client], g_nukeGuardAim[client]);
+            }
+            if (!g_nukeGuardAimValid[client]) return false;
+            float look[3];
+            CopyVector(g_nukeGuardAim[client], look);
+            if (g_cvClearWatch.BoolValue && !TacticalAngles_ClipWatchRay(eye, look))
+            {
+                g_nukeGuardAimCheckAt[client] = 0.0;
+                return false;
+            }
+            SetNativeArray(2, look, 3);
+            return true;
+        }
+    }
+    if (!g_hasLook[client]) return false;
+    if (live && g_cvClearWatch.BoolValue)
+    {
+        float look[3];
+        if (!TacticalAngles_SelectLiveWatch(client, g_orderGoal[client], g_orderLook[client], view_as<int>(g_phase), look))
+            return false;
+        SetNativeArray(2, look, 3);
+        return true;
+    }
     SetNativeArray(2, g_orderLook[client], 3);
     return true;
 }
@@ -1287,6 +1339,7 @@ void PlanLooseBombGuard(int bomb, int spotter)
         g_guardSlot[selected] = target;
         CopyVector(g_targets[target], g_orderGoal[selected]);
         SetOrderLook(selected, g_tSpawn, target);
+        if (NukeGuardWatchEnabled()) ResolveNukeGuardLook(selected);
     }
     ExperienceSignal("guard_bomb", "loose_c4_seen", NearestSite(g_bombPosition), spotter);
     DebugLog("%N saw dropped C4; reserved %d CT guard positions.", spotter, guardCount);
@@ -1309,6 +1362,7 @@ void ResumeLooseBombGuards()
         g_combatReleased[client] = false;
         g_hasOrder[client] = true;
         g_hasLook[client] = true;
+        if (NukeGuardWatchEnabled()) ResolveNukeGuardLook(client);
         g_orderRoute[client] = view_as<int>(Route_Fastest);
         g_orderExpires[client] = 0.0;
         StartOrderProgress(client);
@@ -1324,7 +1378,82 @@ void ClearLooseBombGuard()
         g_guardSlot[client] = -1;
         g_guardStalls[client] = 0;
         g_guardReleasedAt[client] = -100.0;
+        g_nukeGuardAimCheckAt[client] = 0.0;
+        g_nukeGuardAimValid[client] = false;
     }
+}
+
+bool NukeGuardWatchEnabled()
+{
+    return g_nukeMap && g_cvNukeGuardWatch.BoolValue && g_phase == Phase_GuardLooseBomb;
+}
+
+void ResolveNukeGuardLook(int client)
+{
+    float eye[3], look[3];
+    CopyVector(g_orderGoal[client], eye);
+    eye[2] += 64.0;
+    // Keep the nominal hold when there is no clear planned ray; the live
+    // query may find one from the actual eye or yield to native scanning.
+    if (NukeGuard_SelectLook(eye, g_guardSlot[client], look))
+        CopyVector(look, g_orderLook[client]);
+    g_nukeGuardAimCheckAt[client] = 0.0;
+}
+
+bool NukeGuard_ClearRay(const float eye[3], const float look[3])
+{
+    if (Distance2D(eye, look) < 150.0 || FloatAbs(eye[2] - look[2]) > 100.0) return false;
+    Handle trace = TR_TraceRayFilterEx(eye, look, MASK_VISIBLE, RayType_EndPoint, TacticalAngles_TraceFilter, 0);
+    bool clear = !TR_StartSolid(trace) && !TR_DidHit(trace);
+    delete trace;
+    return clear;
+}
+
+bool NukeGuard_SelectLook(const float eye[3], int slot, float look[3])
+{
+    float dx = g_bombPosition[0] - eye[0], dy = g_bombPosition[1] - eye[1];
+    // Let one side watch across the C4. Other offsets split the likely
+    // approaches; NAV-supported endpoints keep the ray in playable space.
+    Normalize2D(dx, dy);
+    if (FloatAbs(dx) + FloatAbs(dy) < 0.01) dx = 1.0;
+    float axisX, axisY;
+    Rotate2D(dx, dy, TacticalAngles_GetSlotOffset(slot < 0 ? 0 : slot), axisX, axisY);
+    float best = -999999.0;
+    int start = NavMeshReady() ? NavMesh_GetNearestArea(eye, false, 160.0, false, true, TEAM_ANY) : -1;
+    if (start >= 0)
+    {
+        ArrayStack areas = new ArrayStack();
+        NavMesh_CollectSurroundingAreas(areas, start, 850.0, 26.0, 60.0);
+        while (!areas.Empty)
+        {
+            float candidate[3];
+            if (!NavMeshArea_GetCenter(areas.Pop(), candidate)) continue;
+            candidate[2] += 64.0;
+            float range = Distance2D(eye, candidate);
+            if (range < 150.0 || range > 780.0 || FloatAbs(eye[2] - candidate[2]) > 100.0) continue;
+            float alignment = ((candidate[0] - eye[0]) * axisX + (candidate[1] - eye[1]) * axisY) / range;
+            float score = alignment * 200.0 - FloatAbs(range - 450.0) * 0.12;
+            if (score <= best || !NukeGuard_ClearRay(eye, candidate)) continue;
+            best = score;
+            CopyVector(candidate, look);
+        }
+        delete areas;
+    }
+    // A narrow corridor can have a clear short lane but no usable NAV center.
+    if (best > -999999.0) return true;
+    for (int step = 0; step < 12; step++)
+    {
+        float x, y, candidate[3];
+        float turn = float((step + 1) / 2) * (step % 2 != 0 ? -30.0 : 30.0);
+        Rotate2D(axisX, axisY, turn, x, y);
+        CopyVector(eye, candidate);
+        candidate[0] += x * 175.0;
+        candidate[1] += y * 175.0;
+        if (!NukeGuard_ClearRay(eye, candidate)) continue;
+        CopyVector(candidate, look);
+        return true;
+    }
+    return false; // Keep the guard slot, but let native AI scan when no safe sightline exists.
 }
 
 bool RetakeIsUnopposed()

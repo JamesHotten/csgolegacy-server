@@ -26,10 +26,10 @@ stock bool BotCTWatch_IsQuietHold(int client)
     int route;
     // Re-query rather than trust last frame: a same-frame fire/hurt event or
     // plugin disable must immediately release native attention.
-    if (!BotCTTactics_GetOrder(client, goal, route) || !BotCTTactics_GetAim(client, look))
+    if (!BotCTTactics_GetOrder(client, goal, route))
         return false;
     GetClientAbsOrigin(client, position);
-    return GetVectorDistance(position, goal) <= 256.0;
+    return GetVectorDistance(position, goal) <= 256.0 && BotCTTactics_GetAim(client, look, true);
 }
 
 stock bool BotCTWatch_IsEssentialLook(const char[] description, bool attack)

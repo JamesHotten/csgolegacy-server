@@ -18,7 +18,7 @@ foreach ($required in @('GetClientTeam(client) != CS_TEAM_CT', '!g_bTacticalHold
     'g_iEnemyVisibleOffset', 'g_iBotNearbyEnemiesOffset', 'g_bBombPlanted',
     'g_bThrowGrenade[client]', 'g_iDoingSmokeNum[client] != -1', 'BotMimic_IsPlayerMimicing(client)',
     'MOVETYPE_LADDER', 'ESCAPE_FROM_BOMB', 'ESCAPE_FROM_FLAMES', 'CS_SLOT_GRENADE',
-    'BotCTTactics_GetOrder(client, goal, route)', 'BotCTTactics_GetAim(client, look)',
+    'BotCTTactics_GetOrder(client, goal, route)', 'BotCTTactics_GetAim(client, look, true)',
     'GetVectorDistance(position, goal) <= 256.0')) {
     if (-not $watch.Contains($required)) { throw "Missing quiet-watch release safeguard: $required" }
 }
@@ -29,7 +29,7 @@ foreach ($required in @('return attack', 'Defuse bomb', 'Use entity', 'Open door
 if ($watch -match 'TeleportEntity|SetEntData|SetEntProp|BotMoveTo|TR_Trace|NavMesh_') {
     throw 'Quiet-watch arbitration must not force aim, edit enemy memory, move bots or recalculate geometry.'
 }
-if (-not $core.Contains('BotCTWatch_IsQuietHold(iClient) && !BotCTWatch_IsEssentialLook(szDesc, hParams.Get(7) != 0)') -or
+if (-not $core.Contains('!BotCTWatch_IsEssentialLook(szDesc, hParams.Get(7) != 0) && BotCTWatch_IsQuietHold(iClient)') -or
     -not $core.Contains('fNow + (bFixedCTWatch ? 0.1 : 0.5)') -or
     -not $core.Contains('BotSetLookAt(iClient, "tactical hold", fTacticalLook, PRIORITY_HIGH, 0.75, false, 8.0, false);') -or
     -not $core.Contains('BotSetLookAt(iClient, "CT assigned hold", fTacticalLook, PRIORITY_HIGH, 0.75, false, 8.0, false);')) {

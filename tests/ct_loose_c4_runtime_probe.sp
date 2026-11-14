@@ -5,6 +5,7 @@
 #include <cstrike>
 
 native bool BotCTTactics_GetOrder(int client, float goal[3], int &route);
+native bool BotCTTactics_GetAim(int client, float look[3], bool live = false);
 native bool BotCTTactics_ReportContact(int client, int enemy);
 native bool BotStuff_CanSeeLooseC4(int client, int bomb);
 public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int maxlen)
@@ -25,6 +26,7 @@ bool g_beforeHasOrder[MAXPLAYERS + 1];
 float g_beforeGoal[MAXPLAYERS + 1][3];
 ConVar g_settings[6];
 ConVar g_auto;
+ConVar g_nukeWatch;
 bool g_autoPrepared;
 float g_autoAfter;
 int g_oldValues[6];
@@ -43,22 +45,40 @@ public void OnPluginStart()
     if (g_nativeCanSeeLoose == null) SetFailState("Cannot prepare native loose C4 vision");
     RegAdminCmd("sm_ct_guard_probe", StartProbe, ADMFLAG_ROOT);
     g_auto = CreateConVar("sm_ct_guard_probe_auto", "0", "Explicit empty-server regression probe autorun.");
+    g_nukeWatch = CreateConVar("sm_ct_guard_probe_nuke_watch", "0", "Nuke watch test: 1 = upper level; 2 = lower level.", _, true, 0.0, true, 2.0);
     CreateTimer(1.0, AutoProbe, _, TIMER_REPEAT);
 }
 
 public Action AutoProbe(Handle timer)
 {
     if (!g_auto.BoolValue) return Plugin_Continue;
+    char map[32];
+    GetCurrentMap(map, sizeof(map));
+    if (g_nukeWatch.IntValue != 0 && !StrEqual(map, "de_nuke", false)) return Plugin_Stop;
     if (!g_autoPrepared)
     {
         // Never freeze a human's match, even if the test was misconfigured.
         for (int i = 1; i <= MaxClients; i++)
             if (IsClientInGame(i) && !IsFakeClient(i)) return Plugin_Stop;
-        ServerCommand("bot_stop 1; bot_dont_shoot 1; mp_warmup_end; mp_restartgame 1");
-        g_autoAfter = GetGameTime() + 20.0;
+        ServerCommand("sv_cheats 1; bot_stop 1; bot_dont_shoot 1; mp_warmup_end; mp_restartgame 1");
+        if (g_nukeWatch.IntValue != 0)
+        {
+            ServerCommand("sv_cheats 1; bot_dont_shoot 1; mp_autoteambalance 0; mp_limitteams 0; mp_freezetime 2; mp_do_warmup_period 0; mp_ignore_round_win_conditions 1; bot_join_after_player 0; bot_quota_mode normal; bot_quota 0; bot_kick");
+            ServerExecute();
+            for (int i = 0; i < 5; i++) ServerCommand("bot_add_ct; bot_add_t");
+            ServerExecute();
+            ServerCommand("mp_warmup_end; mp_restartgame 1");
+        }
+        g_autoAfter = GetGameTime() + (g_nukeWatch.IntValue != 0 ? 8.0 : 20.0);
         g_autoPrepared = true;
     }
     if (GetGameTime() < g_autoAfter) return Plugin_Continue;
+    if (g_nukeWatch.IntValue != 0 && GameRules_GetProp("m_bWarmupPeriod") != 0)
+    {
+        ServerCommand("mp_warmup_end; mp_restartgame 1");
+        g_autoAfter = GetGameTime() + 5.0;
+        return Plugin_Continue;
+    }
     StartProbe(0, 0);
     return g_running ? Plugin_Stop : Plugin_Continue;
 }
@@ -78,7 +98,8 @@ public Action StartProbe(int client, int args)
             g_bots[g_count++] = i;
     if (g_count < 4 || GameRules_GetProp("m_bWarmupPeriod") != 0 || GameRules_GetProp("m_bFreezePeriod") != 0)
     {
-        ReplyToCommand(client, "CT_GUARD_PROBE_REFUSED: need >=4 alive CTs in a live round");
+        ReplyToCommand(client, "CT_GUARD_PROBE_REFUSED: ct=%d warmup=%d freeze=%d", g_count,
+            GameRules_GetProp("m_bWarmupPeriod"), GameRules_GetProp("m_bFreezePeriod"));
         return Plugin_Handled;
     }
     g_settings[0] = FindConVar("bot_stop");
@@ -120,6 +141,8 @@ public Action StartProbe(int client, int args)
     if (spawn == -1) SetFailState("No CT spawn for probe");
     float start[3];
     GetEntPropVector(spawn, Prop_Data, "m_vecOrigin", start);
+    if (g_nukeWatch.IntValue == 1) { start[0] = 416.0; start[1] = -2050.0; start[2] = -416.0; }
+    if (g_nukeWatch.IntValue == 2) { start[0] = 460.0; start[1] = -1015.0; start[2] = -771.0; }
     // The first spawn and its +X side are not guaranteed to have clear LOS.
     // Put the synthetic loose C4 on an explicitly clear line from the spotter.
     float eye[3], spot[3];
@@ -273,6 +296,7 @@ public Action CheckProbe(Handle timer)
         ServerCommand("sm_ct_tactics_status");
         PrintToServer("CT_GUARD_PROBE guards=%d expected=%d", count, g_count);
         Check("all_alive_cts_include_previously_released_bot", count == g_count);
+        if (g_nukeWatch.IntValue != 0) CheckNukeWatchAngles();
         CheckReinforcementPriority();
         FireContact(g_bots[0]);
         float goal[3]; int route;
@@ -296,6 +320,7 @@ public Action CheckProbe(Handle timer)
     else if (g_stage == 4)
     {
         Check("quiet_bot_rejoins_guard", CountGuards() == g_count);
+        if (g_nukeWatch.IntValue != 0) CheckNukeWatchAngles();
         int bomb = EntRefToEntIndex(g_bombRef);
         if (bomb != INVALID_ENT_REFERENCE) RemoveEntity(bomb);
         g_bombRef = INVALID_ENT_REFERENCE;
@@ -309,6 +334,66 @@ public Action CheckProbe(Handle timer)
         Cleanup();
     }
     return Plugin_Stop;
+}
+
+void CheckNukeWatchAngles()
+{
+    int clear, blocked;
+    for (int n = 0; n < g_count; n++)
+    {
+        int route;
+        float goal[3], look[3];
+        if (!BotCTTactics_GetOrder(g_bots[n], goal, route) || !BotCTTactics_GetAim(g_bots[n], look)) continue;
+        goal[2] += 64.0;
+        Handle trace = TR_TraceRayFilterEx(goal, look, MASK_VISIBLE, RayType_EndPoint, TestWorldOnly);
+        float lane = GetVectorDistance(goal, look) * TR_GetFraction(trace);
+        bool valid = !TR_StartSolid(trace) && lane >= 150.0 && !TR_DidHit(trace);
+        delete trace;
+        if (valid) clear++;
+        else blocked++;
+        PrintToServer("NUKE_GUARD_LOOK slot=%d hold=%.0f,%.0f,%.0f look=%.0f,%.0f,%.0f clear_dist=%.1f valid=%d",
+            n,goal[0],goal[1],goal[2]-64.0,look[0],look[1],look[2],lane,valid);
+    }
+    PrintToServer("NUKE_GUARD_RESULT floor=%d clear=%d blocked=%d", g_nukeWatch.IntValue, clear, blocked);
+    Check("nuke_no_wall_watch", clear >= 1 && blocked == 0);
+    CheckNukeEyeAngles();
+}
+
+void CheckNukeEyeAngles()
+{
+    int assessed, blocked, clear;
+    for (int n = 0; n < g_count; n++)
+    {
+        int client = g_bots[n], route;
+        float goal[3], look[3], old[3];
+        if (!BotCTTactics_GetOrder(client, goal, route)) continue;
+        GetClientAbsOrigin(client, old);
+        for (int step = 0; step < 8; step++)
+        {
+            float point[3], mins[3] = {-16.0, -16.0, 0.0}, maxs[3] = {16.0, 16.0, 72.0};
+            CopyVec(goal, point);
+            point[0] += 64.0 * Cosine(float(step) * 0.785398163);
+            point[1] += 64.0 * Sine(float(step) * 0.785398163);
+            point[2] += 3.0;
+            Handle hull = TR_TraceHullFilterEx(point, point, mins, maxs, MASK_PLAYERSOLID, TestWorldOnly);
+            bool fits = !TR_StartSolid(hull) && !TR_DidHit(hull);
+            delete hull;
+            if (!fits) continue;
+            TeleportEntity(client, point, NULL_VECTOR, NULL_VECTOR);
+            assessed++;
+            if (!BotCTTactics_GetAim(client, look, true)) continue; // Native scan fallback is allowed.
+            float eye[3];
+            GetClientEyePosition(client, eye);
+            Handle trace = TR_TraceRayFilterEx(eye, look, MASK_VISIBLE, RayType_EndPoint, TestWorldOnly);
+            bool valid = !TR_StartSolid(trace) && !TR_DidHit(trace) && GetVectorDistance(eye, look) >= 150.0;
+            delete trace;
+            if (valid) clear++;
+            else blocked++;
+        }
+        TeleportEntity(client, old, NULL_VECTOR, NULL_VECTOR);
+    }
+    PrintToServer("NUKE_GUARD_ACTUAL_EYE floor=%d samples=%d clear=%d blocked=%d", g_nukeWatch.IntValue, assessed, clear, blocked);
+    Check("nuke_offset_eye_no_wall_watch", assessed >= g_count && clear > 0 && blocked == 0);
 }
 
 void CheckReinforcementPriority()

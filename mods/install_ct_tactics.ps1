@@ -1825,6 +1825,64 @@ if (-not $text.Contains('BEGIN T_PLANT_DRIVE_REPORT')) {
     $text = Replace-Once $text $old $patch 'report verified C4 approach drive'
 }
 
+$jumpRepetitionSource = Join-Path $PSScriptRoot 'include\bot_jump_repetition.inc'
+if (-not $text.Contains('BOT_JUMP_GUARD_V3_LOCAL_REPETITION')) {
+    $text = Replace-Once $text '#include <bot_stuff_compile_compat>' ('#include <bot_stuff_compile_compat>' + $newline + '#include <bot_jump_repetition>') 'local BOT jump history'
+    $jumpEvent = [regex]::Match($text, '(?ms)^public void OnPlayerJump\([^\r\n]*\)\r?\n\{.*?return;').Value
+    if (!$jumpEvent) { throw 'BOT jump event handler missing.' }
+    $text = Replace-Once $text $jumpEvent ($jumpEvent + $newline + '    if (IsFakeClient(iClient)) BotJumpRecordTakeoff(iClient);') 'record actual BOT takeoff'
+    $spawn = [regex]::Match($text, '(?ms)^public void OnPlayerSpawn\(.*?if \(!IsFakeClient\(iClient\)\)\s+return;').Value
+    if (!$spawn) { throw 'BOT spawn handler missing.' }
+    $text = Replace-Once $text $spawn ($spawn + $newline + '    BotJumpReset(iClient);') 'reset jump history on BOT spawn'
+    $old = 'if (!bJumpExempt && bSettledTacticalHold)'
+    $block = @(
+        '// BOT_JUMP_GUARD_V3_LOCAL_REPETITION',
+        '        bool bLocalRepeatExempt = bRecordedJump || g_bThrowGrenade[iClient] || g_iDoingSmokeNum[iClient] != -1',
+        '            || eItems_GetWeaponSlotByDefIndex(iDefIndex) == CS_SLOT_GRENADE',
+        '            || GetEntityMoveType(iClient) == MOVETYPE_LADDER',
+        '            || GetTask(iClient) == ESCAPE_FROM_FLAMES || GetTask(iClient) == ESCAPE_FROM_BOMB;',
+        '        if (bLocalRepeatExempt) BotJumpReset(iClient);',
+        '        if (!bLocalRepeatExempt && ((!bJumpExempt && bSettledTacticalHold) || BotJumpSuppressLocalRepeat(iClient, g_fBotOrigin[iClient], fNow)))'
+    ) -join $newline
+    $text = Replace-Once $text $old $block 'suppress repeated local BOT takeoffs without a route-wide cooldown'
+}
+
+if (-not $text.Contains('BEGIN TACTICAL_LIVE_SIGHTLINE')) {
+    foreach ($side in @('CT', 'T')) {
+        $old = "native bool Bot${side}Tactics_GetAim(int client, float lookAt[3]);"
+        $new = "native bool Bot${side}Tactics_GetAim(int client, float lookAt[3], bool live = false);"
+        $text = Replace-Once $text $old $new "$side aim query with optional live sightline"
+    }
+    $old = [regex]::Match($text, '(?s)// BEGIN CT_FIXED_WATCH_REFRESH.*?g_fTacticalMoveTimestamp\[iClient\] = fNow \+ \(bFixedCTWatch \? 0.1 : 0.5\);').Value
+    if (!$old) { throw 'Fixed watch dispatch block not found.' }
+    $block = @(
+        '// BEGIN TACTICAL_LIVE_SIGHTLINE',
+        '            bool bLiveAim = !g_bThrowGrenade[iClient] && GetEntityMoveType(iClient) != MOVETYPE_LADDER',
+        '                && GetTask(iClient) != ESCAPE_FROM_FLAMES && GetTask(iClient) != ESCAPE_FROM_BOMB',
+        '                && (GetClientTeam(iClient) == CS_TEAM_CT',
+        '                    ? BotCTTactics_GetAim(iClient, fTacticalLook, true)',
+        '                    : BotTTactics_GetAim(iClient, fTacticalLook, true));',
+        '            if (bLiveAim)',
+        '            {',
+        '                // BEGIN CT_FIXED_WATCH_REFRESH',
+        '                bool bFixedCTWatch = BotCTWatch_IsQuietHold(iClient);',
+        '                if (bFixedCTWatch)',
+        '                    BotSetLookAt(iClient, "CT assigned hold", fTacticalLook, PRIORITY_HIGH, 0.75, false, 8.0, false);',
+        '                else',
+        '                    BotSetLookAt(iClient, "tactical hold", fTacticalLook, PRIORITY_HIGH, 0.75, false, 8.0, false);',
+        '                // END CT_FIXED_WATCH_REFRESH',
+        '                g_fTacticalMoveTimestamp[iClient] = fNow + (bFixedCTWatch ? 0.1 : 0.5);',
+        '            }',
+        '            else g_fTacticalMoveTimestamp[iClient] = fNow + 0.15;',
+        '            // END TACTICAL_LIVE_SIGHTLINE'
+    ) -join $newline
+    $text = Replace-Once $text $old $block 'verify aim only at fixed-look dispatch and preserve movement'
+    $old = 'if (StrEqual(szDesc, "CT assigned hold"))'
+    $text = Replace-Once $text $old 'if (StrEqual(szDesc, "CT assigned hold") || StrEqual(szDesc, "tactical hold"))' 'do not raise a checked tactical aim by the legacy Z offset'
+    $old = 'BotCTWatch_IsQuietHold(iClient) && !BotCTWatch_IsEssentialLook(szDesc, hParams.Get(7) != 0)'
+    $text = Replace-Once $text $old '!BotCTWatch_IsEssentialLook(szDesc, hParams.Get(7) != 0) && BotCTWatch_IsQuietHold(iClient)' 'preserve essential engine look requests before querying watch geometry'
+}
+
 $candidateExperiencePlugin = Join-Path $buildDir "000_bot_tactical_experience.smx"
 
 try {
@@ -1842,6 +1900,7 @@ try {
     Copy-Item -LiteralPath $infernoWatchSource -Destination (Join-Path $includeDir "bot_ct_inferno_watch.inc") -Force
     Copy-Item -LiteralPath $mapProfilesSource -Destination (Join-Path $includeDir "bot_tactical_map_profiles.inc") -Force
     Copy-Item -LiteralPath $mirageUtilitySource -Destination (Join-Path $includeDir "bot_mirage_utility.inc") -Force
+    Copy-Item -LiteralPath $jumpRepetitionSource -Destination (Join-Path $includeDir "bot_jump_repetition.inc") -Force
 
     & $compiler "-o$candidateDirectorPlugin" $directorSource
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $candidateDirectorPlugin)) {

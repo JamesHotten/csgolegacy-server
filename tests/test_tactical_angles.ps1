@@ -32,5 +32,15 @@ if (-not $ct.Contains('#include <bot_tactical_angles>') -or
 if ($angles.Contains('CreateTimer(') -or $angles.Contains('OnGameFrame') -or $angles.Contains('OnPlayerRunCmd')) {
     throw 'Angle planning must remain event-driven and cached, not perform NAV/trace work every frame.'
 }
+foreach ($director in @($ct, $t)) {
+    if (!$director.Contains('GetNativeCell(3)') -or !$director.Contains('TacticalAngles_SelectLiveWatch(client, g_orderGoal[client]')) {
+        throw 'Both sides must check the actual BOT eye in the live aim query, independently of the movement order.'
+    }
+}
+if (!$angles.Contains('GetClientEyePosition(client, eye)') -or
+    !$angles.Contains('if (visible < 152.0) return false;') -or
+    !$angles.Contains('look[2] = eye[2];')) {
+    throw 'Live watch must reject nearby obstructions and keep alternate rays on the same floor.'
+}
 
 Write-Host 'Shared tactical angle-planning regression checks passed.'

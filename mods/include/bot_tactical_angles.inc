@@ -3,8 +3,8 @@
 #endif
 #define _bot_tactical_angles_included
 
-// Shared, stateless angle selection for the CT and T directors. Callers retain
-// ownership of phase/state so one side can be disabled or rolled back alone.
+// Shared angle selection for the CT and T directors. Callers retain
+// ownership of phase and movement; each plugin has a separate look cache.
 
 public bool TacticalAngles_TraceFilter(int entity, int contentsMask, any client)
 {
@@ -77,6 +77,98 @@ stock bool TacticalAngles_RequireClearWatch(const float hold[3], float look[3])
     ScaleVector(ray, (visibleDistance - 24.0) / distance);
     AddVectors(eye, ray, look);
     return true;
+}
+
+// The director plans a sector from the assigned slot, but the engine may
+// stop the BOT well short of it. Validate from the current eye only when
+// a fixed look can be applied, independently of the movement/hold order.
+enum struct TacticalWatchSample
+{
+    int userId;
+    int phase;
+    float time;
+    float eye[3];
+    float goal[3];
+    float planned[3];
+    float look[3];
+    bool valid;
+}
+
+TacticalWatchSample g_tacticalWatch[MAXPLAYERS + 1];
+
+stock bool TacticalAngles_ClipWatchRay(const float eye[3], float look[3])
+{
+    float ray[3];
+    MakeVectorFromPoints(eye, look, ray);
+    float length = GetVectorLength(ray);
+    if (length < 1.0) return false;
+    Handle trace = TR_TraceRayFilterEx(eye, look, MASK_VISIBLE, RayType_EndPoint,
+        TacticalAngles_TraceFilter, 0);
+    bool hit = TR_DidHit(trace);
+    bool solid = TR_StartSolid(trace);
+    float visible = length * TR_GetFraction(trace);
+    delete trace;
+    if (solid) return false;
+    if (!hit) return true; // A nearby visible objective is a valid look.
+    if (visible < 152.0) return false;
+    ScaleVector(ray, (visible - 24.0) / length);
+    AddVectors(eye, ray, look);
+    return true;
+}
+
+stock bool TacticalAngles_SelectLiveWatch(int client, const float goal[3], const float planned[3], int phase, float look[3])
+{
+    float eye[3], now = GetGameTime();
+    GetClientEyePosition(client, eye);
+    int userid = GetClientUserId(client);
+    if (g_tacticalWatch[client].userId == userid && g_tacticalWatch[client].phase == phase
+        && now >= g_tacticalWatch[client].time && now - g_tacticalWatch[client].time < 0.25
+        && GetVectorDistance(eye, g_tacticalWatch[client].eye, true) < 64.0
+        && GetVectorDistance(goal, g_tacticalWatch[client].goal, true) < 1.0
+        && GetVectorDistance(planned, g_tacticalWatch[client].planned, true) < 1.0)
+    {
+        CopyVector(g_tacticalWatch[client].look, look);
+        // Recheck the cached ray so an edge, prop or closing door between
+        // full searches cannot let an invalid angle through.
+        if (g_tacticalWatch[client].valid
+            && ((now == g_tacticalWatch[client].time && GetVectorDistance(eye, g_tacticalWatch[client].eye, true) < 0.01)
+                || TacticalAngles_ClipWatchRay(eye, look))) return true;
+        if (!g_tacticalWatch[client].valid) return false;
+    }
+
+    CopyVector(planned, look);
+    bool valid = TacticalAngles_ClipWatchRay(eye, look);
+    if (!valid)
+    {
+        float x = planned[0] - eye[0], y = planned[1] - eye[1];
+        if (x * x + y * y >= 1.0)
+        {
+            Normalize2D(x, y);
+            // Start nearest the assigned sector. Stay level and do not turn
+            // guards around or aim down onto a different floor.
+            for (int step = 1; step <= 10; step++)
+            {
+                float dx, dy;
+                float yaw = float((step + 1) / 2) * (step % 2 != 0 ? -15.0 : 15.0);
+                Rotate2D(x, y, yaw, dx, dy);
+                look[0] = eye[0] + dx * 420.0;
+                look[1] = eye[1] + dy * 420.0;
+                look[2] = eye[2];
+                if (!TacticalAngles_ClipWatchRay(eye, look)) continue;
+                valid = true;
+                break;
+            }
+        }
+    }
+    g_tacticalWatch[client].userId = userid;
+    g_tacticalWatch[client].phase = phase;
+    g_tacticalWatch[client].time = now;
+    g_tacticalWatch[client].valid = valid;
+    CopyVector(eye, g_tacticalWatch[client].eye);
+    CopyVector(goal, g_tacticalWatch[client].goal);
+    CopyVector(planned, g_tacticalWatch[client].planned);
+    CopyVector(look, g_tacticalWatch[client].look);
+    return valid;
 }
 
 stock bool TacticalAngles_SelectLook(int client, const float hold[3], const float threat[3], int slot, float result[3], bool constrainSector = false)

@@ -6,7 +6,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.5"
+#define PLUGIN_VERSION "0.1.6"
 #define MAX_CANDIDATES 256
 #define TEAM_ANY -2
 
@@ -95,6 +95,7 @@ ConVar g_cvSafePlant;
 ConVar g_cvRouteTiming;
 ConVar g_cvRouteRetry;
 ConVar g_cvPostPlantSectors;
+ConVar g_cvClearWatch;
 ConVar g_cvFakeChance;
 bool g_fakeOpening;
 bool g_fakeBot[MAXPLAYERS + 1];
@@ -201,6 +202,7 @@ public void OnPluginStart()
     g_cvRouteTiming = CreateConVar("sm_bot_t_route_timing", "1", "Use bounded route-aware staging on Mirage and Nuke.", _, true, 0.0, true, 1.0);
     g_cvRouteRetry = CreateConVar("sm_bot_t_route_retry", "1", "Retry a confirmed stalled opening route once on Mirage, Inferno and Nuke.", _, true, 0.0, true, 1.0);
     g_cvPostPlantSectors = CreateConVar("sm_bot_t_postplant_sectors", "1", "Keep a close bomb watcher and distribute the other post-plant angles.", _, true, 0.0, true, 1.0);
+    g_cvClearWatch = CreateConVar("sm_bot_t_clear_watch", "1", "Reject nearby obstructions from the T BOT's actual eye before applying a tactical look.", _, true, 0.0, true, 1.0);
     g_cvFakeChance = CreateConVar("sm_bot_t_fake_opening_chance", "0", "Mirage: chance to add one decoy runner to a default attack; 0 disables.", _, true, 0.0, true, 100.0);
     g_cvRoundTimeDefuse = FindConVar("mp_roundtime_defuse");
 
@@ -347,6 +349,14 @@ public any Native_GetAim(Handle plugin, int numParams)
     if (!g_cvEnabled.BoolValue || client < 1 || client > MaxClients || !g_hasOrder[client]
         || !g_hasLook[client] || g_combatReleased[client] || !IsTBot(client))
         return false;
+    if (numParams >= 3 && GetNativeCell(3) != 0 && g_cvClearWatch.BoolValue)
+    {
+        float look[3];
+        if (!TacticalAngles_SelectLiveWatch(client, g_orderGoal[client], g_orderLook[client], view_as<int>(g_phase), look))
+            return false;
+        SetNativeArray(2, look, 3);
+        return true;
+    }
     SetNativeArray(2, g_orderLook[client], 3);
     return true;
 }
