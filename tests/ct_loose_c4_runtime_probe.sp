@@ -27,6 +27,7 @@ float g_beforeGoal[MAXPLAYERS + 1][3];
 ConVar g_settings[6];
 ConVar g_auto;
 ConVar g_nukeWatch;
+ConVar g_overpassWatch;
 bool g_autoPrepared;
 float g_autoAfter;
 int g_oldValues[6];
@@ -46,6 +47,7 @@ public void OnPluginStart()
     RegAdminCmd("sm_ct_guard_probe", StartProbe, ADMFLAG_ROOT);
     g_auto = CreateConVar("sm_ct_guard_probe_auto", "0", "Explicit empty-server regression probe autorun.");
     g_nukeWatch = CreateConVar("sm_ct_guard_probe_nuke_watch", "0", "Nuke watch test: 1 = upper level; 2 = lower level.", _, true, 0.0, true, 2.0);
+    g_overpassWatch = CreateConVar("sm_ct_guard_probe_overpass_a", "0", "Use Overpass A plantable ground as the loose-C4 geometry fixture.");
     CreateTimer(1.0, AutoProbe, _, TIMER_REPEAT);
 }
 
@@ -55,13 +57,14 @@ public Action AutoProbe(Handle timer)
     char map[32];
     GetCurrentMap(map, sizeof(map));
     if (g_nukeWatch.IntValue != 0 && !StrEqual(map, "de_nuke", false)) return Plugin_Stop;
+    if (g_overpassWatch.BoolValue && !StrEqual(map, "de_overpass", false)) return Plugin_Stop;
     if (!g_autoPrepared)
     {
         // Never freeze a human's match, even if the test was misconfigured.
         for (int i = 1; i <= MaxClients; i++)
             if (IsClientInGame(i) && !IsFakeClient(i)) return Plugin_Stop;
         ServerCommand("sv_cheats 1; bot_stop 1; bot_dont_shoot 1; mp_warmup_end; mp_restartgame 1");
-        if (g_nukeWatch.IntValue != 0)
+        if (g_nukeWatch.IntValue != 0 || g_overpassWatch.BoolValue)
         {
             ServerCommand("sv_cheats 1; bot_dont_shoot 1; mp_autoteambalance 0; mp_limitteams 0; mp_freezetime 2; mp_do_warmup_period 0; mp_ignore_round_win_conditions 1; bot_join_after_player 0; bot_quota_mode normal; bot_quota 0; bot_kick");
             ServerExecute();
@@ -69,11 +72,11 @@ public Action AutoProbe(Handle timer)
             ServerExecute();
             ServerCommand("mp_warmup_end; mp_restartgame 1");
         }
-        g_autoAfter = GetGameTime() + (g_nukeWatch.IntValue != 0 ? 8.0 : 20.0);
+        g_autoAfter = GetGameTime() + (g_nukeWatch.IntValue != 0 || g_overpassWatch.BoolValue ? 8.0 : 20.0);
         g_autoPrepared = true;
     }
     if (GetGameTime() < g_autoAfter) return Plugin_Continue;
-    if (g_nukeWatch.IntValue != 0 && GameRules_GetProp("m_bWarmupPeriod") != 0)
+    if ((g_nukeWatch.IntValue != 0 || g_overpassWatch.BoolValue) && GameRules_GetProp("m_bWarmupPeriod") != 0)
     {
         ServerCommand("mp_warmup_end; mp_restartgame 1");
         g_autoAfter = GetGameTime() + 5.0;
@@ -143,6 +146,7 @@ public Action StartProbe(int client, int args)
     GetEntPropVector(spawn, Prop_Data, "m_vecOrigin", start);
     if (g_nukeWatch.IntValue == 1) { start[0] = 416.0; start[1] = -2050.0; start[2] = -416.0; }
     if (g_nukeWatch.IntValue == 2) { start[0] = 460.0; start[1] = -1015.0; start[2] = -771.0; }
+    if (g_overpassWatch.BoolValue) { start[0] = -2062.5; start[1] = 662.5; start[2] = 472.0; }
     // The first spawn and its +X side are not guaranteed to have clear LOS.
     // Put the synthetic loose C4 on an explicitly clear line from the spotter.
     float eye[3], spot[3];

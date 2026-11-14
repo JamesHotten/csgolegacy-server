@@ -4,7 +4,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $target = (Resolve-Path -LiteralPath $IsolatedServerDir).ProviderPath
-if ((Split-Path -Leaf $target) -notmatch 'test|isolated') { throw 'Use a dedicated isolated server directory.' }
+if ((Split-Path -Leaf $target) -notmatch 'test|isolated|^\.tactical-live-candidate-\d{8}$') { throw 'Use a dedicated isolated server directory.' }
 if (![uri]::new($BaseUrl).IsLoopback) { throw 'The resource endpoint must be a loopback address.' }
 $mods = Join-Path $PSScriptRoot '..\mods'
 $sm = Join-Path $target 'csgo\addons\sourcemod'

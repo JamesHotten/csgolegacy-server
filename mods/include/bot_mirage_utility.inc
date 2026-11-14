@@ -7,6 +7,7 @@ ConVar g_cvMirageRouteUtility;
 bool g_mirageUtilityMap;
 int g_utilitySlot[MAXPLAYERS + 1]; // Selected lineup index plus one.
 float g_utilityDeadline[MAXPLAYERS + 1];
+int g_utilityAssignedLane[MAXPLAYERS + 1];
 int g_ctSmokeUserId;
 
 void MirageUtility_OnMapStart()
@@ -25,6 +26,7 @@ void MirageUtility_Reset()
     {
         g_utilitySlot[i] = 0;
         g_utilityDeadline[i] = 0.0;
+        g_utilityAssignedLane[i] = -1;
     }
 }
 
@@ -93,10 +95,13 @@ bool MirageUtility_Tick(int client, bool enemy, float now, bool hadOrder)
     {
         NadeLineup nade;
         g_aNades.GetArray(selected, nade);
-        if (g_utilitySlot[client] == selected + 1 && now < g_utilityDeadline[client]) return true;
+        if (g_utilitySlot[client] == selected + 1 && g_utilityAssignedLane[client] == lane
+            && now < g_utilityDeadline[client]
+            && IsValidEntity(eItems_FindWeaponByDefIndex(client, nade.iDefIndex))) return true;
         if (g_utilitySlot[client] == 0 && (ct || MirageUtility_Eligible(client, nade.szReplay)) && FileExists(nade.szReplay))
         {
             g_utilitySlot[client] = selected + 1;
+            g_utilityAssignedLane[client] = lane;
             g_utilityDeadline[client] = now + 4.0;
             if (FindConVar("sm_bot_t_tactics_debug") != null && FindConVar("sm_bot_t_tactics_debug").BoolValue)
                 PrintToServer("MIRAGE_UTILITY assigned bot=%d lane=%d replay=%s", client, lane, nade.szReplay);
@@ -105,6 +110,9 @@ bool MirageUtility_Tick(int client, bool enemy, float now, bool hadOrder)
     }
     if (g_utilitySlot[client] > 0 || (roundTask && selected >= 0))
     {
+        if (g_utilitySlot[client] > 0 && now >= g_utilityDeadline[client]
+            && FindConVar("sm_bot_t_tactics_debug") != null && FindConVar("sm_bot_t_tactics_debug").BoolValue)
+            PrintToServer("MIRAGE_UTILITY timeout bot=%d lane=%d", client, g_utilityAssignedLane[client]);
         if (BotMimic_IsPlayerMimicing(client)) BotMimic_StopPlayerMimic(client);
         g_iDoingSmokeNum[client] = -1;
         g_utilitySlot[client] = -1; // At most one assignment per opening/player.

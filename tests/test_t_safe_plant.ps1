@@ -19,4 +19,8 @@ if ($CoreSource) {
         throw 'Shorter stop distance must be limited to the opt-in C4 approach order.'
     }
 }
+if (!$t.Contains('bool managedPlant = IsManagedPlantApproach(client);') -or
+    !$installer.Contains('GetTask(iClient) != PLANT_BOMB || bManagedPlantApproach')) {
+    throw 'A carrier outside the plant trigger must still be eligible for stall detection.'
+}
 Write-Host 'Safe plant goal, native planting and carrier-only bridge checks passed.'

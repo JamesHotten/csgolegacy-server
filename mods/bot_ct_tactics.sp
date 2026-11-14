@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.11"
+#define PLUGIN_VERSION "0.1.12"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -96,6 +96,7 @@ ConVar g_cvRetakeStageTimeout;
 ConVar g_cvRetakeClockAware;
 ConVar g_cvClearSiteDefuse;
 ConVar g_cvRetakeRoles;
+ConVar g_cvRetakeRelay;
 ConVar g_cvNukeGuardWatch;
 ConVar g_cvClearWatch;
 ConVar g_cvObjectiveWatch;
@@ -113,6 +114,9 @@ float g_pressureHomes[2][3], g_pressureAims[2][3];
 bool g_pressureHasAim[2];
 int g_defuserUserId;
 float g_defuserHandoffUntil;
+float g_nextDefuserReviewAt;
+bool g_defuserUsingBomb;
+int g_defuserRetiredUserId;
 ConVar g_cvSyncMinReady;
 ConVar g_cvGuardCount;
 ConVar g_cvFullPushChance;
@@ -231,6 +235,7 @@ public void OnPluginStart()
     g_cvRetakeClockAware = CreateConVar("sm_bot_ct_retake_clock_aware", "1", "Skip CT retake staging with 20 seconds or less left, or for a solo BOT, and reject vertically separated arrivals.", _, true, 0.0, true, 1.0);
     g_cvClearSiteDefuse = CreateConVar("sm_bot_ct_clear_site_defuse", "1", "Yield to native defuse AI when all attackers are eliminated.", _, true, 0.0, true, 1.0);
     g_cvRetakeRoles = CreateConVar("sm_bot_ct_retake_roles", "1", "Use named approaches and prioritize a reachable defuser on Mirage, Inferno and Nuke.", _, true, 0.0, true, 1.0);
+    g_cvRetakeRelay = CreateConVar("sm_bot_ct_retake_relay", "1", "Select a reachable defuser and replace a fallen or interrupted BOT on profiled maps.", _, true, 0.0, true, 1.0);
     g_cvNukeGuardWatch = CreateConVar("sm_bot_ct_nuke_guard_clear_watch", "1", "Nuke loose-C4 guards use visible approach sightlines instead of a blind fixed aim.", _, true, 0.0, true, 1.0);
     g_cvClearWatch = CreateConVar("sm_bot_ct_clear_watch", "1", "Reject nearby obstructions from the CT BOT's actual eye before applying a tactical look.", _, true, 0.0, true, 1.0);
     g_cvObjectiveWatch = CreateConVar("sm_bot_ct_objective_watch", "1", "Prefer distinct visible map entrances around a dropped bomb.", _, true, 0.0, true, 1.0);
@@ -403,10 +408,18 @@ public any Native_GetOrder(Handle plugin, int numParams)
     if (!g_cvEnabled.BoolValue || client < 1 || client > MaxClients || !g_hasOrder[client]
         || g_combatReleased[client] || !IsCTBot(client))
         return false;
+    if (g_phase == Phase_RetakeCommit && RetakeRelayEnabled()
+        && client == GetClientOfUserId(g_defuserUserId) && !g_retakeUnopposed)
+    {
+        float position[3];
+        GetClientAbsOrigin(client, position);
+        if (g_defuserUsingBomb || GetVectorDistance(position, g_bombPosition) <= 128.0)
+            return false; // Native AI owns the actual use/defuse interaction.
+    }
     if (g_cvClearSiteDefuse.BoolValue && g_phase == Phase_RetakeCommit && g_retakeUnopposed)
     {
         int defuser = GetClientOfUserId(g_defuserUserId);
-        if (!RetakeRolesEnabled() || !IsCTBot(defuser) || client == defuser || GetGameTime() > g_defuserHandoffUntil)
+        if ((!RetakeRolesEnabled() && !RetakeRelayEnabled()) || !IsCTBot(defuser) || client == defuser || GetGameTime() > g_defuserHandoffUntil)
             return false;
     }
 
@@ -709,6 +722,10 @@ public void Event_BombPlanted(Event event, const char[] name, bool dontBroadcast
     ClearLooseBombGuard();
     g_bombPlanted = true;
     g_retakeContact = false;
+    g_defuserUserId = 0;
+    g_defuserUsingBomb = false;
+    g_nextDefuserReviewAt = 0.0;
+    g_defuserRetiredUserId = 0;
     // A CT that fought during the site take must still receive the new retake
     // plan after the bomb is planted.
     ClearCombatReleases();
@@ -731,8 +748,9 @@ public Action Timer_PlanRetake(Handle timer)
 public void Event_BombBeginDefuse(Event event, const char[] name, bool dontBroadcast)
 {
     int client = GetClientOfUserId(event.GetInt("userid"));
-    if (RetakeRolesEnabled() && IsCTBot(client))
+    if ((RetakeRolesEnabled() || RetakeRelayEnabled()) && IsCTBot(client))
     {
+        g_defuserUsingBomb = true;
         g_defuserUserId = GetClientUserId(client);
         g_defuserHandoffUntil = GetGameTime() + (GetEntProp(client, Prop_Send, "m_bHasDefuser") ? 5.5 : 10.5);
     }
@@ -837,10 +855,12 @@ public Action Timer_Update(Handle timer)
         bool firstClear = !g_retakeUnopposed;
         g_retakeUnopposed = true;
         if (g_phase == Phase_RetakeStage) PlanRetake(true);
-        if (firstClear && RetakeRolesEnabled()) SelectDefuser();
+        if (RetakeRelayEnabled()) ReviewDefuser();
+        else if (firstClear && RetakeRolesEnabled()) SelectDefuser();
         return Plugin_Continue;
     }
     g_retakeUnopposed = false;
+    if (g_phase == Phase_RetakeCommit && RetakeRelayEnabled()) ReviewDefuser();
     ReviewPairedPressure();
     ReleaseStalledOrders();
     float elapsed = GetGameTime() - g_phaseStarted;
@@ -1536,6 +1556,67 @@ void PlanRetake(bool commit)
     DebugLog(commit ? "CT retake committed to the bomb." : "CT retake staging on distinct approaches.");
 }
 
+bool RetakeRelayEnabled()
+{
+    return g_cvRetakeRelay.BoolValue && g_cvRetakeRoles.BoolValue && g_mapProfile >= 0
+        && NativeAvailable("NavMesh_BuildPath") && NativeAvailable("NavMeshArea_GetCostSoFar");
+}
+
+bool RetakeHasHumanCT()
+{
+    for (int i = 1; i <= MaxClients; i++)
+        if (IsClientInGame(i) && !IsFakeClient(i) && IsPlayerAlive(i) && GetClientTeam(i) == CS_TEAM_CT) return true;
+    return false;
+}
+
+void ReviewDefuser()
+{
+    float now = GetGameTime();
+    if (RetakeHasHumanCT())
+    {
+        g_defuserUserId = 0;
+        return;
+    }
+    if (now < g_nextDefuserReviewAt) return;
+    int bomb = EntRefToEntIndex(g_retakeBombRef);
+    if (bomb == INVALID_ENT_REFERENCE) return;
+    int candidate = GetClientOfUserId(g_defuserUserId);
+    if (IsCTBot(candidate))
+    {
+        if (HasEntProp(bomb, Prop_Send, "m_hBombDefuser")
+            && GetEntPropEnt(bomb, Prop_Send, "m_hBombDefuser") == candidate) return;
+        if (now < g_defuserHandoffUntil && (!g_defuserUsingBomb
+            || !HasEntProp(candidate, Prop_Send, "m_bIsDefusing")
+            || GetEntProp(candidate, Prop_Send, "m_bIsDefusing"))) return;
+    }
+    int previous = g_defuserUserId;
+    g_defuserUserId = 0;
+    g_defuserUsingBomb = false;
+    g_nextDefuserReviewAt = now + 1.5;
+    g_defuserRetiredUserId = previous;
+    SelectDefuser();
+    // A solo survivor still owns the chance to retry an interrupted defuse.
+    if (!g_defuserUserId && IsCTBot(candidate))
+    {
+        g_defuserRetiredUserId = 0;
+        SelectDefuser();
+    }
+    if (g_defuserUserId == 0) return;
+    candidate = GetClientOfUserId(g_defuserUserId);
+    if (!g_retakeUnopposed && g_hasOrder[candidate] && !g_combatReleased[candidate])
+    {
+        CopyVector(g_bombPosition, g_orderGoal[candidate]);
+        g_hasLook[candidate] = false;
+        g_orderRoute[candidate] = view_as<int>(Route_Fastest);
+        StartOrderProgress(candidate);
+    }
+    if (previous != 0 && previous != g_defuserUserId)
+    {
+        ExperienceSignal("defuser_handoff", "candidate_unavailable", RetakeSite(), candidate);
+        DebugLog("CT retake relay: %d -> %N.", previous, candidate);
+    }
+}
+
 bool RetakeRolesEnabled()
 {
     // Inferno, Mirage and Nuke in the shared profile order.
@@ -1630,8 +1711,7 @@ public int RetakeTravelCost(int area, int from, int ladder, any maxCost)
 void SelectDefuser()
 {
     // Leave native arbitration untouched if a human CT is present.
-    for (int i = 1; i <= MaxClients; i++)
-        if (IsClientInGame(i) && !IsFakeClient(i) && IsPlayerAlive(i) && GetClientTeam(i) == CS_TEAM_CT) return;
+    if (RetakeHasHumanCT()) return;
     int bomb = EntRefToEntIndex(g_retakeBombRef);
     int goal = NavMesh_GetNearestArea(g_bombPosition, false, 180.0, false, true, TEAM_ANY);
     if (bomb == INVALID_ENT_REFERENCE || goal < 0) return;
@@ -1640,7 +1720,9 @@ void SelectDefuser()
     int chosen;
     for (int client = 1; client <= MaxClients; client++)
     {
-        if (!IsCTBot(client)) continue;
+        if (!IsCTBot(client) || (RetakeRelayEnabled() && GetClientUserId(client) == g_defuserRetiredUserId)
+            || (RetakeRelayEnabled() && !g_retakeUnopposed
+            && (!g_hasOrder[client] || g_combatReleased[client]))) continue;
         float position[3];
         GetClientAbsOrigin(client, position);
         int start = NavMesh_GetNearestArea(position, false, 160.0, false, true, TEAM_ANY);
@@ -1652,7 +1734,8 @@ void SelectDefuser()
     }
     if (chosen == 0) return;
     g_defuserUserId = GetClientUserId(chosen);
-    g_defuserHandoffUntil = now + (best + 2.0 < 8.0 ? best + 2.0 : 8.0);
+    float travel = best - (GetEntProp(chosen, Prop_Send, "m_bHasDefuser") ? 5.0 : 10.0);
+    g_defuserHandoffUntil = RetakeRelayEnabled() ? now + travel + 2.5 : now + (best + 2.0 < 8.0 ? best + 2.0 : 8.0);
     DebugLog("CT retake lead %N estimated finish %.1f s", chosen, best);
 }
 
@@ -2423,6 +2506,9 @@ void ResetDirector()
     g_retakeBombRef = INVALID_ENT_REFERENCE;
     g_defuserUserId = 0;
     g_defuserHandoffUntil = 0.0;
+    g_nextDefuserReviewAt = 0.0;
+    g_defuserUsingBomb = false;
+    g_defuserRetiredUserId = 0;
     g_pressureReturnAt = 0.0;
 }
 

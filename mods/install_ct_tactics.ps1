@@ -1908,6 +1908,17 @@ if (-not $text.Contains('BEGIN TACTICAL_RECOVERY_DRIVE')) {
     $text = Replace-Once $text $old $block 'observe only actual tactical travel'
 }
 
+if (-not $text.Contains('BEGIN TACTICAL_PLANT_DRIVE_FIX')) {
+    $old = '&& GetTask(iClient) != PLANT_BOMB && GetTask(iClient) != DEFUSE_BOMB;'
+    $block = @(
+        '// BEGIN TACTICAL_PLANT_DRIVE_FIX',
+        '            && (GetTask(iClient) != PLANT_BOMB || bManagedPlantApproach)',
+        '            && GetTask(iClient) != DEFUSE_BOMB;',
+        '        // END TACTICAL_PLANT_DRIVE_FIX'
+    ) -join $newline
+    $text = Replace-Once $text $old $block 'watch a carrier traveling outside the plant zone, not a BOT executing a plant'
+}
+
 $candidateExperiencePlugin = Join-Path $buildDir "000_bot_tactical_experience.smx"
 
 try {

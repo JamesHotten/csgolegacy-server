@@ -14,6 +14,7 @@ native void NavMeshArea_GetPlaceCanonical(int area, char[] name, int length);
 
 public Plugin myinfo = {name = "Isolated objective sightline survey", version = "1.1"};
 ConVar g_on;
+ConVar g_endMap, g_seed;
 bool g_armed;
 int g_map, g_site, g_planter, g_bomb = INVALID_ENT_REFERENCE;
 float g_started;
@@ -35,6 +36,8 @@ static const float Plant[10][2][3] = {
 public void OnPluginStart()
 {
     g_on = CreateConVar("sm_objective_angle_survey", "0", "Only on isolated loopback server.");
+    g_endMap = CreateConVar("sm_objective_angle_end_map", "de_anubis", "Last map to inspect.");
+    g_seed = CreateConVar("sm_objective_angle_seed", "12015", "Use the same objective planning seed for geometry comparisons.");
     HookEvent("round_freeze_end", Start, EventHookMode_PostNoCopy);
 }
 
@@ -94,6 +97,7 @@ public void Start(Event event, const char[] name, bool noBroadcast)
 public Action Cover(Handle timer)
 {
     if (!Safe()) return Plugin_Stop;
+    SetRandomSeed(g_seed.IntValue + g_map * 10 + g_site);
     Measure("ct_open", true);
     g_planter = 0;
     for (int i = 1; i <= MaxClients; i++)
@@ -126,6 +130,7 @@ public Action Planted(Handle timer)
     SetEntProp(bomb, Prop_Send, "m_bBombTicking", 1);
     SetEntPropFloat(bomb, Prop_Send, "m_flC4Blow", GetGameTime() + 40.0);
     g_bomb = EntIndexToEntRef(bomb);
+    SetRandomSeed(g_seed.IntValue + 1200 + g_map * 10 + g_site);
     Event event = CreateEvent("bomb_planted");
     event.SetInt("userid", GetClientUserId(g_planter));
     event.Fire();
@@ -179,7 +184,9 @@ void NextSite()
 void NextMap()
 {
     g_armed = false;
-    if (g_map + 1 < sizeof(Maps)) ServerCommand("changelevel %s", Maps[g_map + 1]);
+    char last[32];
+    g_endMap.GetString(last, sizeof(last));
+    if (!StrEqual(Maps[g_map], last, false) && g_map + 1 < sizeof(Maps)) ServerCommand("changelevel %s", Maps[g_map + 1]);
     else PrintToServer("ANGLE_SURVEY_DONE");
 }
 
@@ -197,6 +204,8 @@ void Measure(const char[] phase, bool ct, int onlyRoute = -1)
 {
     int orders, aims, close, samples, offsetClose, named, namedMask;
     bool retakeWatch = StrEqual(phase, "t_cover") || StrEqual(phase, "t_postplant");
+    float holds[MAXPLAYERS + 1][3];
+    int pairs, overlapping, support;
     float minGoal = 99999.0, minOffset = 99999.0;
     for (int i = 1; i <= MaxClients; i++)
     {
@@ -205,6 +214,21 @@ void Measure(const char[] phase, bool ct, int onlyRoute = -1)
         bool got = ct ? BotCTTactics_GetOrder(i,goal,route) : BotTTactics_GetOrder(i,goal,route);
         if (!got || (onlyRoute != -1 && route != onlyRoute)) continue;
         orders++;
+        if (retakeWatch)
+        {
+            for (int peer = 1; peer < orders; peer++)
+            {
+                float spacing = GetVectorDistance(holds[peer], goal);
+                if (spacing < 115.0) overlapping++;
+                if (spacing < 115.0 || spacing > 500.0 || FloatAbs(holds[peer][2] - goal[2]) > 70.0) continue;
+                float eye[3], other[3];
+                eye = goal; eye[2] += 64.0;
+                other = holds[peer]; other[2] += 64.0;
+                if (WallDist(eye, other) < 0.0) support++;
+            }
+            holds[orders] = goal;
+            pairs += orders - 1;
+        }
         GetClientAbsOrigin(i, original);
         if (SafeFloor(goal, feet))
         {
@@ -228,7 +252,11 @@ void Measure(const char[] phase, bool ct, int onlyRoute = -1)
     }
     PrintToServer("ANGLE_SUMMARY map=%s site=%d phase=%s orders=%d aims=%d near=%d samples=%d offset_near=%d min=%.1f offset_min=%.1f",Maps[g_map],g_site,phase,orders,aims,close,samples,offsetClose,minGoal,minOffset);
     if (retakeWatch)
+    {
         PrintToServer("ENTRANCE_RESULT map=%s site=%d phase=%s assigned=%d lanes=%d", Maps[g_map],g_site,phase,named,namedMask);
+        PrintToServer("CROSSFIRE_GEOMETRY map=%s site=%d phase=%s pairs=%d overlaps=%d support=%d",
+            Maps[g_map], g_site, phase, pairs, overlapping, support);
+    }
 }
 bool SafeFloor(const float point[3], float feet[3])
 {

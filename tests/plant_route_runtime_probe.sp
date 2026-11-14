@@ -8,11 +8,23 @@ native bool BotTTactics_GetOrder(int client, float goal[3], int &route);
 native bool BotTTactics_ShouldHoldStage(int client);
 native int BotTTactics_GetAttackSite();
 native bool BotCTTactics_GetOrder(int client, float goal[3], int &route);
+native int BotTTactics_GetUtilityLane(int client);
 #include "../mods/include/bot_tactical_map_profiles.inc"
 
 public Plugin myinfo = {name = "Plant and retake route probe (isolated only)", version = "1.0"};
 ConVar g_enabled, g_targetB, g_surveyOnly, g_surveyAll, g_split, g_routeSeries, g_kit, g_stageOnly;
 ConVar g_clearDelay, g_alternateSites, g_stallProbe, g_utilityProbe, g_comboProbe, g_plantStallProbe;
+ConVar g_liveAll, g_replaceDefuser, g_enableContact, g_endMap, g_firstSite;
+int g_liveSite;
+float g_maxRetakeZ;
+float g_retakeStartZ[MAXPLAYERS + 1];
+bool g_advancePending;
+bool g_interference, g_casualty;
+int g_firstDefuser;
+int g_armedCombatDeaths;
+int g_stallSamples, g_nativeStallSamples, g_waitSamples;
+float g_lastCarrierSample[3];
+int g_guardReady, g_actualSite;
 bool g_armed, g_live, g_planted, g_completed;
 bool g_stageSeenLive, g_stageSummarized;
 float g_stageLastSample;
@@ -38,12 +50,17 @@ public void OnPluginStart()
     g_routeSeries = CreateConVar("sm_plant_route_probe_series", "0", "Run Inferno B, Mirage A and Nuke B, automatically.");
     g_kit = CreateConVar("sm_plant_route_probe_kit", "1", "Give test CTs a defuse kit.");
     g_stageOnly = CreateConVar("sm_plant_route_probe_stage_only", "0", "Measure staging only, before testing actual retakes.");
-    g_clearDelay = CreateConVar("sm_plant_route_probe_clear_delay", "0.0", "Delay clearing frozen test opponents after plant.", _, true, 0.0, true, 10.0);
+    g_clearDelay = CreateConVar("sm_plant_route_probe_clear_delay", "0.0", "Delay clearing test opponents after plant.", _, true, 0.0, true, 30.0);
     g_alternateSites = CreateConVar("sm_plant_route_probe_alternate_sites", "0", "Test Mirage B and Nuke A instead of Mirage A and Nuke B.");
     g_stallProbe = CreateConVar("sm_plant_route_probe_stall", "0", "Freeze the advancing carrier and check one local retry (test only).");
     g_utilityProbe = CreateConVar("sm_plant_route_probe_utility", "0", "Give the test bots smoke and flash for actual opening throws.");
     g_comboProbe = CreateConVar("sm_plant_route_probe_combos", "0", "Exercise optional CT/T opening variants on Mirage.");
     g_plantStallProbe = CreateConVar("sm_plant_route_probe_plant_stall", "0", "Freeze only the carrier immediately after attack commit and verify native handoff.");
+    g_liveAll = CreateConVar("sm_plant_route_probe_live_all", "0", "Run real plant/retake cases on both sites of all ten maps.");
+    g_replaceDefuser = CreateConVar("sm_plant_route_probe_replace_defuser", "0", "Remove the first BOT that actually starts defusing; isolated only.");
+    g_enableContact = CreateConVar("sm_plant_route_probe_contact", "0", "Allow an armed retake after the plant; isolated only.");
+    g_endMap = CreateConVar("sm_plant_route_probe_end_map", "de_anubis", "Last map in this shard of the live matrix.");
+    g_firstSite = CreateConVar("sm_plant_route_probe_first_site", "0", "Start at B on the initial map of a diagnostic shard.", _, true, 0.0, true, 1.0);
     HookEvent("round_freeze_end", FreezeEnd, EventHookMode_PostNoCopy);
     HookEvent("bomb_beginplant", ObjectiveEvent, EventHookMode_Post);
     HookEvent("bomb_planted", ObjectiveEvent, EventHookMode_Post);
@@ -52,12 +69,16 @@ public void OnPluginStart()
     HookEvent("round_end", RoundResult, EventHookMode_Post);
     HookEvent("smokegrenade_detonate", UtilityDetonated, EventHookMode_Post);
     HookEvent("flashbang_detonate", UtilityDetonated, EventHookMode_Post);
+    HookEvent("player_death", LiveCaseDeath, EventHookMode_Post);
 }
 
 public void OnMapStart()
 {
     g_carrier = g_ct = 0;
     g_live = g_planted = g_completed = false;
+    g_armed = false;
+    g_liveSite = 0;
+    g_advancePending = false;
     if (g_surveyAll.BoolValue) g_targetB.BoolValue = false;
     if (g_routeSeries.BoolValue)
     {
@@ -81,6 +102,7 @@ bool Safe()
 public Action Prepare(Handle timer)
 {
     if (!Safe()) return Plugin_Stop;
+    if (g_liveAll.BoolValue && !g_live) g_liveSite = g_firstSite.IntValue;
     ServerCommand("sv_cheats 1; bot_dont_shoot 1; mp_autoteambalance 0; mp_limitteams 0; mp_freezetime 3; mp_roundtime_defuse 1.92; mp_ignore_round_win_conditions 1; mp_c4timer 40");
     ServerCommand("bot_join_after_player 0; bot_quota_mode normal; bot_quota 0; bot_kick");
     ServerExecute();
@@ -88,12 +110,20 @@ public Action Prepare(Handle timer)
     ServerExecute();
     g_armed = true;
     ServerCommand("mp_warmup_end; mp_restartgame 1");
+    if (g_liveAll.BoolValue) CreateTimer(4.0, EnsureLiveRound, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
     return Plugin_Stop;
+}
+
+public Action EnsureLiveRound(Handle timer)
+{
+    if (!Safe() || !g_armed) return Plugin_Stop;
+    if (GameRules_GetProp("m_bWarmupPeriod")) ServerCommand("mp_warmup_end; mp_restartgame 1");
+    return Plugin_Continue;
 }
 
 public void FreezeEnd(Event event, const char[] name, bool dontBroadcast)
 {
-    if (!g_armed || !Safe()) return;
+    if (!g_armed || !Safe() || (g_liveAll.BoolValue && GameRules_GetProp("m_bWarmupPeriod"))) return;
     g_armed = false;
     RequestFrame(Begin);
 }
@@ -101,6 +131,25 @@ public void FreezeEnd(Event event, const char[] name, bool dontBroadcast)
 public void Begin(any unused)
 {
     if (!Safe()) return;
+    if (g_liveAll.BoolValue)
+    {
+        // This matrix measures each designated site. Mid-round rotation is
+        // a separate behavior and must not turn a valid B finish into A evidence.
+        FindConVar("sm_bot_t_mid_rotate_enable").BoolValue = false;
+        g_targetB.BoolValue = g_liveSite == 1;
+        g_carrier = g_ct = 0;
+        g_planted = g_completed = g_interference = g_casualty = false;
+        g_advancePending = false;
+        g_guardReady = 0;
+        g_actualSite = -1;
+        g_firstDefuser = 0;
+        g_armedCombatDeaths = 0;
+        g_stallSamples = g_nativeStallSamples = g_waitSamples = 0;
+        g_maxRetakeZ = 0.0;
+        char map[64];
+        GetCurrentMap(map, sizeof(map));
+        PrintToServer("LIVE_CASE_BEGIN map=%s site=%s", map, g_liveSite == 0 ? "A" : "B");
+    }
     int manager = FindEntityByClassname(-1, "cs_player_manager");
     GetEntPropVector(manager, Prop_Send, "m_bombsiteCenterA", g_siteA);
     GetEntPropVector(manager, Prop_Send, "m_bombsiteCenterB", g_siteB);
@@ -109,7 +158,19 @@ public void Begin(any unused)
         if (!IsClientInGame(i) || !IsPlayerAlive(i)) continue;
         if (GetClientTeam(i) == CS_TEAM_T && GetPlayerWeaponSlot(i, CS_SLOT_C4) > MaxClients) g_carrier = i;
         if (GetClientTeam(i) == CS_TEAM_CT && g_ct == 0) g_ct = i;
-        if (GetClientTeam(i) == CS_TEAM_CT && !g_comboProbe.BoolValue) SetEntityMoveType(i, MOVETYPE_NONE);
+        if (GetClientTeam(i) == CS_TEAM_CT && !g_comboProbe.BoolValue)
+        {
+            if (g_liveAll.BoolValue)
+            {
+                // On maps like Overpass the CT spawns are inside A. Park the
+                // test team outside both sites so frozen bodies do not block
+                // plant travel and CTs actually have a return route to run.
+                char map[32];
+                GetCurrentMap(map, sizeof(map));
+                if (StrEqual(map, "de_overpass", false) && g_liveSite == 0) ParkOverpassCT(i);
+            }
+            SetEntityMoveType(i, MOVETYPE_NONE);
+        }
         if (g_utilityProbe.BoolValue && GetClientTeam(i) == CS_TEAM_T)
         {
             GivePlayerItem(i, "weapon_smokegrenade");
@@ -150,6 +211,7 @@ public void Begin(any unused)
     g_stageSeenLive = g_stageSummarized = g_carrierStageReady = false;
     g_stageLastSample = 0.0;
     g_stageReady = g_stageOrdered = 0;
+    GetClientAbsOrigin(g_carrier, g_lastCarrierSample);
     for (int i = 1; i <= MaxClients; i++) g_stageHasGoal[i] = false;
     if (g_surveyOnly.BoolValue)
     {
@@ -166,13 +228,51 @@ public void Begin(any unused)
             CreateTimer(0.2, StartStallProbe, _, TIMER_FLAG_NO_MAPCHANGE);
             return;
         }
+        if (g_utilityProbe.BoolValue && GetFeatureStatus(FeatureType_Native, "BotTTactics_GetUtilityLane") == FeatureStatus_Available)
+        {
+            char map[32];
+            GetCurrentMap(map, sizeof(map));
+            if (StrEqual(map, "de_mirage", false))
+            {
+                int routeCounts[4];
+                for (int i = 1; i <= MaxClients; i++)
+                {
+                    int lane = BotTTactics_GetUtilityLane(i);
+                    if (lane >= 0 && lane < sizeof(routeCounts)) routeCounts[lane]++;
+                }
+                PrintToServer("MIRAGE_UTILITY_ROUTES site=%s carrier=%d a=%d b=%d mid=%d",
+                    g_targetB.BoolValue ? "B" : "A", BotTTactics_GetUtilityLane(g_carrier), routeCounts[1], routeCounts[2], routeCounts[3]);
+            }
+        }
         CreateTimer(0.2, ObserveStage, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
         if (!g_stageOnly.BoolValue) CreateTimer(2.0, Observe, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
     }
 }
 
+void ParkOverpassCT(int client)
+{
+    // Lower level, out of sight of the A approach; CT must route back up.
+    float pos[3] = {-1100.0, 50.0, 98.0};
+    pos[1] += float(client % 5) * 40.0;
+    float end[3];
+    end = pos;
+    pos[2] += 90.0;
+    end[2] -= 100.0;
+    Handle trace = TR_TraceRayFilterEx(pos, end, MASK_PLAYERSOLID_BRUSHONLY, RayType_EndPoint, LiveWorldTrace);
+    if (TR_DidHit(trace) && !TR_StartSolid(trace))
+    {
+        TR_GetEndPosition(pos, trace);
+        pos[2] += 2.0;
+        TeleportEntity(client, pos, NULL_VECTOR, NULL_VECTOR);
+    }
+    delete trace;
+}
+
+public bool LiveWorldTrace(int entity, int mask, any data) { return entity > MaxClients; }
+
 public void UtilityDetonated(Event event, const char[] name, bool dontBroadcast)
 {
+    if (Safe() && g_live && g_liveAll.BoolValue) g_interference = true;
     if (Safe() && g_live && g_utilityProbe.BoolValue)
         PrintToServer("MIRAGE_UTILITY actual=%s bot=%d xyz=%.0f %.0f %.0f", name, GetClientOfUserId(event.GetInt("userid")),
             event.GetFloat("x"), event.GetFloat("y"), event.GetFloat("z"));
@@ -291,6 +391,7 @@ public Action CheckPlantHandoff(Handle timer, int userId)
 public APLRes AskPluginLoad2(Handle plugin, bool late, char[] error, int length)
 {
     MarkNativeAsOptional("BotTTactics_GetAttackSite");
+    MarkNativeAsOptional("BotTTactics_GetUtilityLane");
     return APLRes_Success;
 }
 
@@ -340,6 +441,7 @@ public Action Survey(Handle timer)
 public Action Observe(Handle timer)
 {
     if (!Safe() || !g_live || g_completed) return Plugin_Stop;
+    if (!IsClientInGame(g_carrier)) return Plugin_Stop;
     float pos[3], goal[3];
     int route, ready, ordered;
     GetClientAbsOrigin(g_carrier, pos);
@@ -362,16 +464,27 @@ public Action Observe(Handle timer)
         if (g_planted && GetClientTeam(i) == CS_TEAM_CT)
         {
             GetClientAbsOrigin(i, where);
+            if (g_liveAll.BoolValue && FloatAbs(where[2] - g_retakeStartZ[i]) > g_maxRetakeZ)
+                g_maxRetakeZ = FloatAbs(where[2] - g_retakeStartZ[i]);
             PrintToServer("RETAKE_TRAVEL t=%.1f ct=%d pos=%.0f %.0f %.0f move=%d", GetGameTime()-g_plantedAt,
                 i, where[0],where[1],where[2],GetEntityMoveType(i));
         }
     }
+    if (g_planted && ready > g_guardReady) g_guardReady = ready;
+    if (g_liveAll.BoolValue && !g_planted && GetVectorDistance(g_lastCarrierSample, pos) < 42.0)
+    {
+        if (BotTTactics_ShouldHoldStage(g_carrier) && order && GetVectorDistance(pos, goal) <= 180.0) g_waitSamples++;
+        else if (order) g_stallSamples++;
+        else if (!GetEntProp(g_carrier, Prop_Send, "m_bInBombZone")) g_nativeStallSamples++;
+    }
+    g_lastCarrierSample = pos;
     PrintToServer("PLANT_TRAVEL t=%.1f stage=%d ready=%d/%d origin=%.0f %.0f %.0f goal=%.0f %.0f %.0f order=%d zone=%d",
         GetGameTime() - g_start, BotTTactics_ShouldHoldStage(g_carrier), ready, ordered,
         pos[0], pos[1], pos[2], goal[0], goal[1], goal[2], order, GetEntProp(g_carrier, Prop_Send, "m_bInBombZone"));
-    if ((!g_planted && GetGameTime() - g_start > 60.0) || (g_planted && GetGameTime() - g_plantedAt > 42.0))
+    if ((!g_planted && GetGameTime() - g_start > (g_liveAll.BoolValue ? 115.0 : 60.0)) || (g_planted && GetGameTime() - g_plantedAt > 42.0))
     {
         PrintToServer("PLANT_ROUTE_FAIL planted=%d stage=%d commit=%d", g_planted, g_stageSeen, g_commitSeen);
+        if (g_liveAll.BoolValue) FinishLiveCase(g_planted ? "no_defuse" : "no_plant", 0, 0);
         NextRouteCase();
         return Plugin_Stop;
     }
@@ -387,21 +500,39 @@ public void ObjectiveEvent(Event event, const char[] name, bool dontBroadcast)
     {
         g_planted = true;
         g_plantedAt = GetGameTime();
+        float pos[3];
+        if (client > 0 && IsClientInGame(client))
+        {
+            GetClientAbsOrigin(client, pos);
+            g_actualSite = GetVectorDistance(pos, g_siteA) <= GetVectorDistance(pos, g_siteB) ? 0 : 1;
+        }
         // CT starts at spawn and runs the engine's actual return route. Keep
         // the non-shooting opponents for an optional window of real staging.
         for (int i = 1; i <= MaxClients; i++)
             if (IsClientInGame(i) && IsPlayerAlive(i))
             {
-                if (GetClientTeam(i) == CS_TEAM_T && g_clearDelay.FloatValue > 0.0) SetEntityMoveType(i, MOVETYPE_NONE);
+                if (GetClientTeam(i) == CS_TEAM_T && g_clearDelay.FloatValue > 0.0 && !g_liveAll.BoolValue) SetEntityMoveType(i, MOVETYPE_NONE);
                 else if (GetClientTeam(i) == CS_TEAM_CT)
                 {
                     SetEntityMoveType(i, MOVETYPE_WALK);
                     SetEntProp(i, Prop_Send, "m_bHasDefuser", g_kit.BoolValue ? 1 : 0);
+                    float start[3]; GetClientAbsOrigin(i, start);
+                    g_retakeStartZ[i] = start[2];
                 }
             }
         if (g_clearDelay.FloatValue > 0.0)
             CreateTimer(g_clearDelay.FloatValue, ClearTestAttackers, _, TIMER_FLAG_NO_MAPCHANGE);
         else ClearTestAttackers(null);
+        if (g_enableContact.BoolValue)
+        {
+            FindConVar("bot_dont_shoot").BoolValue = false;
+            PrintToServer("LIVE_RETAKE_CONTACT");
+        }
+    }
+    if (StrEqual(name, "bomb_begindefuse") && client > 0 && g_replaceDefuser.BoolValue && g_firstDefuser == 0)
+    {
+        g_firstDefuser = GetClientUserId(client);
+        CreateTimer(0.15, RemoveFirstDefuser, g_firstDefuser, TIMER_FLAG_NO_MAPCHANGE);
     }
     if (StrEqual(name, "bomb_defused"))
     {
@@ -410,8 +541,20 @@ public void ObjectiveEvent(Event event, const char[] name, bool dontBroadcast)
         GetCurrentMap(map, sizeof(map));
         PrintToServer("PLANT_ROUTE_PASS map=%s plant_to_defuse=%.2f stage_samples=%d commit_samples=%d",
             map, GetGameTime() - g_plantedAt, g_stageSeen, g_commitSeen);
+        if (g_replaceDefuser.BoolValue)
+            PrintToServer("LIVE_DEFUSER_REPLACEMENT_%s first=%d final=%d",
+                g_firstDefuser != 0 && client > 0 && GetClientUserId(client) != g_firstDefuser ? "PASS" : "FAIL",
+                g_firstDefuser, client > 0 ? GetClientUserId(client) : 0);
         NextRouteCase();
     }
+}
+
+public Action RemoveFirstDefuser(Handle timer, int userid)
+{
+    if (!Safe() || !g_live || !g_planted || g_completed) return Plugin_Stop;
+    int client = GetClientOfUserId(userid);
+    if (client > 0 && IsPlayerAlive(client)) ForcePlayerSuicide(client);
+    return Plugin_Stop;
 }
 
 public Action ClearTestAttackers(Handle timer)
@@ -426,15 +569,65 @@ public Action ClearTestAttackers(Handle timer)
 
 public void RoundResult(Event event, const char[] name, bool dontBroadcast)
 {
-    if (!Safe() || !g_live || !g_planted) return;
+    if (!Safe() || !g_live || (!g_planted && !g_liveAll.BoolValue)) return;
     char map[64];
     GetCurrentMap(map, sizeof(map));
     PrintToServer("RETAKE_ROUND map=%s winner=%d reason=%d", map, event.GetInt("winner"), event.GetInt("reason"));
+    if (g_liveAll.BoolValue)
+        FinishLiveCase(!g_planted ? "no_plant" : (event.GetInt("reason") != 7 ? "round_ended" : (g_actualSite == g_liveSite ? "defused" : "wrong_site")),
+            event.GetInt("winner"), event.GetInt("reason"));
+}
+
+public void LiveCaseDeath(Event event, const char[] name, bool dontBroadcast)
+{
+    if (!g_liveAll.BoolValue || !g_live || !g_planted || !Safe()) return;
+    g_casualty = true;
+    int victim = GetClientOfUserId(event.GetInt("userid"));
+    int attacker = GetClientOfUserId(event.GetInt("attacker"));
+    if (victim > 0 && attacker > 0 && victim != attacker && GetClientTeam(victim) != GetClientTeam(attacker))
+        g_armedCombatDeaths++;
+}
+
+void FinishLiveCase(const char[] outcome, int winner, int reason)
+{
+    if (g_advancePending) return;
+    g_advancePending = true;
+    g_completed = true;
+    g_live = false;
+    char map[64];
+    GetCurrentMap(map, sizeof(map));
+    PrintToServer("LIVE_CASE_RESULT map=%s site=%s actual=%d outcome=%s winner=%d reason=%d guard_ready=%d retake_stage=%d retake_push=%d z_delta=%.0f casualty=%d utility=%d",
+        map, g_liveSite == 0 ? "A" : "B", g_actualSite, outcome, winner, reason, g_guardReady, g_stageSeen, g_commitSeen, g_maxRetakeZ, g_casualty, g_interference);
+    PrintToServer("LIVE_CASE_MOTION map=%s site=%s waiting=%d ordered_stalls=%d native_stalls=%d",
+        map, g_liveSite == 0 ? "A" : "B", g_waitSamples, g_stallSamples, g_nativeStallSamples);
+    if (g_enableContact.BoolValue) PrintToServer("LIVE_CASE_CONTACT enemy_kills=%d", g_armedCombatDeaths);
+    CreateTimer(1.5, AdvanceLiveCase, _, TIMER_FLAG_NO_MAPCHANGE);
+}
+
+public Action AdvanceLiveCase(Handle timer)
+{
+    if (!Safe()) return Plugin_Stop;
+    if (g_liveSite == 0)
+    {
+        g_liveSite = 1;
+        g_armed = true;
+        ServerCommand("bot_dont_shoot 1; mp_ignore_round_win_conditions 1; mp_restartgame 1");
+        CreateTimer(4.0, EnsureLiveRound, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+        return Plugin_Stop;
+    }
+    char map[64], next[64], last[64];
+    GetCurrentMap(map, sizeof(map));
+    g_endMap.GetString(last, sizeof(last));
+    g_firstSite.IntValue = 0;
+    if (!StrEqual(map, last, false) && TacticalMap_GetName(TacticalMap_Find(map) + 1, next, sizeof(next)))
+        ForceChangeLevel(next, "isolated live regression");
+    else PrintToServer("\nLIVE_CASE_SUITE_DONE");
+    return Plugin_Stop;
 }
 
 void NextRouteCase()
 {
-    if (!g_routeSeries.BoolValue) return;
+    if (g_liveAll.BoolValue || !g_routeSeries.BoolValue) return;
     g_completed = true;
     char map[64];
     GetCurrentMap(map, sizeof(map));

@@ -6,7 +6,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.7"
+#define PLUGIN_VERSION "0.1.8"
 #define MAX_CANDIDATES 256
 #define TEAM_ANY -2
 
@@ -14,6 +14,7 @@ native bool NavMesh_Exists();
 native int NavMesh_GetNearestArea(const float pos[3], bool anyZ=false, float maxDist=10000.0, bool checkLOS=false, bool checkGround=true, int team=TEAM_ANY);
 native void NavMesh_CollectSurroundingAreas(ArrayStack stack, int startArea, float travelDistLimit=1500.0, float maxStepUpLimit=18.0, float maxDropDownLimit=100.0);
 native bool NavMeshArea_GetCenter(int areaIndex, float buffer[3]);
+native void NavMeshArea_GetClosestPointOnArea(int areaIndex, const float pos[3], float buffer[3]);
 native void NavMeshArea_GetHidingSpots(ArrayStack stack, int areaIndex);
 native void NavHidingSpot_GetPosition(int hidingSpotIndex, float buffer[3]);
 native void NavMeshArea_GetPlaceCanonical(int areaIndex, char[] buffer, int maxlen);
@@ -147,6 +148,8 @@ float g_orderLastPosition[MAXPLAYERS + 1][3];
 float g_orderLastProgressAt[MAXPLAYERS + 1];
 bool g_orderArrived[MAXPLAYERS + 1];
 bool g_orderStallReported[MAXPLAYERS + 1];
+float g_plantBestDistance, g_plantBestAt;
+int g_plantProgressUserId;
 
 float g_candidates[MAX_CANDIDATES][3];
 int g_candidateCount;
@@ -172,6 +175,7 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     MarkNativeAsOptional("NavMeshArea_GetHidingSpots");
     MarkNativeAsOptional("NavHidingSpot_GetPosition");
     MarkNativeAsOptional("NavMeshArea_GetPlaceCanonical");
+    MarkNativeAsOptional("NavMeshArea_GetClosestPointOnArea");
     MarkNativeAsOptional("NavMeshArea_GetCostSoFar");
     MarkNativeAsOptional("NavMesh_WorldToGridX");
     MarkNativeAsOptional("NavMesh_WorldToGridY");
@@ -441,15 +445,16 @@ public any Native_GetUtilityLane(Handle plugin, int numParams)
     if (g_phase != TPhase_AttackStage) return -1;
     if (GetPlayerWeaponSlot(client, CS_SLOT_C4) > MaxClients) return 0; // Keep C4 on the staging route.
     if (g_fakeBot[client]) return g_attackA ? 2 : 1;
-    if (g_attackA) return 1;
     if (g_utilityOrderLane[client] > 0) return g_utilityOrderLane[client];
-    g_utilityOrderLane[client] = 2;
+    g_utilityOrderLane[client] = g_attackA ? 1 : 2;
     if (NativeAvailable("NavMeshArea_GetPlaceCanonical") && NativeAvailable("NavMesh_GetNearestArea"))
     {
         int area = NavMesh_GetNearestArea(g_orderGoal[client], false, 160.0, false, true, TEAM_ANY);
         char place[32];
         if (area >= 0) NavMeshArea_GetPlaceCanonical(area, place, sizeof(place));
-        if (StrEqual(place, "Catwalk", false)) g_utilityOrderLane[client] = 3;
+        if (StrEqual(place, "Catwalk", false) || StrEqual(place, "TopofMid", false)
+            || StrEqual(place, "Middle", false) || StrEqual(place, "Connector", false))
+            g_utilityOrderLane[client] = 3;
     }
     return g_utilityOrderLane[client];
 }
@@ -839,6 +844,7 @@ void PlanPlantCover(int planter, const float position[3])
     g_targetCount = 0;
     BuildAround(position, count, 180.0, 560.0, false, 0.0, 0.0);
     FillMissingTargetsAt(count, position);
+    EnsureObjectiveEntrance(position, false);
     ClearCombatReleases();
     AssignTargets(bots, count, Route_Safest, 0, count, true);
     g_phase = TPhase_PlantCover;
@@ -1220,6 +1226,7 @@ void PlanAttackCommit()
 void AppendPlantTarget(const float site[3], int carrier)
 {
     g_plantOrderClient = 0;
+    g_plantProgressUserId = 0;
     if (!g_cvSafePlant.BoolValue || !IsTBot(carrier))
     { AppendProjectedTarget(site); return; }
 
@@ -1318,6 +1325,21 @@ bool FindTriggerPlantGoal(const float site[3], int carrier, float goal[3])
     return best < 999999.0;
 }
 
+bool HasStalledPlantApproach(int client, float distance, float now)
+{
+    int userId = GetClientUserId(client);
+    if (g_plantProgressUserId != userId || distance < g_plantBestDistance - 85.0)
+    {
+        g_plantProgressUserId = userId;
+        g_plantBestDistance = distance;
+        g_plantBestAt = now;
+    }
+    // Count a genuinely stalled approach, not navigation detours far away
+    // from the site. This catches tight circles where displacement alone
+    // can otherwise reset the ordinary anti-stall timer indefinitely.
+    return distance < 1050.0 && now - g_plantBestAt >= 11.0;
+}
+
 bool PlantPointIsClear(const float point[3], ArrayList zones, bool allowFringe = true)
 {
     float foot[3], head[3], mins[3] = {-16.0,-16.0,0.0}, maxs[3] = {16.0,16.0,72.0};
@@ -1383,8 +1405,11 @@ void PlanPostPlant()
     g_targetCount = 0;
     if (g_cvPostPlantSectors.BoolValue && (g_routeRetryMap || (g_cvObjectiveWatch.BoolValue && g_mapProfile >= 0)))
         BuildAround(g_bombPosition, 1, 145.0, 235.0, false, 0.0, 0.0);
+    if (g_targetCount < count) AddDust2PostPlantEntrance(g_bombPosition);
     BuildAround(g_bombPosition, count - g_targetCount, 220.0, 720.0, false, 0.0, 0.0);
     FillMissingTargetsAt(count, g_bombPosition);
+    EnsureObjectiveEntrance(g_bombPosition, true);
+    SeparatePostPlantCover();
     AssignTargets(bots, count, Route_Safest, 0, count, true);
     g_phase = TPhase_PostPlant;
     AssignObjectiveWatch(g_bombPosition, true);
@@ -1470,13 +1495,136 @@ void AssignObjectiveWatch(const float objective[3], bool planted)
     if (!g_cvObjectiveWatch.BoolValue || g_mapProfile < 0) return;
     int site = GetVectorDistance(objective, g_siteA) <= GetVectorDistance(objective, g_siteB) ? 0 : 1;
     ArrayList lanes = ObjectiveWatch_Collect(g_mapProfile, site, true, objective);
-    int used;
+    int used, remaining[MAXPLAYERS + 1];
     for (int client = 1; client <= MaxClients; client++)
     {
         if (!g_hasOrder[client] || !g_hasLook[client] || (planted && g_objectiveNamed[client])) continue;
-        g_objectiveNamed[client] = ObjectiveWatch_Select(lanes, g_orderGoal[client], used, g_orderLook[client]);
+        remaining[client] = ObjectiveWatch_Available(lanes, g_orderGoal[client]);
+    }
+    // Give the BOT with only one viable entrance first choice; a flexible
+    // teammate can then cover a second entrance instead of duplicating it.
+    for (int room = 1; room <= 3; room++)
+        for (int client = 1; client <= MaxClients; client++)
+            if (remaining[client] == room)
+                g_objectiveNamed[client] = ObjectiveWatch_Select(lanes, g_orderGoal[client], used, g_orderLook[client]);
+    delete lanes;
+}
+
+bool AddDust2PostPlantEntrance(const float bomb[3])
+{
+    if (!g_cvObjectiveWatch.BoolValue || g_mapProfile != 4
+        || GetVectorDistance(bomb, g_siteA) > GetVectorDistance(bomb, g_siteB)) return false;
+    int start = NavMesh_GetNearestArea(bomb, false, 140.0, false, true, TEAM_ANY);
+    if (start < 0) return false;
+    ArrayList lanes = ObjectiveWatch_Collect(g_mapProfile, 0, true, bomb);
+    ArrayStack holds = new ArrayStack();
+    NavMesh_CollectSurroundingAreas(holds, start, 500.0, 24.0, 65.0);
+    float best = 99999.0, result[3];
+    int budget = 35;
+    while (!holds.Empty && budget > 0)
+    {
+        float point[3], look[3];
+        if (!NavMeshArea_GetCenter(holds.Pop(), point)) continue;
+        float range = GetVectorDistance(point, bomb);
+        if (range < 210.0 || range > 480.0 || FloatAbs(point[2] - bomb[2]) > 75.0
+            || range >= best || !StageHullFits(point)) continue;
+        if (g_targetCount > 0 && GetVectorDistance(g_targets[0], point) < 155.0) continue;
+        budget--;
+        int used;
+        if (!ObjectiveWatch_Select(lanes, point, used, look)) continue;
+        best = range;
+        CopyVector(point, result);
     }
     delete lanes;
+    delete holds;
+    if (best == 99999.0) return false;
+    AppendTarget(result);
+    return true;
+}
+
+void EnsureObjectiveEntrance(const float objective[3], bool planted)
+{
+    if (!g_cvObjectiveWatch.BoolValue || g_mapProfile < 0 || g_targetCount <= (planted ? 1 : 0)) return;
+    int site = GetVectorDistance(objective, g_siteA) <= GetVectorDistance(objective, g_siteB) ? 0 : 1;
+    ArrayList lanes = ObjectiveWatch_Collect(g_mapProfile, site, true, objective);
+    int first = planted ? 1 : 0;
+    for (int slot = first; slot < g_targetCount; slot++)
+    {
+        if (ObjectiveWatch_Available(lanes, g_targets[slot]) == 0) continue;
+        delete lanes;
+        return;
+    }
+    int budget = 36, replace = -1;
+    float nearest = 99999.0, selected[3];
+    // Existing orders may all contain safe but irrelevant angles. Relocate
+    // at most one non-bomb slot, within its original lane and floor.
+    for (int slot = first; slot < g_targetCount && budget > 0; slot++)
+    {
+        int area = NavMesh_GetNearestArea(g_targets[slot], false, 100.0, false, true, TEAM_ANY);
+        if (area < 0) continue;
+        ArrayStack offsets = new ArrayStack();
+        NavMesh_CollectSurroundingAreas(offsets, area, 280.0, 22.0, 38.0);
+        while (!offsets.Empty && budget > 0)
+        {
+            float point[3];
+            if (!NavMeshArea_GetCenter(offsets.Pop(), point)) continue;
+            float step = GetVectorDistance(point, g_targets[slot]);
+            float range = GetVectorDistance(point, objective);
+            if (step < 45.0 || step > 240.0 || step >= nearest || FloatAbs(point[2] - g_targets[slot][2]) > 42.0
+                || range < 150.0 || range > 790.0 || !StageHullFits(point)) continue;
+            bool spaced = true;
+            for (int peer = 0; peer < g_targetCount; peer++)
+                if (peer != slot && GetVectorDistance(point, g_targets[peer]) < 125.0) { spaced = false; break; }
+            if (!spaced) continue;
+            budget--;
+            if (ObjectiveWatch_Available(lanes, point) == 0) continue;
+            nearest = step;
+            replace = slot;
+            CopyVector(point, selected);
+        }
+        delete offsets;
+    }
+    if (replace < 0)
+    {
+        // If the existing slots are in separate occluded pockets, consider
+        // one position connected to the objective itself. Verify the route
+        // back to the bomb so a one-way ledge is not chosen for cover.
+        int origin = NavMesh_GetNearestArea(objective, false, 150.0, false, true, TEAM_ANY);
+        if (origin >= 0 && NativeAvailable("NavMesh_BuildPath") && NativeAvailable("NavMeshArea_GetCostSoFar"))
+        {
+            ArrayStack positions = new ArrayStack();
+            NavMesh_CollectSurroundingAreas(positions, origin, 780.0, 24.0, 55.0);
+            int checks = 36;
+            while (!positions.Empty && checks > 0)
+            {
+                int area = positions.Pop();
+                float point[3];
+                if (!NavMeshArea_GetCenter(area, point)) continue;
+                float distance = GetVectorDistance(point, objective);
+                if (distance < 180.0 || distance > 650.0 || FloatAbs(point[2] - objective[2]) > 88.0 || !StageHullFits(point)) continue;
+                int slot = -1;
+                float step = nearest;
+                bool spaced = true;
+                for (int peer = 0; peer < g_targetCount; peer++)
+                {
+                    float offset = GetVectorDistance(point, g_targets[peer]);
+                    if (offset < 125.0) { spaced = false; break; }
+                    if (peer >= first && offset < step) { step = offset; slot = peer; }
+                }
+                if (!spaced || slot < 0 || step > 540.0) continue;
+                checks--;
+                if (ObjectiveWatch_Available(lanes, point) == 0) continue;
+                int closest;
+                if (!NavMesh_BuildPath(area, origin, objective, TMap_TravelCost, 1100, closest, 0.0, 0.0)) continue;
+                nearest = step;
+                replace = slot;
+                CopyVector(point, selected);
+            }
+            delete positions;
+        }
+    }
+    delete lanes;
+    if (replace >= 0) CopyVector(selected, g_targets[replace]);
 }
 
 void BuildAround(const float origin[3], int wanted, float minRadius, float maxRadius, bool directional, float dirX, float dirY)
@@ -1507,6 +1655,78 @@ void BuildAround(const float origin[3], int wanted, float minRadius, float maxRa
             AppendProjectedTarget(fallback);
         }
     }
+}
+
+// Favor a second angle over a second player on the same firing line when
+// constructing post-plant cover. Never move the carrier or the bomb watch.
+void SeparatePostPlantCover()
+{
+    if (!g_cvObjectiveWatch.BoolValue || g_mapProfile < 0) return;
+    int site = GetVectorDistance(g_bombPosition, g_siteA) <= GetVectorDistance(g_bombPosition, g_siteB) ? 0 : 1;
+    ArrayList lanes = ObjectiveWatch_Collect(g_mapProfile, site, true, g_bombPosition);
+    int budget = 96;
+    for (int slot = 1; slot < g_targetCount; slot++)
+    {
+        bool overlaps;
+        for (int peer = 0; peer < g_targetCount; peer++)
+            if (slot != peer)
+            if (GetVectorDistance(g_targets[peer], g_targets[slot]) < 115.0) overlaps = true;
+        int currentLinks = CoverLinks(slot, g_targets[slot]);
+        if (!overlaps && currentLinks >= 3) continue;
+        int currentEntrances = ObjectiveWatch_Available(lanes, g_targets[slot]);
+        int area = NavMesh_GetNearestArea(g_targets[slot], false, 110.0, false, true, TEAM_ANY);
+        if (area < 0) continue;
+        ArrayStack nearby = new ArrayStack();
+        NavMesh_CollectSurroundingAreas(nearby, area, 360.0, 24.0, 42.0);
+        float best = 99999.0, chosen[3];
+        int bestLinks = currentLinks;
+        while (!nearby.Empty && budget > 0)
+        {
+            float point[3];
+            if (!NavMeshArea_GetCenter(nearby.Pop(), point) || !StageHullFits(point)) continue;
+            float offset = GetVectorDistance(point, g_targets[slot]);
+            float bombRange = GetVectorDistance(point, g_bombPosition);
+            if (offset < 48.0 || offset > 275.0 || bombRange < 155.0 || bombRange > 790.0
+                || FloatAbs(point[2] - g_targets[slot][2]) > 48.0) continue;
+            bool clear = true;
+            for (int peer = 0; peer < g_targetCount; peer++)
+            {
+                if (peer == slot) continue;
+                float distance = GetVectorDistance(point, g_targets[peer]);
+                if (distance < 115.0) { clear = false; break; }
+            }
+            if (!clear) continue;
+            budget--;
+            int links = CoverLinks(slot, point);
+            if (links < 1 || links < bestLinks || (!overlaps && links == currentLinks)
+                || (links == bestLinks && offset >= best)) continue;
+            if (currentEntrances > 0 && ObjectiveWatch_Available(lanes, point) < currentEntrances) continue;
+            bestLinks = links;
+            best = offset;
+            CopyVector(point, chosen);
+        }
+        delete nearby;
+        if (best < 99999.0) CopyVector(chosen, g_targets[slot]);
+    }
+    delete lanes;
+}
+
+int CoverLinks(int slot, const float point[3])
+{
+    int count;
+    float eye[3], other[3];
+    CopyVector(point, eye);
+    eye[2] += 64.0;
+    for (int peer = 0; peer < g_targetCount; peer++)
+    {
+        if (peer == slot) continue;
+        float distance = GetVectorDistance(point, g_targets[peer]);
+        if (distance < 115.0 || distance > 500.0 || FloatAbs(point[2] - g_targets[peer][2]) > 70.0) continue;
+        CopyVector(g_targets[peer], other);
+        other[2] += 64.0;
+        if (TacticalAngles_ClearExactRay(eye, other)) count++;
+    }
+    return count;
 }
 
 void CollectCandidates(const float origin[3], float minRadius, float maxRadius)
@@ -1775,7 +1995,21 @@ void ObserveOrderProgress()
         float position[3];
         GetClientAbsOrigin(client, position);
         float distance = GetVectorDistance(position, g_orderGoal[client]);
-        bool plantApproach = g_cvRouteRetry.BoolValue && g_routeRetryMap && IsManagedPlantApproach(client);
+        bool managedPlant = IsManagedPlantApproach(client);
+        bool plantApproach = g_cvRouteRetry.BoolValue && g_routeRetryMap && managedPlant;
+        // The distance-only test is useful on Overpass's local approaches.
+        // Dust II Long A must first run past the upper site to reach its ramp;
+        // giving up the ordered goal there can strand the native carrier.
+        if (managedPlant && g_mapProfile == 5 && g_cvRouteRecovery.BoolValue && TacticalRecovery_Driving(client, now))
+        {
+            if (HasStalledPlantApproach(client, distance, now))
+            {
+                g_plantOrderClient = -client;
+                ExperienceSignal("plant_route_handoff", "circling_near_site", g_attackA ? 0 : 1, client);
+                DebugLog("T plant route handed to native BOT: %N circling near site", client);
+                continue;
+            }
+        }
         if (g_cvRouteRetry.BoolValue && g_routeRetryMap && (g_phase == TPhase_AttackStage || plantApproach)
             && g_routePausedAt[client] > 0.0 && now - g_routePausedAt[client] <= 0.6)
         {
@@ -1784,7 +2018,7 @@ void ObserveOrderProgress()
             g_orderLastDistance[client] = distance;
             continue;
         }
-        if (!plantApproach && distance <= 128.0)
+        if (!managedPlant && distance <= 128.0)
         {
             if (!g_orderArrived[client])
                 ExperienceSignal("order_arrived", phase, g_attackA ? 0 : 1, client);
@@ -1794,7 +2028,7 @@ void ObserveOrderProgress()
             CopyVector(position, g_orderLastPosition[client]);
             continue;
         }
-        if (!plantApproach && g_orderArrived[client] && distance <= 256.0)
+        if (!managedPlant && g_orderArrived[client] && distance <= 256.0)
             continue; // A settled stage/post-plant position is not a stalled route.
         g_orderArrived[client] = false;
         float displacement = GetVectorDistance(position, g_orderLastPosition[client]);
@@ -1848,8 +2082,8 @@ void ObserveOrderProgress()
             }
             continue;
         }
-        if (now - g_orderLastProgressAt[client] < 5.0 || distance <= 160.0 || g_fakeBot[client]) continue;
-        if (IsManagedPlantApproach(client))
+        if (now - g_orderLastProgressAt[client] < 5.0 || (!managedPlant && distance <= 160.0) || g_fakeBot[client]) continue;
+        if (managedPlant)
         {
             g_plantOrderClient = -client; // Never move the validated plant point.
             ExperienceSignal("plant_route_handoff", "stalled_approach", g_attackA ? 0 : 1, client);

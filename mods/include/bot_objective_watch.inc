@@ -8,10 +8,9 @@
 // unrelated angle just because it has more open space.
 bool g_objectiveNamed[MAXPLAYERS + 1];
 
-stock bool ObjectiveWatch_Select(const ArrayList lanes, const float hold[3], int &used, float look[3])
+stock int ObjectiveWatch_Score(const ArrayList lanes, const float hold[3], float candidates[3][3])
 {
     float eye[3], item[4], best[3], score[3] = {999999.0,999999.0,999999.0};
-    float candidates[3][3];
     CopyVector(hold, eye);
     eye[2] += 64.0;
     for (int i = 0; i < lanes.Length; i++)
@@ -26,10 +25,30 @@ stock bool ObjectiveWatch_Select(const ArrayList lanes, const float hold[3], int
         score[lane] = rank;
         CopyVector(best, candidates[lane]);
     }
+    int mask;
+    for (int lane = 0; lane < 3; lane++)
+        if (score[lane] < 999999.0) mask |= 1 << lane;
+    return mask;
+}
+
+stock int ObjectiveWatch_Available(const ArrayList lanes, const float hold[3])
+{
+    float candidates[3][3];
+    int mask = ObjectiveWatch_Score(lanes, hold, candidates);
+    int count;
+    for (int lane = 0; lane < 3; lane++)
+        if (mask & (1 << lane)) count++;
+    return count;
+}
+
+stock bool ObjectiveWatch_Select(const ArrayList lanes, const float hold[3], int &used, float look[3])
+{
+    float candidates[3][3];
+    int mask = ObjectiveWatch_Score(lanes, hold, candidates);
     for (int pass = 0; pass < 2; pass++)
         for (int lane = 0; lane < 3; lane++)
         {
-            if (score[lane] == 999999.0 || (pass == 0 && (used & (1 << lane)))) continue;
+            if (!(mask & (1 << lane)) || (pass == 0 && (used & (1 << lane)))) continue;
             used |= 1 << lane;
             CopyVector(candidates[lane], look);
             return true;
@@ -65,6 +84,19 @@ stock ArrayList ObjectiveWatch_Collect(int map, int site, bool retake, const flo
             point[0] = nav[0]; point[1] = nav[1]; point[2] = nav[2]; point[3] = float(lane);
             points.PushArray(point);
             counts[lane]++;
+            if (counts[lane] < 80 && NativeAvailable("NavMeshArea_GetClosestPointOnArea"))
+            {
+                // The center of a named area can be behind a corner even
+                // though its near edge is the actual doorway/ramp to hold.
+                NavMeshArea_GetClosestPointOnArea(area, center, nav);
+                float dx = nav[0] - point[0], dy = nav[1] - point[1];
+                if (dx * dx + dy * dy >= 36.0 * 36.0)
+                {
+                    point[0] = nav[0]; point[1] = nav[1]; point[2] = nav[2];
+                    points.PushArray(point);
+                    counts[lane]++;
+                }
+            }
         }
     }
     delete areas;
