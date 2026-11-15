@@ -6,7 +6,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.8"
+#define PLUGIN_VERSION "0.1.9"
 #define MAX_CANDIDATES 256
 #define TEAM_ANY -2
 
@@ -98,6 +98,7 @@ ConVar g_cvRouteRetry;
 ConVar g_cvPostPlantSectors;
 ConVar g_cvClearWatch;
 ConVar g_cvObjectiveWatch;
+ConVar g_cvSingleExposure;
 ConVar g_cvRouteRecovery;
 ConVar g_cvFakeChance;
 bool g_fakeOpening;
@@ -213,6 +214,7 @@ public void OnPluginStart()
     g_cvPostPlantSectors = CreateConVar("sm_bot_t_postplant_sectors", "1", "Keep a close bomb watcher and distribute the other post-plant angles.", _, true, 0.0, true, 1.0);
     g_cvClearWatch = CreateConVar("sm_bot_t_clear_watch", "1", "Reject nearby obstructions from the T BOT's actual eye before applying a tactical look.", _, true, 0.0, true, 1.0);
     g_cvObjectiveWatch = CreateConVar("sm_bot_t_objective_watch", "1", "Use visible retake entrances for plant cover and post-plant holds.", _, true, 0.0, true, 1.0);
+    g_cvSingleExposure = CreateConVar("sm_bot_t_single_exposure", "1", "Prefer sheltered plant-cover and post-plant holds without losing their entrance.", _, true, 0.0, true, 1.0);
     g_cvRouteRecovery = CreateConVar("sm_bot_t_route_recovery", "1", "Try one local same-lane recovery when an actively driven T order stalls.", _, true, 0.0, true, 1.0);
     g_cvFakeChance = CreateConVar("sm_bot_t_fake_opening_chance", "0", "Mirage: chance to add one decoy runner to a default attack; 0 disables.", _, true, 0.0, true, 100.0);
     g_cvRoundTimeDefuse = FindConVar("mp_roundtime_defuse");
@@ -1496,9 +1498,12 @@ void AssignObjectiveWatch(const float objective[3], bool planted)
     int site = GetVectorDistance(objective, g_siteA) <= GetVectorDistance(objective, g_siteB) ? 0 : 1;
     ArrayList lanes = ObjectiveWatch_Collect(g_mapProfile, site, true, objective);
     int used, remaining[MAXPLAYERS + 1];
+    bool watchesBomb[MAXPLAYERS + 1];
     for (int client = 1; client <= MaxClients; client++)
     {
-        if (!g_hasOrder[client] || !g_hasLook[client] || (planted && g_objectiveNamed[client])) continue;
+        if (!g_hasOrder[client] || !g_hasLook[client]) continue;
+        watchesBomb[client] = planted && g_objectiveNamed[client];
+        if (watchesBomb[client]) continue;
         remaining[client] = ObjectiveWatch_Available(lanes, g_orderGoal[client]);
     }
     // Give the BOT with only one viable entrance first choice; a flexible
@@ -1507,6 +1512,23 @@ void AssignObjectiveWatch(const float objective[3], bool planted)
         for (int client = 1; client <= MaxClients; client++)
             if (remaining[client] == room)
                 g_objectiveNamed[client] = ObjectiveWatch_Select(lanes, g_orderGoal[client], used, g_orderLook[client]);
+    bool audit = g_cvDebug.BoolValue && planted && g_cvSingleExposure.BoolValue;
+    int oldPairs, oldOverlap, oldSupport;
+    if (audit) ObjectiveCover_AuditLinks(oldPairs, oldOverlap, oldSupport);
+    if (g_cvSingleExposure.BoolValue)
+        for (int client = 1; client <= MaxClients; client++)
+            if (g_hasOrder[client] && g_hasLook[client] && !watchesBomb[client]
+                && ObjectiveCover_Refine(client, lanes, g_mapProfile, site, true, objective, true))
+                StartOrderProgress(client);
+    if (audit)
+    {
+        int pairs, overlap, support;
+        char map[32];
+        ObjectiveCover_AuditLinks(pairs, overlap, support);
+        TacticalMap_GetName(g_mapProfile, map, sizeof(map));
+        PrintToServer("CROSSFIRE_MATCHED map=%s site=%d pairs=%d,%d overlap=%d,%d support=%d,%d",
+            map, site, oldPairs, pairs, oldOverlap, overlap, oldSupport, support);
+    }
     delete lanes;
 }
 

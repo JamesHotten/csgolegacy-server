@@ -1919,6 +1919,41 @@ if (-not $text.Contains('BEGIN TACTICAL_PLANT_DRIVE_FIX')) {
     $text = Replace-Once $text $old $block 'watch a carrier traveling outside the plant zone, not a BOT executing a plant'
 }
 
+if (-not $text.Contains('BEGIN CT_HOLD_READY_GUN')) {
+    $safeTravelPattern = '(?s)if \(IsSafe\(iClient\)\)\s*\{\s*iButtons &= ~IN_SPEED;\s*if\s*\(g_bIsProBot\[iClient\] && !g_bDontSwitch\[iClient\] && !BotIsHiding\(iClient\)\)\s*SwitchWeapon\(iClient, GetPlayerWeaponSlot\(iClient, CS_SLOT_KNIFE\)\);\s*\}'
+    $holdReady = @(
+        '// BEGIN CT_HOLD_READY_GUN',
+        '    bool bCTGuardWithGun = bHoldInitialCTPosition && g_iAliveCountT > 0 && !bEnemyVisible',
+        '        && GetEntData(iClient, g_iEnemyVisibleOffset) == 0 && GetEntData(iClient, g_iBotNearbyEnemiesOffset) == 0',
+        '        && !g_bThrowGrenade[iClient] && g_iDoingSmokeNum[iClient] == -1 && !BotMimic_IsPlayerMimicing(iClient)',
+        '        && GetEntityMoveType(iClient) != MOVETYPE_LADDER && GetTask(iClient) != ESCAPE_FROM_FLAMES',
+        '        && GetTask(iClient) != ESCAPE_FROM_BOMB && GetTask(iClient) != DEFUSE_BOMB',
+        '        && eItems_GetWeaponSlotByDefIndex(iDefIndex) != CS_SLOT_GRENADE;',
+        '    if (bCTGuardWithGun)',
+        '    {',
+        '        int knife = GetPlayerWeaponSlot(iClient, CS_SLOT_KNIFE);',
+        '        if (knife > MaxClients && iWeapon == knife) iWeapon = 0;',
+        '        if (!g_bDontSwitch[iClient] && eItems_GetWeaponSlotByDefIndex(iDefIndex) == CS_SLOT_KNIFE)',
+        '        {',
+        '            int gun = GetPlayerWeaponSlot(iClient, CS_SLOT_PRIMARY);',
+        '            if (gun <= MaxClients || !IsValidEntity(gun) || GetEntProp(gun, Prop_Send, "m_iClip1") <= 0)',
+        '                gun = GetPlayerWeaponSlot(iClient, CS_SLOT_SECONDARY);',
+        '            if (gun > MaxClients && IsValidEntity(gun) && GetEntProp(gun, Prop_Send, "m_iClip1") > 0)',
+        '                SwitchWeapon(iClient, gun);',
+        '        }',
+        '    }',
+        '    if (IsSafe(iClient))',
+        '    {',
+        '        iButtons &= ~IN_SPEED;',
+        '        if (!bCTGuardWithGun && g_bIsProBot[iClient] && !g_bDontSwitch[iClient] && !BotIsHiding(iClient))',
+        '            SwitchWeapon(iClient, GetPlayerWeaponSlot(iClient, CS_SLOT_KNIFE));',
+        '    }',
+        '    // END CT_HOLD_READY_GUN'
+    ) -join $newline
+    $text = Replace-RegexOnce $text $safeTravelPattern $holdReady 'keep the gun out on a settled quiet CT hold'
+    $text = Replace-Once $text 'float fCTReleaseRadius = fCTHoldRadius * 2.0;' 'float fCTReleaseRadius = fCTHoldRadius < 32.0 ? fCTHoldRadius : fCTHoldRadius * 2.0;' 'keep a precise inner guard inside its measured clearance'
+}
+
 $candidateExperiencePlugin = Join-Path $buildDir "000_bot_tactical_experience.smx"
 
 try {

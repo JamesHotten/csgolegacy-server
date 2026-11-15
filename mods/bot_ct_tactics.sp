@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.12"
+#define PLUGIN_VERSION "0.1.13"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -108,10 +108,12 @@ float g_nukeGuardAim[MAXPLAYERS + 1][3];
 bool g_nukeGuardAimValid[MAXPLAYERS + 1];
 ConVar g_cvPairedPressure;
 ConVar g_cvCoverSpacing;
+ConVar g_cvInnerHolds, g_cvSingleExposure, g_cvOpeningFall;
 int g_pressureUsers[2];
 float g_pressureReturnAt;
 float g_pressureHomes[2][3], g_pressureAims[2][3];
 bool g_pressureHasAim[2];
+bool g_pressureInner[2];
 int g_defuserUserId;
 float g_defuserHandoffUntil;
 float g_nextDefuserReviewAt;
@@ -167,6 +169,9 @@ float g_carrierLastPosition[3];
 bool g_hasOrder[MAXPLAYERS + 1];
 bool g_hasLook[MAXPLAYERS + 1];
 bool g_infernoPreciseOrder[MAXPLAYERS + 1];
+bool g_innerOrder[MAXPLAYERS + 1];
+int g_plainFallTick[MAXPLAYERS + 1];
+float g_lastRouteFallAt[MAXPLAYERS + 1], g_lastRouteFallDistance[MAXPLAYERS + 1];
 bool g_combatReleased[MAXPLAYERS + 1];
 float g_orderGoal[MAXPLAYERS + 1][3];
 float g_orderLook[MAXPLAYERS + 1][3];
@@ -242,6 +247,9 @@ public void OnPluginStart()
     g_cvRouteRecovery = CreateConVar("sm_bot_ct_route_recovery", "1", "Try one local same-lane recovery for an actively driven CT order.", _, true, 0.0, true, 1.0);
     g_cvPairedPressure = CreateConVar("sm_bot_ct_pair_pressure_chance", "0", "Mirage: chance to add a short two-BOT probe to a standard setup; 0 disables.", _, true, 0.0, true, 100.0);
     g_cvCoverSpacing = CreateConVar("sm_bot_ct_cover_spacing", "1", "Avoid overlapping generic opening positions when clear alternate holds are available.", _, true, 0.0, true, 1.0);
+    g_cvInnerHolds = CreateConVar("sm_bot_ct_inner_holds", "1", "Reserve an inset bomb-zone hold on each side of the standard opening.", _, true, 0.0, true, 1.0);
+    g_cvSingleExposure = CreateConVar("sm_bot_ct_single_exposure", "1", "Prefer sheltered watch positions without losing the assigned entrance.", _, true, 0.0, true, 1.0);
+    g_cvOpeningFall = CreateConVar("sm_bot_ct_keep_fall_order", "1", "Do not treat a world-only fall as enemy contact during opening defense.", _, true, 0.0, true, 1.0);
     g_cvSyncMinReady = CreateConVar("sm_bot_ct_tactics_sync_min_ready", "50", "Percent of active ordered CT bots required at retake staging goals.", _, true, 20.0, true, 100.0);
     g_cvGuardCount = CreateConVar("sm_bot_ct_tactics_guard_count", "0", "Dropped C4 guards: 0 = all alive CT bots; positive values cap the count.", _, true, 0.0, true, 5.0);
 
@@ -280,6 +288,8 @@ public void OnPluginStart()
     RegAdminCmd("sm_ct_tactics_replan", Command_Replan, ADMFLAG_GENERIC, "Rebuild the current round's CT setup.");
 
     CreateTimer(0.5, Timer_Update, _, TIMER_REPEAT);
+    for (int client = 1; client <= MaxClients; client++)
+        if (IsClientInGame(client)) SDKHook(client, SDKHook_OnTakeDamage, MarkWorldFall);
 }
 
 public void OnMapStart()
@@ -318,6 +328,10 @@ bool InfernoWatchEnabled()
 
 public void OnClientPutInServer(int client)
 {
+    SDKHook(client, SDKHook_OnTakeDamage, MarkWorldFall);
+    g_plainFallTick[client] = 0;
+    g_lastRouteFallAt[client] = 0.0;
+    g_innerOrder[client] = false;
     g_combatReleased[client] = false;
     g_guardSlot[client] = -1;
     g_guardStalls[client] = 0;
@@ -516,6 +530,9 @@ public any Native_GetHoldRadius(Handle plugin, int numParams)
 
 float GetCTHoldRadius(int client)
 {
+    if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && g_cvInnerHolds.BoolValue
+        && g_hasOrder[client] && g_innerOrder[client] && !g_combatReleased[client])
+        return 24.0;
     if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && InfernoWatchEnabled()
         && g_hasOrder[client] && g_hasLook[client] && g_infernoPreciseOrder[client] && !g_combatReleased[client])
         return 32.0;
@@ -792,10 +809,42 @@ public void Event_PlayerHurt(Event event, const char[] name, bool dontBroadcast)
 {
     int victim = GetClientOfUserId(event.GetInt("userid"));
     int attacker = GetClientOfUserId(event.GetInt("attacker"));
+    if (g_cvOpeningFall.BoolValue && g_phase == Phase_Initial && IsCTBot(victim)
+        && (attacker == 0 || attacker == victim) && g_plainFallTick[victim] == GetGameTickCount())
+    {
+        g_plainFallTick[victim] = 0;
+        if (g_nukeMap && g_hasOrder[victim])
+        {
+            float foot[3], now = GetGameTime();
+            GetClientAbsOrigin(victim, foot);
+            float remaining = GetVectorDistance(foot, g_orderGoal[victim]);
+            // One fall is not a fight; repeatedly following the same
+            // multi-level route into a fall with no progress is a route failure.
+            if (g_lastRouteFallAt[victim] > 0.0 && now - g_lastRouteFallAt[victim] <= 18.0
+                && remaining > GetCTHoldRadius(victim) && remaining >= g_lastRouteFallDistance[victim] - 64.0)
+            {
+                DebugLog("Opening route for %N repeatedly returned to a fall without progress.", victim);
+                ReleaseOrder(victim, "navigation stalled");
+                return;
+            }
+            g_lastRouteFallAt[victim] = now;
+            g_lastRouteFallDistance[victim] = remaining;
+        }
+        DebugLog("Retained %N opening hold after world fall.", victim);
+        return;
+    }
     if (g_phase == Phase_RetakeStage && (IsCTBot(victim) || IsCTBot(attacker)))
         g_retakeContact = true;
     ReleaseOrder(victim, "hurt");
     ReleaseOrder(attacker, "combat");
+}
+
+public Action MarkWorldFall(int victim, int &attacker, int &inflictor, float &damage, int &damageType)
+{
+    if (g_phase == Phase_Initial && IsCTBot(victim))
+        g_plainFallTick[victim] = damageType == DMG_FALL
+            && (attacker == 0 || attacker == victim) ? GetGameTickCount() : 0;
+    return Plugin_Continue;
 }
 
 public void Event_PlayerBlind(Event event, const char[] name, bool dontBroadcast)
@@ -925,6 +974,7 @@ void PlanInitialDefense()
     AssignTargets(bots, count, Route_Fastest, -1, true);
     if (infernoProfile) ApplyInfernoOpeningAims(count, infernoAims);
     g_phase = Phase_Initial;
+    if (g_plan == Plan_Standard && g_mapProfile >= 0) RefineStandardHolds();
     g_pressureReturnAt = 0.0;
     if (g_mapProfile == 2 && g_plan == Plan_Standard && count >= 4
         && g_cvPairedPressure.IntValue > 0 && GetRandomInt(1, 100) <= g_cvPairedPressure.IntValue)
@@ -1002,6 +1052,7 @@ void BeginPairedPressure()
         CopyVector(g_orderGoal[client], g_pressureHomes[slot]);
         CopyVector(g_orderLook[client], g_pressureAims[slot]);
         g_pressureHasAim[slot] = g_hasLook[client];
+        g_pressureInner[slot] = g_innerOrder[client];
         CopyVector(goals[slot], g_orderGoal[client]);
         CopyVector(pressureLook[slot], g_orderLook[client]);
         g_hasLook[client] = true;
@@ -1032,6 +1083,7 @@ void ReviewPairedPressure()
         CopyVector(g_pressureAims[slot], g_orderLook[client]);
         g_hasLook[client] = g_pressureHasAim[slot];
         StartOrderProgress(client);
+        g_innerOrder[client] = g_pressureInner[slot];
     }
     DebugLog("CT paired pressure returned to original coverage.");
 }
@@ -1088,6 +1140,199 @@ void BuildStandardTargets(int count)
             middle[axis] = (g_siteA[axis] + g_siteB[axis]) * 0.5;
         AppendProjectedTarget(middle);
     }
+}
+
+bool CTInner_InTrigger(const float foot[3], const ArrayList zones)
+{
+    for (int zone = 0; zone < zones.Length; zone++)
+        for (int height = 12; height <= 44; height += 16)
+        {
+            float point[3], end[3];
+            CopyVector(foot, point);
+            point[2] += float(height);
+            CopyVector(point, end);
+            end[2] += 1.0;
+            Handle ray = TR_ClipRayToEntityEx(point, end, MASK_ALL, RayType_EndPoint, zones.Get(zone));
+            bool inside = TR_StartSolid(ray);
+            delete ray;
+            if (inside) return true;
+        }
+    return false;
+}
+
+bool CTInner_Inset(const float foot[3], const ArrayList zones)
+{
+    if (!CTInner_InTrigger(foot, zones)) return false;
+    // The movement tolerance must fit INSIDE the brush, not just reach an
+    // endpoint that is barely inside while the actual defender stops outside.
+    for (int step = 0; step < 8; step++)
+    {
+        float point[3], angle = float(step) * 0.785398163;
+        CopyVector(foot, point);
+        point[0] += 30.0 * Cosine(angle);
+        point[1] += 30.0 * Sine(angle);
+        if (!CTInner_InTrigger(point, zones)) return false;
+    }
+    return true;
+}
+
+void RefineStandardHolds()
+{
+    // Leave short-handed layouts and the deliberate ECO pressure/stack mixes
+    // alone. Both the exterior roles and one inner role are possible with 4+.
+    int count;
+    for (int client = 1; client <= MaxClients; client++)
+        if (g_hasOrder[client]) count++;
+    for (int site = 0; site < 2; site++)
+    {
+        if (!g_cvInnerHolds.BoolValue && !g_cvSingleExposure.BoolValue) continue;
+        float objective[3], other[3];
+        TacticalMap_PlantGround(g_mapProfile, site, objective);
+        TacticalMap_PlantGround(g_mapProfile, 1 - site, other);
+        ArrayList lanes = ObjectiveWatch_Collect(g_mapProfile, site, false, objective);
+        if (g_cvInnerHolds.BoolValue && count >= 4) CTInner_Assign(site, objective, other, lanes);
+        int extraLane = -1;
+        if (g_mapProfile == 4 && site == 0 && g_cvEntranceWatch.BoolValue)
+        {
+            int occupied;
+            for (int client = 1; client <= MaxClients; client++)
+                if (g_hasOrder[client] && g_hasLook[client]
+                    && GetVectorDistance(g_orderGoal[client], objective) < GetVectorDistance(g_orderGoal[client], other))
+                {
+                    int lane = ObjectiveCover_AimLane(g_mapProfile, site, false, g_orderLook[client]);
+                    if (lane >= 0) occupied |= 1 << lane;
+                }
+            // Dust II A: when the team already has one named lane, allow the
+            // generic exterior role to take the other if the new hold is
+            // safer. Never trade a named assignment for that fallback.
+            if (occupied == 1 || occupied == 2) extraLane = occupied == 1 ? 1 : 0;
+        }
+        if (g_cvSingleExposure.BoolValue)
+            for (int client = 1; client <= MaxClients; client++)
+            {
+                if (!g_hasOrder[client] || !g_hasLook[client] || g_innerOrder[client] || g_infernoPreciseOrder[client]
+                    || GetVectorDistance(g_orderGoal[client], objective) > GetVectorDistance(g_orderGoal[client], other)
+                    || GetVectorDistance(g_orderGoal[client], objective) > 900.0) continue;
+                if (ObjectiveCover_Refine(client, lanes, g_mapProfile, site, false, objective, false, false, extraLane))
+                {
+                    StartOrderProgress(client);
+                    extraLane = -1;
+                }
+            }
+        delete lanes;
+    }
+}
+
+void CTInner_Assign(int site, const float objective[3], const float other[3], const ArrayList lanes)
+{
+    if (!NativeAvailable("NavMesh_BuildPath") || !NativeAvailable("NavMeshArea_GetCostSoFar")) return;
+    int area = NavMesh_GetNearestArea(objective, false, 120.0, false, true, TEAM_ANY);
+    if (area < 0) return;
+    int owner;
+    float closestHold = 950.0;
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!g_hasOrder[client] || g_innerOrder[client]) continue;
+        float distance = GetVectorDistance(g_orderGoal[client], objective);
+        if (distance < closestHold && distance < GetVectorDistance(g_orderGoal[client], other))
+        {
+            owner = client;
+            closestHold = distance;
+        }
+    }
+    if (!owner) return;
+    float spawn[3];
+    GetClientAbsOrigin(owner, spawn);
+    int start = NavMesh_GetNearestArea(spawn, false, 150.0, false, true, TEAM_ANY);
+    if (start < 0) return;
+    ArrayList zones = new ArrayList();
+    int entity = -1;
+    while ((entity = FindEntityByClassname(entity, "func_bomb_target")) != -1)
+    {
+        float mins[3], maxs[3], center[3];
+        GetEntPropVector(entity, Prop_Send, "m_vecMins", mins);
+        GetEntPropVector(entity, Prop_Send, "m_vecMaxs", maxs);
+        GetEntPropVector(entity, Prop_Data, "m_vecAbsOrigin", center);
+        for (int axis = 0; axis < 3; axis++) center[axis] += (mins[axis] + maxs[axis]) * 0.5;
+        if (GetVectorDistance(center, objective) <= GetVectorDistance(center, other)) zones.Push(entity);
+    }
+    ArrayStack areas = new ArrayStack();
+    NavMesh_CollectSurroundingAreas(areas, area, 660.0, 24.0, 45.0);
+    areas.Push(area);
+    int preferred = g_hasLook[owner] ? ObjectiveCover_AimLane(g_mapProfile, site, false, g_orderLook[owner]) : -1;
+    int covered;
+    for (int client = 1; client <= MaxClients; client++)
+        if (client != owner && g_hasOrder[client] && g_hasLook[client])
+        {
+            int lane = ObjectiveCover_AimLane(g_mapProfile, site, false, g_orderLook[client]);
+            if (lane >= 0) covered |= 1 << lane;
+        }
+    if (preferred >= 0 && (covered & (1 << preferred))) preferred = -1;
+    float best = 999999.0, bestGoal[3], bestAim[3];
+    int budget = 64;
+    while (!areas.Empty && zones.Length > 0 && budget > 0)
+    {
+        int candidate = areas.Pop();
+        for (int sample = 0; sample < 2 && budget > 0; sample++)
+        {
+            float center[3], point[3], eye[3], look[3], targets[3][3];
+            if (sample == 0)
+            {
+                if (!NavMeshArea_GetCenter(candidate, center)) continue;
+            }
+            else
+            {
+                if (!NativeAvailable("NavMeshArea_GetClosestPointOnArea")) continue;
+                NavMeshArea_GetClosestPointOnArea(candidate, objective, center);
+            }
+            if (FloatAbs(center[2] - objective[2]) > 85.0 || !ObjectiveCover_Floor(center, point)
+                || ObjectiveCover_Support(owner, point) < 0 || !CTInner_Inset(point, zones)) continue;
+            budget--;
+            int mask = ObjectiveWatch_Score(lanes, point, targets), chosen = -1;
+            if (preferred >= 0)
+            {
+                if (!(mask & (1 << preferred))) continue; // don't abandon the only cover on this entrance
+                chosen = preferred;
+            }
+            else
+            {
+                for (int lane = 0; lane < 3; lane++)
+                    if ((mask & (1 << lane)) && (chosen < 0 || !(covered & (1 << lane))
+                        && (covered & (1 << chosen)))) chosen = lane;
+            }
+            if (chosen >= 0) CopyVector(targets[chosen], look);
+            else
+            {
+                TacticalAngles_SelectLook(owner, point, g_tSpawn, 0, look);
+                if (!TacticalAngles_RequireClearWatch(point, look)) continue;
+            }
+            CopyVector(point, eye);
+            eye[2] += 64.0;
+            float plant[3];
+            CopyVector(objective, plant);
+            plant[2] += 42.0;
+            // Cover exposure dominates distance; prefer a view of the plant
+            // and a distinct entry when two equally sheltered points work.
+            float score = float(ObjectiveCover_Exposure(lanes, point)) * 500.0
+                + (ObjectiveCover_Shot(eye, plant) ? 0.0 : 190.0)
+                + (chosen >= 0 ? ((covered & (1 << chosen)) ? 90.0 : 0.0) : 240.0)
+                + GetVectorDistance(point, g_orderGoal[owner]) * 0.25;
+            int reachable;
+            if (score >= best || !NavMesh_BuildPath(start, candidate, point, RetakeTravelCost, 6500, reachable, 0.0, 0.0)) continue;
+            best = score;
+            CopyVector(point, bestGoal);
+            CopyVector(look, bestAim);
+        }
+    }
+    delete areas;
+    delete zones;
+    if (best >= 999999.0) return;
+    CopyVector(bestGoal, g_orderGoal[owner]);
+    CopyVector(bestAim, g_orderLook[owner]);
+    g_hasLook[owner] = true;
+    StartOrderProgress(owner);
+    g_innerOrder[owner] = true;
+    DebugLog("Reserved inset %s hold for %N at %.0f %.0f %.0f.",site == 0 ? "A" : "B",owner,bestGoal[0],bestGoal[1],bestGoal[2]);
 }
 
 void BuildPushTargets(int count)
@@ -1393,9 +1638,21 @@ void PlanLooseBombGuard(int bomb, int spotter)
         g_objectiveNamed[selected] = watchLanes != null && ObjectiveWatch_Select(watchLanes, g_orderGoal[selected], usedLanes, g_orderLook[selected]);
         if (!g_objectiveNamed[selected] && NukeGuardWatchEnabled()) ResolveNukeGuardLook(selected);
     }
-    delete watchLanes;
     ExperienceSignal("guard_bomb", "loose_c4_seen", NearestSite(g_bombPosition), spotter);
     DebugLog("%N saw dropped C4; reserved %d CT guard positions.", spotter, guardCount);
+    if (g_cvSingleExposure.BoolValue && watchLanes != null)
+    {
+        // The reserved orders are not yet active. Only publish and refine after
+        // ResumeLooseBombGuards has applied its normal quiet/combat checks.
+        ResumeLooseBombGuards();
+        for (int client = 1; client <= MaxClients; client++)
+        {
+            if (g_guardSlot[client] < 0 || !g_hasOrder[client] || !g_hasLook[client]) continue;
+            if (ObjectiveCover_Refine(client, watchLanes, g_mapProfile, RetakeSite(), false, g_bombPosition, true, true))
+                StartOrderProgress(client);
+        }
+    }
+    delete watchLanes;
 }
 
 void ResumeLooseBombGuards()
@@ -2343,6 +2600,8 @@ void ClearOrders()
         g_hasOrder[client] = false;
         g_hasLook[client] = false;
         g_infernoPreciseOrder[client] = false;
+        g_innerOrder[client] = false;
+        g_lastRouteFallAt[client] = 0.0;
         g_orderExpires[client] = 0.0;
         g_orderLastProgressDistance[client] = 0.0;
         g_orderLastProgressAt[client] = 0.0;
@@ -2357,6 +2616,8 @@ void ClearOrders()
 void StartOrderProgress(int client)
 {
     g_infernoPreciseOrder[client] = false;
+    g_innerOrder[client] = false;
+    g_lastRouteFallAt[client] = 0.0;
     float position[3];
     GetClientAbsOrigin(client, position);
     g_orderLastProgressDistance[client] = Distance2D(position, g_orderGoal[client]);
@@ -2388,7 +2649,7 @@ void ReleaseStalledOrders()
         if (distance <= holdRadius)
         {
             if (!g_orderArrived[client])
-                ExperienceSignal("order_arrived", precise ? "within_32" : "within_128", g_geometryReady ? NearestSite(g_orderGoal[client]) : -1, client);
+                ExperienceSignal("order_arrived", holdRadius < 32.0 ? "within_24" : (precise ? "within_32" : "within_128"), g_geometryReady ? NearestSite(g_orderGoal[client]) : -1, client);
             g_orderArrived[client] = true;
             g_orderLastProgressDistance[client] = distance;
             g_orderLastProgressAt[client] = now;
@@ -2398,7 +2659,8 @@ void ReleaseStalledOrders()
 
         // Do not release a settled initial defender merely because the
         // engine's idle movement displaced it a few steps from its cover.
-        if ((g_phase == Phase_Initial || g_phase == Phase_GuardLooseBomb) && g_orderArrived[client] && distance <= holdRadius * 2.0)
+        if ((g_phase == Phase_Initial || g_phase == Phase_GuardLooseBomb) && g_orderArrived[client]
+            && distance <= (holdRadius < 32.0 ? holdRadius : holdRadius * 2.0))
         {
             g_orderLastProgressDistance[client] = distance;
             g_orderLastProgressAt[client] = now;
@@ -2425,7 +2687,7 @@ void ReleaseStalledOrders()
         float timeout = g_cvNavigationStallTimeout.FloatValue;
         if (precise && timeout < 5.0) timeout = 5.0;
         if (now - g_orderLastProgressAt[client] < timeout) continue;
-        if (g_cvRouteRecovery.BoolValue && !g_recoveryTried[client] && g_phase != Phase_RetakeCommit
+        if (g_cvRouteRecovery.BoolValue && !g_innerOrder[client] && !g_recoveryTried[client] && g_phase != Phase_RetakeCommit
             && client != GetClientOfUserId(g_defuserUserId))
         {
             if (now < g_recoverySearchAt) continue;

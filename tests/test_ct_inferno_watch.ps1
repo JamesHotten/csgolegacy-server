@@ -27,7 +27,7 @@ if ($source -match 'CreateTimer|OnGameFrame|TeleportEntity|BotMoveTo|SetEntProp|
 if (-not $installer.Contains('bot_ct_inferno_watch.inc')) { throw 'Installer must deliver the Inferno profile.' }
 foreach ($required in @('CreateNative("BotCTTactics_GetHoldRadius", Native_GetHoldRadius)',
     'g_phase == Phase_Initial && InfernoWatchEnabled()', 'g_infernoPreciseOrder[client] = false;',
-    'return 32.0;', 'return 128.0;', 'distance <= holdRadius * 2.0',
+    'return 32.0;', 'return 128.0;', 'holdRadius < 32.0 ? holdRadius : holdRadius * 2.0',
     'float displacementStep = precise ? 32.0 : 64.0;',
     'if (precise && timeout < 5.0) timeout = 5.0;')) {
     if (-not $ct.Contains($required)) { throw "Missing precision hold lifecycle rule: $required" }

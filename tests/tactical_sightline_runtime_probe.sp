@@ -10,14 +10,24 @@ native bool BotTTactics_GetOrder(int client, float goal[3], int &route);
 native bool BotTTactics_GetAim(int client, float look[3], bool live = false);
 native int NavMesh_GetNearestArea(const float pos[3], bool anyZ=false, float maxDist=10000.0, bool checkLOS=false, bool checkGround=true, int team=-2);
 native void NavMeshArea_GetPlaceCanonical(int area, char[] name, int length);
+native int NavMesh_WorldToGridX(float x);
+native int NavMesh_WorldToGridY(float y);
+native void NavMesh_GetAreasOnGrid(ArrayStack areas, int x, int y);
+native bool NavMeshArea_GetCenter(int area, float out[3]);
+native void NavMeshArea_GetClosestPointOnArea(int area, const float from[3], float out[3]);
+native bool BotStuff_CanSeeLooseC4(int client, int bomb);
 #include "../mods/include/bot_tactical_map_profiles.inc"
 
 public Plugin myinfo = {name = "Isolated objective sightline survey", version = "1.1"};
 ConVar g_on;
-ConVar g_endMap, g_seed;
+ConVar g_endMap, g_seed, g_exposure;
 bool g_armed;
 int g_map, g_site, g_planter, g_bomb = INVALID_ENT_REFERENCE;
 float g_started;
+int g_loose = INVALID_ENT_REFERENCE, g_spotter;
+float g_looseStart, g_spotterOriginal[3], g_spotterAngles[3], g_spotterAim[3];
+MoveType g_spotterMove;
+int g_samplesByLane[3];
 static const char Maps[][] = {"de_inferno","de_train","de_mirage","de_nuke","de_dust2","de_overpass","de_vertigo","de_cache","de_ancient","de_anubis"};
 // On this server these exact standing spots passed the earlier engine bomb-zone survey.
 static const float Plant[10][2][3] = {
@@ -38,6 +48,7 @@ public void OnPluginStart()
     g_on = CreateConVar("sm_objective_angle_survey", "0", "Only on isolated loopback server.");
     g_endMap = CreateConVar("sm_objective_angle_end_map", "de_anubis", "Last map to inspect.");
     g_seed = CreateConVar("sm_objective_angle_seed", "12015", "Use the same objective planning seed for geometry comparisons.");
+    g_exposure = CreateConVar("sm_hold_exposure_survey", "0", "Include objective exposure and loose-C4 checks on the isolated server.");
     HookEvent("round_freeze_end", Start, EventHookMode_PostNoCopy);
 }
 
@@ -54,6 +65,7 @@ public void OnMapStart()
     g_site = 0;
     g_armed = false;
     g_bomb = INVALID_ENT_REFERENCE;
+    g_loose = INVALID_ENT_REFERENCE;
     char map[32];
     GetCurrentMap(map,sizeof(map));
     for (int i = 0; i < sizeof(Maps); i++) if (StrEqual(Maps[i],map)) g_map = i;
@@ -65,6 +77,7 @@ public Action Prep(Handle timer)
     if (!Safe() || g_map < 0) return Plugin_Stop;
     ServerCommand("sv_cheats 1; bot_stop 1; bot_dont_shoot 1; mp_autoteambalance 0; mp_limitteams 0; mp_freezetime 2; mp_do_warmup_period 0; mp_ignore_round_win_conditions 1; bot_quota 0; bot_kick");
     ServerExecute();
+    if (g_exposure.BoolValue) FindConVar("sm_bot_t_tactics_debug").BoolValue = true;
     for (int i = 0; i < 5; i++) ServerCommand("bot_add_ct; bot_add_t");
     ServerExecute();
     g_armed = true;
@@ -97,8 +110,115 @@ public void Start(Event event, const char[] name, bool noBroadcast)
 public Action Cover(Handle timer)
 {
     if (!Safe()) return Plugin_Stop;
+    ServerCommand("sm_bot_experience_record_enable 0");
     SetRandomSeed(g_seed.IntValue + g_map * 10 + g_site);
     Measure("ct_open", true);
+    if (!g_exposure.BoolValue) return BeginPlantCover(timer);
+    InspectExposure("ct_open", true, false);
+    if (StartLoose())
+    {
+        CreateTimer(0.25, CheckLoose, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+        return Plugin_Stop;
+    }
+    PrintToServer("EXPOSURE_SKIP map=%s site=%d phase=ct_loose no_fixture", Maps[g_map], g_site);
+    return BeginPlantCover(timer);
+}
+
+bool StartLoose()
+{
+    g_spotter = 0;
+    int actual = -1;
+    while ((actual = FindEntityByClassname(actual, "weapon_c4")) != -1)
+        if (GetEntPropEnt(actual, Prop_Send, "m_hOwnerEntity") <= 0) RemoveEntity(actual);
+    for (int i=1; i<=MaxClients; i++)
+        if (IsClientInGame(i) && IsPlayerAlive(i) && GetClientTeam(i) == CS_TEAM_CT) {g_spotter=i; break;}
+    if (!g_spotter) return false;
+    int bomb = CreateEntityByName("weapon_c4");
+    if (bomb == -1) return false;
+    DispatchSpawn(bomb);
+    SetEntityMoveType(bomb, MOVETYPE_NONE);
+    float point[3], foot[3], eye[3], dir[3];
+    point = Plant[g_map][g_site];
+    point[2] += 12.0;
+    TeleportEntity(bomb, point, NULL_VECTOR, NULL_VECTOR);
+    GetClientAbsOrigin(g_spotter, g_spotterOriginal);
+    GetClientEyeAngles(g_spotter, g_spotterAngles);
+    for (int ring=1; ring<=3; ring++)
+    {
+        for (int step=0; step<8; step++)
+        {
+            foot = Plant[g_map][g_site];
+            foot[0] += float(ring*48) * Cosine(float(step)*0.785398163);
+            foot[1] += float(ring*48) * Sine(float(step)*0.785398163);
+            if (!SafeFloor(foot, eye)) continue;
+            foot = eye;
+            eye[2] += 64.0;
+            float bombEye[3];
+            bombEye = point;
+            bombEye[2] += 8.0;
+            if (!Shot(eye, bombEye, bomb)) continue;
+            MakeVectorFromPoints(eye, bombEye, dir);
+            GetVectorAngles(dir,g_spotterAim);
+            g_spotterMove = GetEntityMoveType(g_spotter);
+            SetEntityMoveType(g_spotter,MOVETYPE_NONE);
+            TeleportEntity(g_spotter,foot,g_spotterAim,NULL_VECTOR);
+            SetEntPropFloat(g_spotter,Prop_Send,"m_angEyeAngles[0]",g_spotterAim[0]);
+            SetEntPropFloat(g_spotter,Prop_Send,"m_angEyeAngles[1]",g_spotterAim[1]);
+            g_loose = EntIndexToEntRef(bomb);
+            g_looseStart = GetGameTime();
+            Event event = CreateEvent("bomb_dropped");
+            event.Fire();
+            return true;
+        }
+    }
+    RemoveEntity(bomb);
+    TeleportEntity(g_spotter,g_spotterOriginal,g_spotterAngles,NULL_VECTOR);
+    return false;
+}
+
+public void OnGameFrame()
+{
+    if (g_loose == INVALID_ENT_REFERENCE || !Safe() || !IsClientInGame(g_spotter)) return;
+    TeleportEntity(g_spotter,NULL_VECTOR,g_spotterAim,NULL_VECTOR);
+    SetEntPropFloat(g_spotter,Prop_Send,"m_angEyeAngles[0]",g_spotterAim[0]);
+    SetEntPropFloat(g_spotter,Prop_Send,"m_angEyeAngles[1]",g_spotterAim[1]);
+}
+
+public Action CheckLoose(Handle timer)
+{
+    if (!Safe()) return Plugin_Stop;
+    int guards;
+    for (int i=1;i<=MaxClients;i++)
+    {
+        int route;
+        float goal[3];
+        if (IsClientInGame(i) && IsPlayerAlive(i) && GetClientTeam(i)==CS_TEAM_CT
+            && BotCTTactics_GetOrder(i,goal,route) && route==1
+            && GetVectorDistance(Plant[g_map][g_site],goal)<700.0) guards++;
+    }
+    if (guards < 4 && GetGameTime()-g_looseStart < 4.0) return Plugin_Continue;
+    int bomb=EntRefToEntIndex(g_loose);
+    if (guards >= 4)
+    {
+        ServerCommand("sm_ct_tactics_status");
+        ServerExecute();
+        InspectExposure("ct_loose", true, false);
+    }
+    else PrintToServer("EXPOSURE_SKIP map=%s site=%d phase=ct_loose guards=%d visible=%d",Maps[g_map],g_site,guards,
+        bomb!=INVALID_ENT_REFERENCE && BotStuff_CanSeeLooseC4(g_spotter,bomb));
+    if(bomb!=INVALID_ENT_REFERENCE) RemoveEntity(bomb);
+    g_loose=INVALID_ENT_REFERENCE;
+    SetEntityMoveType(g_spotter,g_spotterMove);
+    TeleportEntity(g_spotter,g_spotterOriginal,g_spotterAngles,NULL_VECTOR);
+    Event event=CreateEvent("bomb_pickup");
+    event.Fire();
+    CreateTimer(0.25,BeginPlantCover,_,TIMER_FLAG_NO_MAPCHANGE);
+    return Plugin_Stop;
+}
+
+public Action BeginPlantCover(Handle timer)
+{
+    if (!Safe()) return Plugin_Stop;
     g_planter = 0;
     for (int i = 1; i <= MaxClients; i++)
         if (IsClientInGame(i) && IsPlayerAlive(i) && GetClientTeam(i) == CS_TEAM_T && GetPlayerWeaponSlot(i, CS_SLOT_C4) > MaxClients) {g_planter=i; break;}
@@ -116,6 +236,7 @@ public Action Cover(Handle timer)
     event.SetInt("userid", GetClientUserId(g_planter));
     event.Fire();
     Measure("t_cover", false);
+    if (g_exposure.BoolValue) InspectExposure("t_cover", false, true);
     CreateTimer(0.25, Planted, _, TIMER_FLAG_NO_MAPCHANGE);
     return Plugin_Stop;
 }
@@ -142,6 +263,7 @@ public Action RetakeStage(Handle timer)
 {
     if (!Safe()) return Plugin_Stop;
     Measure("t_postplant", false);
+    if (g_exposure.BoolValue) InspectExposure("t_postplant", false, true);
     Measure("ct_retake_stage", true, 2);
     for (int i = 1; i <= MaxClients; i++)
     {
@@ -191,6 +313,130 @@ void NextMap()
 }
 
 public bool World(int entity, int mask, any unused) { return entity > MaxClients; }
+
+ArrayList EntranceEyes(bool retake)
+{
+    ArrayList result = new ArrayList(4);
+    StringMap seen = new StringMap();
+    ArrayStack areas = new ArrayStack();
+    char names[3][32];
+    for (int i=0;i<3;i++)
+    {
+        g_samplesByLane[i] = 0;
+        TacticalMap_GetWatchPlace(g_map,g_site,i,retake,names[i],sizeof(names[]));
+    }
+    float site[3];
+    site = Plant[g_map][g_site];
+    for (int x=NavMesh_WorldToGridX(site[0]-1800.0); x<=NavMesh_WorldToGridX(site[0]+1800.0); x++)
+        for (int y=NavMesh_WorldToGridY(site[1]-1800.0); y<=NavMesh_WorldToGridY(site[1]+1800.0); y++)
+            NavMesh_GetAreasOnGrid(areas,x,y);
+    while (!areas.Empty)
+    {
+        int area=areas.Pop();
+        char key[16], found[32];
+        IntToString(area,key,sizeof(key));
+        if (!seen.SetValue(key,1,false)) continue;
+        NavMeshArea_GetPlaceCanonical(area,found,sizeof(found));
+        for (int lane=0;lane<3;lane++)
+        {
+            if (!names[lane][0] || !StrEqual(names[lane],found,false)) continue;
+            for (int mode=0;mode<2;mode++)
+            {
+                float p[3], feet[3], eye[4];
+                if (mode == 0 && !NavMeshArea_GetCenter(area,p)) continue;
+                if (mode == 1) NavMeshArea_GetClosestPointOnArea(area,site,p);
+                if (GetVectorDistance(site,p)>2100.0 || !SafeFloor(p,feet)) continue;
+                eye[0]=feet[0]; eye[1]=feet[1]; eye[2]=feet[2]+64.0; eye[3]=float(lane);
+                result.PushArray(eye);
+                g_samplesByLane[lane]++;
+            }
+        }
+    }
+    delete seen;
+    delete areas;
+    return result;
+}
+
+public bool BulletWorld(int entity,int mask,any ignored) { return entity>MaxClients && entity!=ignored; }
+
+bool Shot(const float from[3], const float to[3], int ignored = -1)
+{
+    Handle ray=TR_TraceRayFilterEx(from,to,MASK_SHOT,RayType_EndPoint,BulletWorld,ignored);
+    bool clear=!TR_StartSolid(ray) && !TR_DidHit(ray);
+    delete ray;
+    return clear;
+}
+
+int Exposed(ArrayList eyes, const float feet[3], bool duck, float witness[3][3])
+{
+    int mask;
+    for (int j=0;j<eyes.Length;j++)
+    {
+        float item[4], from[3], to[3];
+        eyes.GetArray(j,item,sizeof(item));
+        int lane=RoundToNearest(item[3]);
+        if (mask & (1<<lane)) continue;
+        from[0]=item[0];from[1]=item[1];from[2]=item[2];
+        float distance=GetVectorDistance(from,feet);
+        if (distance<120.0 || distance>2200.0) continue;
+        to=feet;to[2]+=duck?46.0:64.0;
+        bool clear=Shot(from,to);
+        if (!clear)
+        {
+            to[2]-=duck?12.0:14.0;
+            clear=Shot(from,to);
+            float yaw=ArcTangent2(from[1]-to[1],from[0]-to[0]);
+            for (int side=-1;!clear && side<=1;side+=2)
+            {
+                to[0]=feet[0]+float(side)*12.0*Sine(yaw);
+                to[1]=feet[1]-float(side)*12.0*Cosine(yaw);
+                clear=Shot(from,to);
+            }
+        }
+        if (clear) { mask|=1<<lane; witness[lane]=from; }
+    }
+    return mask;
+}
+
+int Bits(int mask)
+{
+    return (mask&1) + ((mask>>1)&1) + ((mask>>2)&1);
+}
+
+void InspectExposure(const char[] phase, bool ct, bool retake)
+{
+    ArrayList eyes=EntranceEyes(retake);
+    int orders, valid, dual, duckDual;
+    for (int i=1;i<=MaxClients;i++)
+    {
+        if (!IsClientInGame(i) || !IsPlayerAlive(i) || GetClientTeam(i)!=(ct?CS_TEAM_CT:CS_TEAM_T)) continue;
+        int route;
+        float goal[3],look[3],feet[3],witness[3][3];
+        if (!(ct?BotCTTactics_GetOrder(i,goal,route):BotTTactics_GetOrder(i,goal,route))) continue;
+        if (StrEqual(phase,"ct_open") && GetVectorDistance(goal,Plant[g_map][g_site])>
+            GetVectorDistance(goal,Plant[g_map][1-g_site])) continue;
+        if (StrEqual(phase,"ct_loose") && (route!=1 || GetVectorDistance(goal,Plant[g_map][g_site])>=700.0)) continue;
+        // Only positions with an assigned tactical watch, not the planter/order to the bomb.
+        if (!(ct?BotCTTactics_GetAim(i,look):BotTTactics_GetAim(i,look))) continue;
+        orders++;
+        if (!SafeFloor(goal,feet)) continue;
+        valid++;
+        int standing=Exposed(eyes,feet,false,witness);
+        if (Bits(standing)>=2)
+        {
+            dual++;
+            PrintToServer("EXPOSURE_WITNESS map=%s site=%d phase=%s lanes=%d hold=%.0f,%.0f,%.0f entry0=%.0f,%.0f,%.0f entry1=%.0f,%.0f,%.0f entry2=%.0f,%.0f,%.0f",
+                Maps[g_map],g_site,phase,standing,feet[0],feet[1],feet[2],
+                witness[0][0],witness[0][1],witness[0][2],witness[1][0],witness[1][1],witness[1][2],witness[2][0],witness[2][1],witness[2][2]);
+
+        }
+        if (Bits(Exposed(eyes,feet,true,witness))>=2) duckDual++;
+    }
+    delete eyes;
+    PrintToServer("EXPOSURE_SUMMARY map=%s site=%d phase=%s orders=%d valid=%d dual=%d crouch_dual=%d eyes=%d,%d,%d",
+        Maps[g_map],g_site,phase,orders,valid,dual,duckDual,g_samplesByLane[0],g_samplesByLane[1],g_samplesByLane[2]);
+}
+
 
 float WallDist(const float eye[3], const float look[3])
 {

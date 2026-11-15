@@ -30,7 +30,7 @@ if (-not $run.Contains('(bHoldInitialCTPosition || bHoldTAttackStage || bHoldTPo
 }
 if (-not $watchdog.Contains('g_orderArrived[client]') -or
     -not $watchdog.Contains('distance <= holdRadius') -or
-    -not $watchdog.Contains('distance <= holdRadius * 2.0') -or
+    -not $watchdog.Contains('distance <= (holdRadius < 32.0 ? holdRadius : holdRadius * 2.0)') -or
     -not $watchdog.Contains('g_phase == Phase_Initial')) {
     throw 'The CT director must not release a settled initial defender inside the hold buffer.'
 }

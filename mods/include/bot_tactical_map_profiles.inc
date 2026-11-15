@@ -10,6 +10,26 @@ static const char g_TacticalMapNames[][] = {
     "de_inferno", "de_train", "de_mirage", "de_nuke", "de_dust2",
     "de_overpass", "de_vertigo", "de_cache", "de_ancient", "de_anubis"
 };
+// Ground references verified with the actual Legacy bomb triggers. The
+// bombsite manager's center and a NAV place name alone do not imply a valid
+// floor position (especially on multi-level or irregular sites).
+static const float g_TacticalPlantGround[10][2][3] = {
+    {{1887.5,475.0,160.0},{475.0,2650.0,160.0}},
+    {{637.5,-137.5,-217.9},{50.0,-1287.5,-286.9}},
+    {{-437.5,-2200.0,-177.9},{-2100.0,187.5,-159.9}},
+    {{587.5,-762.5,-399.9},{700.0,-987.5,-769.1}},
+    {{1100.0,2462.5,96.0},{-1550.0,2687.5,5.9}},
+    {{-2062.5,662.5,472.0},{-1100.0,50.0,98.0}},
+    {{-287.5,-575.0,11775.0},{-2212.5,725.0,11744.0}},
+    {{-312.5,1762.5,1686.5},{-37.5,-1250.0,1659.1}},
+    {{-1425.0,825.0,53.5},{987.5,-50.0,131.0}},
+    {{1262.5,1987.5,-191.9},{-950.0,625.0,-1.9}}
+};
+
+stock void TacticalMap_PlantGround(int map, int site, float position[3])
+{
+    for (int axis = 0; axis < 3; axis++) position[axis] = g_TacticalPlantGround[map][site][axis];
+}
 static const char g_TacticalMapPlaces[10][2][5][32] = {
     {{"TopofMid", "Balcony", "Arch", "TopofMid", "Apartments"},
      {"Banana", "Ruins", "", "Banana", ""}},                                      // Inferno
