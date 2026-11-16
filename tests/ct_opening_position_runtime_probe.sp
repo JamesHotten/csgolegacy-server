@@ -4,6 +4,7 @@
 #include <sdktools>
 #include <sdkhooks>
 #include <cstrike>
+#include <commandline>
 #include "../mods/include/bot_tactical_map_profiles.inc"
 
 native bool BotCTTactics_GetOrder(int client, float goal[3], int &route);
@@ -28,6 +29,16 @@ public void OnPluginStart()
     g_rounds = CreateConVar("sm_ct_opening_position_rounds", "1", _, _, true, 1.0, true, 3.0);
     g_seconds = CreateConVar("sm_ct_opening_position_seconds", "18", _, _, true, 8.0, true, 38.0);
     g_debug = CreateConVar("sm_ct_opening_position_debug", "0", "Include tactical routing details in isolated audit.");
+    if (FindCommandLineParam("-ctrefineopening"))
+    {
+        char ip[32], last[32];
+        GetCommandLineParam("-ip", ip, sizeof(ip));
+        if (!StrEqual(ip, "127.0.0.1")) SetFailState("CT refinement fixture is loopback-only");
+        GetCommandLineParam("-ctrefineend", last, sizeof(last), "de_anubis");
+        g_enabled.BoolValue = true;
+        g_last.SetString(last);
+        g_seconds.FloatValue = 26.0;
+    }
     HookEvent("round_freeze_end", FreezeEnd, EventHookMode_PostNoCopy);
     HookEvent("weapon_fire", TraceFire, EventHookMode_Post);
 }

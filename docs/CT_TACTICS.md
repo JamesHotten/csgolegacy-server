@@ -4,6 +4,8 @@
 
 `BetterBots T Tactical Director` 使用相同的可选桥接，但拥有独立状态、配置和开关；两方不会共享战术命令。
 
+Overpass 补防与命名回防入口、Mirage 开局补枪和 Nuke 卡路/B 区补位见 [三图 CT 专项](CT_MAP_REFINEMENT.md)。
+
 ## 战术行为
 
 - 标准局：根据地图 A、B 包点、T 出生方向和 NAV 掩体自动形成 A/B 防守与中间回防位；5 名 CT 通常是 2A、2B、1 名机动位。BOT 到位后由双方共用的架点规划器按武器距离、局部 NAV、视线和不同防守扇区选择主要进攻方向，接敌时立即交还原战斗 AI。

@@ -3,6 +3,7 @@
 #include <sourcemod>
 #include <sdktools>
 #include <cstrike>
+#include <commandline>
 
 native bool BotTTactics_GetOrder(int client, float goal[3], int &route);
 native bool BotTTactics_ShouldHoldStage(int client);
@@ -61,6 +62,17 @@ public void OnPluginStart()
     g_enableContact = CreateConVar("sm_plant_route_probe_contact", "0", "Allow an armed retake after the plant; isolated only.");
     g_endMap = CreateConVar("sm_plant_route_probe_end_map", "de_anubis", "Last map in this shard of the live matrix.");
     g_firstSite = CreateConVar("sm_plant_route_probe_first_site", "0", "Start at B on the initial map of a diagnostic shard.", _, true, 0.0, true, 1.0);
+    if (FindCommandLineParam("-ctrefinelive"))
+    {
+        char ip[32], last[32];
+        GetCommandLineParam("-ip", ip, sizeof(ip));
+        if (!StrEqual(ip, "127.0.0.1")) SetFailState("CT refinement fixture is loopback-only");
+        GetCommandLineParam("-ctrefineend", last, sizeof(last), "de_anubis");
+        g_enabled.BoolValue = g_liveAll.BoolValue = true;
+        g_endMap.SetString(last);
+        g_clearDelay.FloatValue = 7.0;
+        g_utilityProbe.BoolValue = true;
+    }
     HookEvent("round_freeze_end", FreezeEnd, EventHookMode_PostNoCopy);
     HookEvent("bomb_beginplant", ObjectiveEvent, EventHookMode_Post);
     HookEvent("bomb_planted", ObjectiveEvent, EventHookMode_Post);
@@ -102,6 +114,7 @@ bool Safe()
 public Action Prepare(Handle timer)
 {
     if (!Safe()) return Plugin_Stop;
+    if (FindCommandLineParam("-ctrefinelive")) FindConVar("sm_bot_ct_tactics_debug").BoolValue = true;
     if (g_liveAll.BoolValue && !g_live) g_liveSite = g_firstSite.IntValue;
     ServerCommand("sv_cheats 1; bot_dont_shoot 1; mp_autoteambalance 0; mp_limitteams 0; mp_freezetime 3; mp_roundtime_defuse 1.92; mp_ignore_round_win_conditions 1; mp_c4timer 40");
     ServerCommand("bot_join_after_player 0; bot_quota_mode normal; bot_quota 0; bot_kick");

@@ -38,6 +38,10 @@ public Action Tick(Handle timer)
     if (g_stage == 0)
     {
         if (GetGameTime() < 10.0) return Plugin_Continue;
+        // This legacy fixture deliberately verifies the native-release
+        // fallback. The map refinement probe independently tests the detour.
+        ConVar nukeCover = FindConVar("sm_bot_ct_nuke_route_cover");
+        if (g_repeatFall.BoolValue && nukeCover != null) nukeCover.BoolValue = false;
         ServerCommand("bot_dont_shoot 1; sm_bot_t_tactics_enable 0; sm_bot_experience_record_enable 0; mp_ignore_round_win_conditions 1; mp_freezetime 1; mp_warmup_end; mp_restartgame 1");
         g_since = GetGameTime();
         g_stage++;
