@@ -3,6 +3,7 @@
 #include <sourcemod>
 #include <sdktools>
 #include <cstrike>
+#include <commandline>
 
 native bool BotCTTactics_GetOrder(int client, float goal[3], int &route);
 native bool BotTTactics_GetOrder(int client, float goal[3], int &route);
@@ -10,12 +11,23 @@ native bool BotTTactics_GetOrder(int client, float goal[3], int &route);
 public Plugin myinfo = {name = "Isolated tactical stability fixture", version = "1.0"};
 ConVar g_enable;
 bool g_live;
+int g_ruleFixture;
 int g_rounds, g_phases;
 int g_previousTeam[MAXPLAYERS + 1], g_previousUserId[MAXPLAYERS + 1];
 
 public void OnPluginStart()
 {
     g_enable = CreateConVar("sm_tactical_stability_fixture", "0", "Run short match on an isolated CS:GO Legacy server only.");
+    if (FindCommandLineParam("-ctstabilitymode"))
+    {
+        char ip[24], mode[8];
+        GetCommandLineParam("-ip", ip, sizeof(ip));
+        GetCommandLineParam("-ctstabilitymode", mode, sizeof(mode));
+        if (!StrEqual(ip, "127.0.0.1") || (!StrEqual(mode,"mr12") && !StrEqual(mode,"mr15")))
+            SetFailState("Refusing non-loopback/unknown ruleset fixture");
+        g_ruleFixture = StrEqual(mode,"mr12") ? 12 : 15;
+        g_enable.BoolValue = true;
+    }
     HookEvent("round_freeze_end", OnFreezeEnd, EventHookMode_PostNoCopy);
     HookEvent("announce_phase_end", OnPhaseEnd, EventHookMode_PostNoCopy);
 }
@@ -38,6 +50,17 @@ bool Safe()
 public Action Prepare(Handle timer)
 {
     if (!Safe()) return Plugin_Stop;
+    if (g_ruleFixture)
+    {
+        ServerCommand("exec mr%d.cfg", g_ruleFixture);
+        ServerExecute();
+        int rounds = FindConVar("mp_maxrounds").IntValue;
+        int ruleset = FindConVar("sm_lan_economy_ruleset").IntValue;
+        int overtime = FindConVar("mp_overtime_enable").IntValue;
+        if (rounds != g_ruleFixture * 2 || ruleset != (g_ruleFixture == 12 ? 1 : 0) || overtime != 1)
+            SetFailState("Configured MR ruleset did not apply before fixture shortening");
+        PrintToServer("TACTICAL_RULESET rounds=%d mode=%d overtime=%d", rounds, ruleset, overtime);
+    }
     ServerCommand("sv_cheats 1; bot_dont_shoot 1; mp_autoteambalance 0; mp_limitteams 0; mp_freezetime 2; mp_round_restart_delay 2; mp_halftime 1; mp_maxrounds 2; mp_overtime_enable 1; mp_overtime_maxrounds 2; mp_halftime_duration 2; mp_match_can_clinch 1; mp_ignore_round_win_conditions 0; mp_do_warmup_period 0; bot_join_after_player 0; bot_quota_mode normal; bot_quota 0; bot_kick");
     ServerExecute();
     for (int i = 0; i < 5; i++) ServerCommand("bot_add_ct; bot_add_t");
@@ -88,6 +111,7 @@ public Action Inspect(Handle timer)
     if (g_rounds >= 4)
     {
         g_live = false;
+        if (g_ruleFixture) ServerCommand("quit");
         return Plugin_Stop;
     }
     // Force regulation 1:1 and advance into the genuine overtime half switch.

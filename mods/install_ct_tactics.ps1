@@ -1956,6 +1956,8 @@ if (-not $text.Contains('BEGIN CT_HOLD_READY_GUN')) {
 
 . (Join-Path $PSScriptRoot "patch_ct_breakable_bridge.ps1")
 $text = Add-CTBreakableBridge -Source $text
+. (Join-Path $PSScriptRoot "patch_ct_retake_travel_bridge.ps1")
+$text = Add-CTRetakeTravelBridge -Source $text
 
 $candidateExperiencePlugin = Join-Path $buildDir "000_bot_tactical_experience.smx"
 

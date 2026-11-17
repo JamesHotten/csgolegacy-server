@@ -9,6 +9,7 @@ native bool BotTTactics_GetOrder(int client, float goal[3], int &route);
 native bool BotTTactics_ShouldHoldStage(int client);
 native int BotTTactics_GetAttackSite();
 native bool BotCTTactics_GetOrder(int client, float goal[3], int &route);
+native void BotCTTactics_ReportRouteDrive(int client, bool driving, bool defuseApproach = false);
 native int BotTTactics_GetUtilityLane(int client);
 #include "../mods/include/bot_tactical_map_profiles.inc"
 
@@ -16,6 +17,16 @@ public Plugin myinfo = {name = "Plant and retake route probe (isolated only)", v
 ConVar g_enabled, g_targetB, g_surveyOnly, g_surveyAll, g_split, g_routeSeries, g_kit, g_stageOnly;
 ConVar g_clearDelay, g_alternateSites, g_stallProbe, g_utilityProbe, g_comboProbe, g_plantStallProbe;
 ConVar g_liveAll, g_replaceDefuser, g_enableContact, g_endMap, g_firstSite;
+char g_pressure[12];
+bool g_pressureSingle, g_pressureConnector, g_pressureStuck;
+int g_pressureStuckUser;
+float g_pressureStuckStart, g_pressureStuckOrigin[3];
+bool g_pressureWaypointSeen;
+int g_pressureStarts, g_pressureStops, g_pressureFinalDefuser, g_pressureCT, g_pressureT;
+int g_pressureCTKills, g_pressureTKills, g_pressureTAtFirstUse;
+int g_pressureDefenders;
+float g_pressureFirstLeft, g_pressureFinishLeft;
+float g_pressureNearLeft, g_pressureEligibleLeft;
 int g_liveSite;
 float g_maxRetakeZ;
 float g_retakeStartZ[MAXPLAYERS + 1];
@@ -72,11 +83,29 @@ public void OnPluginStart()
         g_endMap.SetString(last);
         g_clearDelay.FloatValue = 7.0;
         g_utilityProbe.BoolValue = true;
+        GetCommandLineParam("-ctretakepressure", g_pressure, sizeof(g_pressure));
+        if (g_pressure[0] != '\0')
+        {
+            if (!StrEqual(g_pressure, "armed") && !StrEqual(g_pressure, "relay"))
+                SetFailState("Unsupported retake pressure scenario");
+            g_enableContact.BoolValue = true;
+            g_replaceDefuser.BoolValue = StrEqual(g_pressure, "relay");
+            g_pressureSingle = FindCommandLineParam("-pressureone");
+            g_pressureConnector = FindCommandLineParam("-pressureconnector");
+            g_pressureStuck = g_pressureConnector && FindCommandLineParam("-pressurestuck");
+            g_firstSite.IntValue = FindCommandLineParam("-pressureb") ? 1 : 0;
+            if (FindCommandLineParam("-pressurenokit")) g_kit.BoolValue = false;
+            char defenders[4];
+            GetCommandLineParam("-pressuredefenders", defenders, sizeof(defenders), "5");
+            g_pressureDefenders = StringToInt(defenders);
+            if (g_pressureDefenders < 2 || g_pressureDefenders > 5) SetFailState("Pressure needs between two and five living defenders");
+        }
     }
     HookEvent("round_freeze_end", FreezeEnd, EventHookMode_PostNoCopy);
     HookEvent("bomb_beginplant", ObjectiveEvent, EventHookMode_Post);
     HookEvent("bomb_planted", ObjectiveEvent, EventHookMode_Post);
     HookEvent("bomb_begindefuse", ObjectiveEvent, EventHookMode_Post);
+    HookEvent("bomb_abortdefuse", ObjectiveEvent, EventHookMode_Post);
     HookEvent("bomb_defused", ObjectiveEvent, EventHookMode_Post);
     HookEvent("round_end", RoundResult, EventHookMode_Post);
     HookEvent("smokegrenade_detonate", UtilityDetonated, EventHookMode_Post);
@@ -157,6 +186,12 @@ public void Begin(any unused)
         g_actualSite = -1;
         g_firstDefuser = 0;
         g_armedCombatDeaths = 0;
+        g_pressureStarts = g_pressureStops = g_pressureFinalDefuser = g_pressureCT = g_pressureT = 0;
+        g_pressureCTKills = g_pressureTKills = 0;
+        g_pressureTAtFirstUse = -1;
+        g_pressureStuckUser = 0;
+        g_pressureFirstLeft = g_pressureFinishLeft = -1.0;
+        g_pressureNearLeft = g_pressureEligibleLeft = -1.0;
         g_stallSamples = g_nativeStallSamples = g_waitSamples = 0;
         g_maxRetakeZ = 0.0;
         char map[64];
@@ -527,13 +562,46 @@ public void ObjectiveEvent(Event event, const char[] name, bool dontBroadcast)
                 if (GetClientTeam(i) == CS_TEAM_T && g_clearDelay.FloatValue > 0.0 && !g_liveAll.BoolValue) SetEntityMoveType(i, MOVETYPE_NONE);
                 else if (GetClientTeam(i) == CS_TEAM_CT)
                 {
+                    if (g_pressureConnector && g_liveSite == 0)
+                    {
+                        char map[32];
+                        GetCurrentMap(map, sizeof(map));
+                        if (StrEqual(map, "de_overpass") && i == g_ct)
+                        {
+                            float point[3] = {-1460.0,-773.0,36.0};
+                            TeleportEntity(i, point, NULL_VECTOR, NULL_VECTOR);
+                            PrintToServer("RETAKE_CONNECTOR_START uid=%d pos=%.0f,%.0f,%.0f",
+                                GetClientUserId(i), point[0],point[1],point[2]);
+                            if (g_pressureStuck)
+                                CreateTimer(2.5, BeginPressureStall, GetClientUserId(i), TIMER_FLAG_NO_MAPCHANGE);
+                        }
+                    }
                     SetEntityMoveType(i, MOVETYPE_WALK);
                     SetEntProp(i, Prop_Send, "m_bHasDefuser", g_kit.BoolValue ? 1 : 0);
                     float start[3]; GetClientAbsOrigin(i, start);
                     g_retakeStartZ[i] = start[2];
                 }
             }
-        if (g_clearDelay.FloatValue > 0.0)
+        if (g_pressure[0] != '\0')
+        {
+            if (g_pressureDefenders < 5)
+            {
+                // This fixture chooses a post-plant population once, before
+                // shooting resumes. All selected defenders stay in play.
+                PressureSelectDefenders(client);
+            }
+            for (int i = 1; i <= MaxClients; i++)
+                if (IsClientInGame(i) && IsPlayerAlive(i))
+                {
+                    if (GetClientTeam(i) == CS_TEAM_CT) g_pressureCT++;
+                    if (GetClientTeam(i) == CS_TEAM_T) g_pressureT++;
+                }
+            // Both teams keep their real weapons and can fight. No forced
+            // clearing at a fixed deadline in the armed and relay scenarios.
+            FindConVar("mp_ignore_round_win_conditions").BoolValue = false;
+            CreateTimer(0.25, ObservePressureApproach, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+        }
+        else if (g_clearDelay.FloatValue > 0.0)
             CreateTimer(g_clearDelay.FloatValue, ClearTestAttackers, _, TIMER_FLAG_NO_MAPCHANGE);
         else ClearTestAttackers(null);
         if (g_enableContact.BoolValue)
@@ -542,6 +610,18 @@ public void ObjectiveEvent(Event event, const char[] name, bool dontBroadcast)
             PrintToServer("LIVE_RETAKE_CONTACT");
         }
     }
+    if (g_pressure[0] != '\0' && StrEqual(name, "bomb_begindefuse"))
+    {
+        if (++g_pressureStarts == 1)
+        {
+            g_pressureFirstLeft = 40.0 - (GetGameTime() - g_plantedAt);
+            g_pressureTAtFirstUse = 0;
+            for (int i = 1; i <= MaxClients; i++)
+                if (IsClientInGame(i) && IsPlayerAlive(i) && GetClientTeam(i) == CS_TEAM_T)
+                    g_pressureTAtFirstUse++;
+        }
+    }
+    if (g_pressure[0] != '\0' && StrEqual(name, "bomb_abortdefuse")) g_pressureStops++;
     if (StrEqual(name, "bomb_begindefuse") && client > 0 && g_replaceDefuser.BoolValue && g_firstDefuser == 0)
     {
         g_firstDefuser = GetClientUserId(client);
@@ -550,6 +630,11 @@ public void ObjectiveEvent(Event event, const char[] name, bool dontBroadcast)
     if (StrEqual(name, "bomb_defused"))
     {
         g_completed = true;
+        if (g_pressure[0] != '\0')
+        {
+            g_pressureFinalDefuser = client > 0 ? GetClientUserId(client) : 0;
+            g_pressureFinishLeft = 40.0 - (GetGameTime() - g_plantedAt);
+        }
         char map[64];
         GetCurrentMap(map, sizeof(map));
         PrintToServer("PLANT_ROUTE_PASS map=%s plant_to_defuse=%.2f stage_samples=%d commit_samples=%d",
@@ -560,6 +645,135 @@ public void ObjectiveEvent(Event event, const char[] name, bool dontBroadcast)
                 g_firstDefuser, client > 0 ? GetClientUserId(client) : 0);
         NextRouteCase();
     }
+}
+
+public Action ObservePressureApproach(Handle timer)
+{
+    if (!Safe() || !g_live || !g_planted || g_completed) return Plugin_Stop;
+    int bomb = FindEntityByClassname(-1, "planted_c4");
+    if (bomb == -1) return Plugin_Continue;
+    float timeLeft = GetEntPropFloat(bomb, Prop_Send, "m_flC4Blow") - GetGameTime();
+    if (timeLeft <= 0.0 || g_pressureEligibleLeft >= 0.0) return Plugin_Continue;
+    float origin[3], eye[3], target[3], foot[3];
+    GetEntPropVector(bomb, Prop_Send, "m_vecOrigin", origin);
+    target = origin;
+    target[2] += 8.0;
+    for (int i = 1; i <= MaxClients; i++)
+    {
+        if (!IsClientInGame(i) || !IsPlayerAlive(i) || GetClientTeam(i) != CS_TEAM_CT) continue;
+        GetClientAbsOrigin(i, foot);
+        float distance = GetVectorDistance(foot, origin);
+        if (distance > 224.0 || FloatAbs(foot[2] - origin[2]) > 66.0) continue;
+        GetClientEyePosition(i, eye);
+        Handle trace = TR_TraceRayFilterEx(eye, target, MASK_VISIBLE, RayType_EndPoint, PressureWorldTrace, bomb);
+        bool clear = !TR_StartSolid(trace) && !TR_DidHit(trace);
+        delete trace;
+        if (!clear) continue;
+        if (g_pressureNearLeft < 0.0) g_pressureNearLeft = timeLeft;
+        if (distance <= 80.0 && timeLeft >= (GetEntProp(i, Prop_Send, "m_bHasDefuser") ? 5.5 : 10.5))
+            g_pressureEligibleLeft = timeLeft;
+    }
+    return Plugin_Continue;
+}
+
+void PressureSelectDefenders(int planter)
+{
+    if (planter <= 0 || !IsClientInGame(planter) || !IsPlayerAlive(planter)) return;
+    bool keep[MAXPLAYERS + 1];
+    keep[planter] = true;
+    float origin[3];
+    GetClientAbsOrigin(planter, origin);
+    for (int pick = 1; pick < g_pressureDefenders; pick++)
+    {
+        int chosen;
+        float best = 999999.0;
+        for (int client = 1; client <= MaxClients; client++)
+        {
+            if (keep[client] || !IsClientInGame(client) || !IsPlayerAlive(client) || GetClientTeam(client) != CS_TEAM_T) continue;
+            float position[3];
+            GetClientAbsOrigin(client,position);
+            float distance = GetVectorDistance(origin, position);
+            if (distance < best) { chosen = client; best = distance; }
+        }
+        if (chosen == 0) return;
+        keep[chosen] = true;
+    }
+    for (int client = 1; client <= MaxClients; client++)
+        if (!keep[client] && IsClientInGame(client) && IsPlayerAlive(client) && GetClientTeam(client) == CS_TEAM_T)
+            ForcePlayerSuicide(client);
+    PrintToServer("RETAKE_PRESSURE_SETUP defenders=%d", g_pressureDefenders);
+}
+
+public bool PressureWorldTrace(int entity, int mask, any bomb) { return entity > MaxClients && entity != bomb; }
+
+public Action BeginPressureStall(Handle timer, int userid)
+{
+    if (!Safe() || !g_live || !g_planted) return Plugin_Stop;
+    int client = GetClientOfUserId(userid);
+    int route;
+    float goal[3], foot[3];
+    if (client <= 0 || !IsPlayerAlive(client) || !BotCTTactics_GetOrder(client, goal, route))
+    {
+        client = 0;
+        for (int i = 1; i <= MaxClients && !client; i++)
+            if (IsClientInGame(i) && IsPlayerAlive(i) && GetClientTeam(i) == CS_TEAM_CT
+                && BotCTTactics_GetOrder(i, goal, route))
+            {
+                GetClientAbsOrigin(i, foot);
+                if (FloatAbs(foot[2] - goal[2]) > 180.0) client = i;
+            }
+    }
+    if (!client)
+    {
+        PrintToServer("RETAKE_STALL_INVALID reason=no_ordered_candidate");
+        return Plugin_Stop;
+    }
+    float place[3] = {-1460.0,-773.0,36.0};
+    TeleportEntity(client, place, NULL_VECTOR, NULL_VECTOR);
+    g_pressureStuckUser = GetClientUserId(client);
+    g_pressureStuckStart = GetGameTime();
+    GetClientAbsOrigin(client, g_pressureStuckOrigin);
+    SetEntityMoveType(client, MOVETYPE_NONE);
+    g_pressureWaypointSeen = false;
+    CreateTimer(0.10, CheckPressureStall, _, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
+    return Plugin_Stop;
+}
+
+public Action CheckPressureStall(Handle timer)
+{
+    if (!Safe()) return Plugin_Stop;
+    int client = GetClientOfUserId(g_pressureStuckUser);
+    if (client <= 0 || !IsPlayerAlive(client)) return Plugin_Stop;
+    float elapsed = GetGameTime() - g_pressureStuckStart;
+    float goal[3];
+    int route;
+    if (!g_pressureWaypointSeen && BotCTTactics_GetOrder(client, goal, route)
+        && GetVectorDistance(goal, g_pressureStuckOrigin) >= 130.0
+        && GetVectorDistance(goal, g_pressureStuckOrigin) <= 480.0 && FloatAbs(goal[2] - g_pressureStuckOrigin[2]) < 45.0)
+    {
+        g_pressureWaypointSeen = true;
+        SetEntityMoveType(client, MOVETYPE_WALK);
+        PrintToServer("RETAKE_STALL_WAYPOINT uid=%d observed=1 after=%.2f goal=%.0f,%.0f,%.0f",
+            g_pressureStuckUser, elapsed, goal[0],goal[1],goal[2]);
+    }
+    if (elapsed < 12.0 && g_live) return Plugin_Continue;
+    SetEntityMoveType(client, MOVETYPE_WALK);
+    float pos[3];
+    GetClientAbsOrigin(client, pos);
+    PrintToServer("RETAKE_STALL_RESULT uid=%d observed=%d traveled=%.0f", g_pressureStuckUser, g_pressureWaypointSeen,
+        GetVectorDistance(pos, g_pressureStuckOrigin));
+    g_pressureStuckUser = 0;
+    return Plugin_Stop;
+}
+
+public void OnPlayerRunCmdPost(int client, int buttons, int impulse, const float vel[3], const float angles[3],
+    int weapon, int subtype, int cmdnum, int tickcount, int seed, const int mouse[2])
+{
+    if (!g_pressureStuckUser || !g_live || g_pressureWaypointSeen || !IsClientInGame(client)
+        || GetClientUserId(client) != g_pressureStuckUser || !Safe()) return;
+    // Replay the captured task classification at the real movement input
+    // seam after the bridge's pre-hook, without faking plant/defuse events.
+    BotCTTactics_ReportRouteDrive(client, false, true);
 }
 
 public Action RemoveFirstDefuser(Handle timer, int userid)
@@ -598,7 +812,11 @@ public void LiveCaseDeath(Event event, const char[] name, bool dontBroadcast)
     int victim = GetClientOfUserId(event.GetInt("userid"));
     int attacker = GetClientOfUserId(event.GetInt("attacker"));
     if (victim > 0 && attacker > 0 && victim != attacker && GetClientTeam(victim) != GetClientTeam(attacker))
+    {
         g_armedCombatDeaths++;
+        if (GetClientTeam(attacker) == CS_TEAM_CT) g_pressureCTKills++;
+        if (GetClientTeam(attacker) == CS_TEAM_T) g_pressureTKills++;
+    }
 }
 
 void FinishLiveCase(const char[] outcome, int winner, int reason)
@@ -614,12 +832,24 @@ void FinishLiveCase(const char[] outcome, int winner, int reason)
     PrintToServer("LIVE_CASE_MOTION map=%s site=%s waiting=%d ordered_stalls=%d native_stalls=%d",
         map, g_liveSite == 0 ? "A" : "B", g_waitSamples, g_stallSamples, g_nativeStallSamples);
     if (g_enableContact.BoolValue) PrintToServer("LIVE_CASE_CONTACT enemy_kills=%d", g_armedCombatDeaths);
+    if (g_pressure[0] != '\0')
+        PrintToServer("RETAKE_PRESSURE map=%s site=%s mode=%s ct=%d t=%d ct_kills=%d t_kills=%d use=%d aborts=%d t_at_use=%d use_left=%.2f finish_left=%.2f first=%d final=%d",
+            map, g_liveSite == 0 ? "A" : "B", g_pressure, g_pressureCT, g_pressureT, g_pressureCTKills, g_pressureTKills,
+            g_pressureStarts, g_pressureStops, g_pressureTAtFirstUse, g_pressureFirstLeft, g_pressureFinishLeft, g_firstDefuser, g_pressureFinalDefuser);
+    if (g_pressure[0] != '\0')
+        PrintToServer("RETAKE_PRESSURE_APPROACH near_left=%.2f eligible_left=%.2f", g_pressureNearLeft, g_pressureEligibleLeft);
     CreateTimer(1.5, AdvanceLiveCase, _, TIMER_FLAG_NO_MAPCHANGE);
 }
 
 public Action AdvanceLiveCase(Handle timer)
 {
     if (!Safe()) return Plugin_Stop;
+    if (g_pressureSingle)
+    {
+        PrintToServer("LIVE_CASE_SUITE_DONE");
+        ServerCommand("quit");
+        return Plugin_Stop;
+    }
     if (g_liveSite == 0)
     {
         g_liveSite = 1;
@@ -634,7 +864,11 @@ public Action AdvanceLiveCase(Handle timer)
     g_firstSite.IntValue = 0;
     if (!StrEqual(map, last, false) && TacticalMap_GetName(TacticalMap_Find(map) + 1, next, sizeof(next)))
         ForceChangeLevel(next, "isolated live regression");
-    else PrintToServer("\nLIVE_CASE_SUITE_DONE");
+    else
+    {
+        PrintToServer("\nLIVE_CASE_SUITE_DONE");
+        if (g_pressure[0] != '\0') ServerCommand("quit");
+    }
     return Plugin_Stop;
 }
 

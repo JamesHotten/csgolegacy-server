@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.16"
+#define PLUGIN_VERSION "0.1.17"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -136,6 +136,7 @@ ConVar g_cvNavigationStallTimeout;
 ConVar g_cvMidReorganize;
 ConVar g_cvOverpassTeamwork, g_cvMirageCrossfire, g_cvNukeRoutes;
 ConVar g_cvOverpassAOpening;
+ConVar g_cvRetakeLocalDetour;
 ConVar g_cvProfiledRelief, g_cvProfiledRetake;
 int g_contactEnemy[MAXPLAYERS + 1];
 float g_contactSeenAt[MAXPLAYERS + 1];
@@ -281,6 +282,7 @@ public void OnPluginStart()
     g_cvMidReorganize = CreateConVar("sm_bot_ct_mid_reorganize_enable", "1", "Reinforce on two confirmed attackers; permit full rotation only against a strong confirmed execute.", _, true, 0.0, true, 1.0);
     g_cvOverpassTeamwork = CreateConVar("sm_bot_ct_overpass_teamwork", "1", "Overpass: cover-based reinforcement and reachable named retake routes.", _, true, 0.0, true, 1.0);
     g_cvOverpassAOpening = CreateConVar("sm_bot_ct_overpass_a_crossfire", "1", "Overpass standard A opening: paired Lower Park/Restroom holds.", _, true, 0.0, true, 1.0);
+    g_cvRetakeLocalDetour = CreateConVar("sm_bot_ct_retake_crossfloor_recovery", "1", "Use one local ground waypoint after a proven cross-floor retake stall.", _, true, 0.0, true, 1.0);
     g_cvMirageCrossfire = CreateConVar("sm_bot_ct_mirage_crossfire", "1", "Mirage: opening partners cover each other and briefly support confirmed contact.", _, true, 0.0, true, 1.0);
     g_cvNukeRoutes = CreateConVar("sm_bot_ct_nuke_route_cover", "1", "Nuke: one bounded route correction and lower-site anchor backfill.", _, true, 0.0, true, 1.0);
     g_cvProfiledRelief = CreateConVar("sm_bot_ct_profiled_relief", "1", "TEN Legacy maps: route-checked cover reinforcement for standard defenses.", _, true, 0.0, true, 1.0);
@@ -474,7 +476,7 @@ public any Native_GetOrder(Handle plugin, int numParams)
         return false;
     }
 
-    if (NukeRouteCoverEnabled() && g_phase == Phase_Initial && g_nukeDetouring[client])
+    if (g_nukeDetouring[client] && ((NukeRouteCoverEnabled() && g_phase == Phase_Initial) || CrossFloorRetakeScope()))
         SetNativeArray(2, g_nukeAlternate[client], 3);
     else SetNativeArray(2, g_orderGoal[client], 3);
     SetNativeCellRef(3, g_orderRoute[client]);
@@ -489,7 +491,7 @@ public any Native_GetAim(Handle plugin, int numParams)
         return false;
 
     bool live = numParams >= 3 && GetNativeCell(3) != 0;
-    if (live && NukeRouteCoverEnabled() && g_phase == Phase_Initial && g_nukeDetouring[client]) return false;
+    if (live && g_nukeDetouring[client] && ((NukeRouteCoverEnabled() && g_phase == Phase_Initial) || CrossFloorRetakeScope())) return false;
     if (live && MirageCrossfireEnabled() && g_phase == Phase_Initial && g_mirageTradeUntil[client] > GetGameTime())
     {
         float eye[3];
@@ -558,7 +560,16 @@ public any Native_ReportRouteDrive(Handle plugin, int numParams)
 {
     int client = GetNativeCell(1);
     if (g_cvRouteRecovery.BoolValue && IsCTBot(client) && g_hasOrder[client])
-        TacticalRecovery_Report(client, GetNativeCell(2) != 0);
+    {
+        bool driving = GetNativeCell(2) != 0;
+        if (!driving && numParams >= 3 && GetNativeCell(3) != 0 && CrossFloorRetakeScope())
+        {
+            float pos[3];
+            GetClientAbsOrigin(client, pos);
+            driving = FloatAbs(pos[2] - g_bombPosition[2]) >= 170.0;
+        }
+        TacticalRecovery_Report(client, driving);
+    }
     return 0;
 }
 
@@ -2058,7 +2069,7 @@ void ReviewDefuser()
     }
     if (g_defuserUserId == 0) return;
     candidate = GetClientOfUserId(g_defuserUserId);
-    if (!g_retakeUnopposed && g_hasOrder[candidate] && !g_combatReleased[candidate])
+    if (!g_retakeUnopposed && g_hasOrder[candidate] && !g_combatReleased[candidate] && !g_nukeDetouring[candidate])
     {
         CopyVector(g_bombPosition, g_orderGoal[candidate]);
         g_hasLook[candidate] = false;
@@ -2272,6 +2283,14 @@ bool NukeRouteCoverEnabled()
         && NativeAvailable("NavMeshArea_GetCostSoFar");
 }
 
+bool CrossFloorRetakeScope()
+{
+    if (!g_cvRetakeLocalDetour.BoolValue || !g_cvRouteRecovery.BoolValue || g_retakeUnopposed || !g_bombPlanted
+        || g_phase != Phase_RetakeCommit || !NativeAvailable("NavMesh_BuildPath")
+        || !NativeAvailable("NavMeshArea_GetCostSoFar")) return false;
+    return (g_mapProfile == 5 && RetakeSite() == 0) || (g_nukeMap && RetakeSite() == 1);
+}
+
 int NukePreferLowerOwner(int owner, int goalArea, const float goal[3], const float upper[3])
 {
     float pos[3];
@@ -2289,7 +2308,7 @@ int NukePreferLowerOwner(int owner, int goalArea, const float goal[3], const flo
     return chosen;
 }
 
-bool NukeTryDetour(int client, const float from[3])
+bool NukeTryDetour(int client, const float from[3], bool retake = false)
 {
     if (g_nukeDetourUsed[client] || g_combatReleased[client] || g_blindUntil[client] > GetGameTime()
         || (NativeAvailable("BotStuff_HasVisibleEnemy") && BotStuff_HasVisibleEnemy(client))) return false;
@@ -2321,8 +2340,9 @@ bool NukeTryDetour(int client, const float from[3])
     g_nukeDetourUsed[client] = g_nukeDetouring[client] = true;
     CopyVector(chosen, g_nukeAlternate[client]);
     g_orderLastProgressAt[client] = GetGameTime();
-    ExperienceSignal("route_retry", "nuke_local_waypoint", NearestSite(g_orderGoal[client]), client);
-    DebugLog("Nuke local detour bot=%N waypoint=%.0f %.0f %.0f", client, chosen[0], chosen[1], chosen[2]);
+    ExperienceSignal("route_retry", retake ? "retake_local_waypoint" : "nuke_local_waypoint",
+        retake ? RetakeSite() : NearestSite(g_orderGoal[client]), client);
+    DebugLog("%s local detour bot=%N waypoint=%.0f %.0f %.0f", retake ? "CT retake" : "Nuke", client, chosen[0], chosen[1], chosen[2]);
     return true;
 }
 
@@ -3330,7 +3350,8 @@ void ReleaseStalledOrders()
 
         float position[3];
         GetClientAbsOrigin(client, position);
-        if (NukeRouteCoverEnabled() && g_phase == Phase_Initial && g_nukeDetouring[client])
+        bool retakeRecovery = CrossFloorRetakeScope();
+        if (g_nukeDetouring[client] && ((NukeRouteCoverEnabled() && g_phase == Phase_Initial) || retakeRecovery))
         {
             if (GetVectorDistance(position, g_nukeAlternate[client]) <= 105.0
                 && FloatAbs(position[2] - g_nukeAlternate[client][2]) < 72.0)
@@ -3398,6 +3419,8 @@ void ReleaseStalledOrders()
         float timeout = g_cvNavigationStallTimeout.FloatValue;
         if (precise && timeout < 5.0) timeout = 5.0;
         if (now - g_orderLastProgressAt[client] < timeout) continue;
+        if (retakeRecovery && FloatAbs(position[2] - g_bombPosition[2]) >= 170.0
+            && NukeTryDetour(client, position, true)) continue;
         if (NukeRouteCoverEnabled() && g_phase == Phase_Initial && NukeTryDetour(client, position)) continue;
         if (g_cvRouteRecovery.BoolValue && !g_innerOrder[client] && !g_recoveryTried[client] && g_phase != Phase_RetakeCommit
             && !(NukeRouteCoverEnabled() && g_phase == Phase_Initial && g_nukeDetourUsed[client])

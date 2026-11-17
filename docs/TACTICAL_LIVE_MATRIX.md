@@ -10,6 +10,14 @@
 4. `tests/check_tactical_live_matrix.ps1 -Log <console.log>` 要求十图 A/B 各有一条记录，实际包点和请求一致，CT 经真实拆包获胜，T 有守包到位样本，并且回防确实发出过战术命令。Nuke B 还要求记录到高度变化。传 `-ReportOnly` 可查看未完成或失败的记录。
 5. 单独的压力用例：`sm_plant_route_probe_contact 1` 在下包后允许交火并统计敌方击杀；`sm_plant_route_probe_replace_defuser 1` 移除第一个实际开始拆包的 BOT，要求不同的 BOT 完成拆包；`sm_plant_route_probe_utility 1` 给 T 分发烟闪并记录真实爆开。应分别验收，不用基线结果替代这些压力用例。
 
+### 不定时清除守包者的压力测试
+
+回环测试服可用 `-ctrefinelive -ctretakepressure armed` 启用。真实下包后才开放交火；可用 `-pressuredefenders 2` 在开火前固定两名 T 守员，余下两名守员不再被计时器移除（未指定时五名全留）。用 `relay` 替代 `armed` 只额外移除首名真实开拆的 CT，验证第二人接手；这是受控阵亡场景，不把移除计作对手击杀。 `-pressureone` 只测一个点，另加 `-pressureb` 选 B。
+
+`tests/check_tactical_pressure_matrix.ps1 -Log <日志路径数组>` 核对实际包点、引擎拆弹、双方击杀及 10 图 A/B 顺序。Nuke B 须实际记录跨层。它不要求 CT 赢每个交火回合；至少每图有一个实际拆成的回合，失败和超时仍全部保留。
+
+Overpass A 与 Nuke B 的跨层回防可在确认失去移动进度后尝试一次较近、同层且导航可达的中间路点，然后回原目标。移动桥只有在没有可见敌人、没有投道具、未在撤离且未真正拆包时才会补报「原生引擎正赶往炸弹」。关闭 `sm_bot_ct_retake_crossfloor_recovery 0` 即回到原有行为。此项不调整集合时限、经济、枪法或 T 方守包。
+
 Overpass A 掉包复测用 `tests/ct_loose_c4_runtime_probe.sp` 与 `sm_ct_guard_probe_overpass_a 1`；它用包区内可落脚的位置重新建立目击条件。Dust II A 命名入口用 `tests/tactical_sightline_runtime_probe.sp` 从实际眼位检查，应确认面向可见的命名回防入口，而不仅是没有撞墙。
 
 ## 本轮行为
