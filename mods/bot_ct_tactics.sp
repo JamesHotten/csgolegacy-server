@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.15"
+#define PLUGIN_VERSION "0.1.16"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -135,6 +135,7 @@ ConVar g_cvRadioReport;
 ConVar g_cvNavigationStallTimeout;
 ConVar g_cvMidReorganize;
 ConVar g_cvOverpassTeamwork, g_cvMirageCrossfire, g_cvNukeRoutes;
+ConVar g_cvOverpassAOpening;
 ConVar g_cvProfiledRelief, g_cvProfiledRetake;
 int g_contactEnemy[MAXPLAYERS + 1];
 float g_contactSeenAt[MAXPLAYERS + 1];
@@ -179,6 +180,7 @@ bool g_hasOrder[MAXPLAYERS + 1];
 bool g_hasLook[MAXPLAYERS + 1];
 bool g_infernoPreciseOrder[MAXPLAYERS + 1];
 bool g_innerOrder[MAXPLAYERS + 1];
+bool g_overpassOpeningOrder[MAXPLAYERS + 1];
 int g_plainFallTick[MAXPLAYERS + 1];
 float g_lastRouteFallAt[MAXPLAYERS + 1], g_lastRouteFallDistance[MAXPLAYERS + 1];
 bool g_combatReleased[MAXPLAYERS + 1];
@@ -278,6 +280,7 @@ public void OnPluginStart()
     g_cvOverpassTeamwork = CreateConVar("sm_bot_ct_overpass_teamwork", "1", "Overpass: cover-based reinforcement and reachable named retake routes.", _, true, 0.0, true, 1.0);
     g_cvMirageCrossfire = CreateConVar("sm_bot_ct_mirage_crossfire", "1", "Mirage: opening partners cover each other and briefly support confirmed contact.", _, true, 0.0, true, 1.0);
     g_cvNukeRoutes = CreateConVar("sm_bot_ct_nuke_route_cover", "1", "Nuke: one bounded route correction and lower-site anchor backfill.", _, true, 0.0, true, 1.0);
+    g_cvOverpassAOpening = CreateConVar("sm_bot_ct_overpass_a_crossfire", "1", "Overpass standard A opening: paired Lower Park/Restroom holds.", _, true, 0.0, true, 1.0);
     g_cvProfiledRelief = CreateConVar("sm_bot_ct_profiled_relief", "1", "TEN Legacy maps: route-checked cover reinforcement for standard defenses.", _, true, 0.0, true, 1.0);
     g_cvProfiledRetake = CreateConVar("sm_bot_ct_profiled_retake", "1", "TEN Legacy maps: bounded map-specific staging entrances, with generic fallback.", _, true, 0.0, true, 1.0);
 
@@ -348,6 +351,7 @@ public void OnClientPutInServer(int client)
     g_innerOrder[client] = false;
     g_combatReleased[client] = false;
     g_guardSlot[client] = -1;
+    g_overpassOpeningOrder[client] = false;
     g_guardStalls[client] = 0;
     g_lastCombatAt[client] = -100.0;
     g_guardReleasedAt[client] = -100.0;
@@ -565,6 +569,9 @@ float GetCTHoldRadius(int client)
 {
     if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && g_cvInnerHolds.BoolValue
         && g_hasOrder[client] && g_innerOrder[client] && !g_combatReleased[client])
+        return 24.0;
+    if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && g_hasOrder[client]
+        && g_overpassOpeningOrder[client] && !g_combatReleased[client])
         return 24.0;
     if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && InfernoWatchEnabled()
         && g_hasOrder[client] && g_hasLook[client] && g_infernoPreciseOrder[client] && !g_combatReleased[client])
@@ -1058,6 +1065,8 @@ void BeginPairedPressure()
     float goals[2][3], pressureLook[2][3];
     for (int slot = 0; slot < 2; slot++)
     {
+    if (g_plan == Plan_Standard && g_mapProfile == 5 && count >= 4 && g_cvOverpassAOpening.BoolValue)
+        OverpassPairOpening();
         int client = pair[slot];
         float direction[3], desired[3];
         MakeVectorFromPoints(g_orderGoal[client], g_orderLook[client], direction);
@@ -1420,6 +1429,104 @@ void BuildPushTargets(int count)
 
     int rotators = remaining - otherCount;
     if (rotators > 0)
+// Two measured legacy Overpass A footprints: the inner anchor takes the
+// park swing; the second player holds the restroom exit with a shared line
+// into the park swing. These are only a proposal until BOTH fit the loaded
+// map and are reachable; a map revision or occupied slot leaves both intact.
+void OverpassPairOpening()
+{
+    if (!g_cvInnerHolds.BoolValue || !g_cvEntranceWatch.BoolValue
+        || !NativeAvailable("NavMesh_BuildPath") || !NativeAvailable("NavMeshArea_GetCostSoFar")) return;
+
+    float center[3], other[3];
+    TacticalMap_PlantGround(5, 0, center);
+    TacticalMap_PlantGround(5, 1, other);
+    int pair[2], eligible;
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!g_hasOrder[client] || !g_hasLook[client] || !IsCTBot(client)) continue;
+        float dist = GetVectorDistance(center, g_orderGoal[client]);
+        if (dist > 820.0 || dist >= GetVectorDistance(other, g_orderGoal[client])
+            || FloatAbs(g_orderGoal[client][2] - center[2]) > 115.0) continue;
+        pair[g_innerOrder[client] ? 0 : 1] = client;
+        eligible++;
+    }
+    if (eligible != 2 || !pair[0] || !pair[1]) return;
+
+    static const float positions[2][3] = {{-2212.5,700.0,474.2},{-2387.5,750.0,474.2}};
+    static const float park[3][3] = {{-2505.0,260.0,517.0},{-2450.0,92.0,490.0},{-2487.0,269.0,522.0}};
+    static const float restroom[5][3] = {{-2462.5,-187.5,496.0},{-2550.0,-175.0,496.0},
+        {-2487.5,-175.0,496.0},{-2562.5,-112.5,496.0},{-2675.0,-150.0,495.4}};
+    float goals[2][3], eyes[2][3], aim[2][3];
+    for (int slot = 0; slot < 2; slot++)
+    {
+        int client = pair[slot];
+        if (!ObjectiveCover_Floor(positions[slot], goals[slot])
+            || GetVectorDistance(goals[slot], positions[slot]) > 12.0
+            || GetVectorDistance(goals[slot], g_orderGoal[client]) > 570.0) return;
+        for (int peer = 1; peer <= MaxClients; peer++)
+            if (peer != pair[0] && peer != pair[1] && g_hasOrder[peer]
+                && GetVectorDistance(g_orderGoal[peer], goals[slot]) < 140.0) return;
+
+        float spawn[3];
+        GetClientAbsOrigin(client, spawn);
+        int start = NavMesh_GetNearestArea(spawn, false, 160.0, false, true, TEAM_ANY);
+        int oldArea = NavMesh_GetNearestArea(g_orderGoal[client], false, 110.0, false, true, TEAM_ANY);
+        int dest = NavMesh_GetNearestArea(goals[slot], false, 48.0, false, true, TEAM_ANY);
+        int oldTravel = CTPathLength(start, oldArea, g_orderGoal[client], 6500);
+        int travel = CTPathLength(start, dest, goals[slot], 6500);
+        if (oldTravel < 0 || travel < 0 || travel > oldTravel + 500) return;
+        CopyVector(goals[slot], eyes[slot]);
+        eyes[slot][2] += 64.0;
+    }
+    if (GetVectorDistance(goals[0], goals[1]) < 175.0) return;
+
+    // Keep the designated in-site role safely inside the real bomb trigger.
+    ArrayList zones = new ArrayList();
+    int entity = -1;
+    while ((entity = FindEntityByClassname(entity, "func_bomb_target")) != -1)
+        zones.Push(entity);
+    bool inside = CTInner_Inset(goals[0], zones);
+    delete zones;
+    if (!inside) return;
+
+    // Lower Park gunfight samples sit on the same approach. Distinct distant
+    // entrances still use the standard cover audit (not a number of rays).
+    ArrayList lanes = ObjectiveWatch_Collect(5, 0, false, center);
+    bool cover = lanes.Length > 0 && ObjectiveCover_Exposure(lanes, goals[0]) <= 1
+        && ObjectiveCover_Exposure(lanes, goals[1]) <= 1;
+    delete lanes;
+    if (!cover) return;
+    int shared;
+    for (int point = 0; point < sizeof(park); point++)
+        if (ObjectiveCover_Shot(eyes[0], park[point]) && ObjectiveCover_Shot(eyes[1], park[point]))
+        {
+            if (!shared) CopyVector(park[point], aim[0]);
+            shared++;
+        }
+    if (shared < 2) return;
+
+    bool toilet;
+    for (int point = 0; point < sizeof(restroom); point++)
+        if (ObjectiveCover_Shot(eyes[1], restroom[point]))
+        {
+            CopyVector(restroom[point], aim[1]);
+            toilet = true;
+            break;
+        }
+    if (!toilet) return;
+    for (int slot = 0; slot < 2; slot++)
+    {
+        int client = pair[slot];
+        CopyVector(goals[slot], g_orderGoal[client]);
+        CopyVector(aim[slot], g_orderLook[client]);
+        StartOrderProgress(client);
+        g_innerOrder[client] = slot == 0;
+        g_overpassOpeningOrder[client] = true;
+    }
+    ExperienceSignal("opening_crossfire", "overpass_a_park_restroom", 0, pair[1]);
+}
+
     {
         float middle[3];
         for (int axis = 0; axis < 3; axis++)
@@ -3178,6 +3285,7 @@ void StartOrderProgress(int client)
     g_orderLastProgressAt[client] = GetGameTime();
     g_orderArrived[client] = false;
     CopyVector(position, g_orderLastProgressPosition[client]);
+        g_overpassOpeningOrder[client] = false;
 }
 
 void ReleaseStalledOrders()
@@ -3199,6 +3307,7 @@ void ReleaseStalledOrders()
                 StartOrderProgress(client);
                 g_innerOrder[client] = inner;
                 DebugLog("Nuke detour reached: %N resumes original hold.", client);
+    g_overpassOpeningOrder[client] = false;
             }
             else if (now - g_orderLastProgressAt[client] >= 6.0)
             {
