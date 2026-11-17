@@ -37,7 +37,11 @@ public void OnPluginStart()
         GetCommandLineParam("-ctrefineend", last, sizeof(last), "de_anubis");
         g_enabled.BoolValue = true;
         g_last.SetString(last);
-        g_seconds.FloatValue = 26.0;
+        char repeats[4], seconds[4];
+        GetCommandLineParam("-openingrounds", repeats, sizeof(repeats), "1");
+        GetCommandLineParam("-openingseconds", seconds, sizeof(seconds), "26");
+        g_rounds.IntValue = StringToInt(repeats);
+        g_seconds.IntValue = StringToInt(seconds);
     }
     HookEvent("round_freeze_end", FreezeEnd, EventHookMode_PostNoCopy);
     HookEvent("weapon_fire", TraceFire, EventHookMode_Post);
@@ -65,7 +69,8 @@ public Action Prepare(Handle timer)
     if (!Safe() || g_map < 0) return Plugin_Stop;
     ServerCommand("sv_cheats 1; bot_stop 0; bot_dont_shoot 1; bot_join_after_player 0; bot_quota_mode normal; bot_quota 0; bot_kick; mp_autoteambalance 0; mp_limitteams 0; mp_freezetime 2; mp_do_warmup_period 0; mp_ignore_round_win_conditions 1; sm_bot_t_tactics_enable 0; sm_bot_experience_record_enable 0");
     ServerExecute();
-    if (g_debug.BoolValue) FindConVar("sm_bot_ct_tactics_debug").BoolValue = true;
+    if (g_debug.BoolValue || FindCommandLineParam("-openingtrace"))
+        FindConVar("sm_bot_ct_tactics_debug").BoolValue = true;
     for (int client = 0; client < 5; client++) ServerCommand("bot_add_ct; bot_add_t");
     ServerExecute();
     Restart();
@@ -126,12 +131,25 @@ public Action TraceDamage(int victim, int &attacker, int &inflictor, float &dama
 
 public void TraceFire(Event event,const char[] name,bool noBroadcast)
 {
-    if (!g_debug.BoolValue || !g_enabled.BoolValue || g_armed || g_round < 1) return;
+    if ((!g_debug.BoolValue && !FindCommandLineParam("-openingtrace")) || !g_enabled.BoolValue || g_armed || g_round < 1) return;
     int client=GetClientOfUserId(event.GetInt("userid"));
     if (client <= 0 || GetClientTeam(client)!=CS_TEAM_CT) return;
     char weapon[32];event.GetString("weapon",weapon,sizeof(weapon));
-    PrintToServer("CT_SITE_FIRE bot=%N weapon=%s",client,weapon);
+    float eye[3], angles[3], point[3];
+    GetClientEyePosition(client,eye);
+    GetClientEyeAngles(client,angles);
+    Handle trace=TR_TraceRayFilterEx(eye,angles,MASK_SHOT,RayType_Infinite,IgnoreShooter,client);
+    int hit=TR_GetEntityIndex(trace);
+    TR_GetEndPosition(point,trace);
+    delete trace;
+    char classname[48]="none";
+    if(hit==0) strcopy(classname,sizeof(classname),"world");
+    else if(hit>0 && IsValidEntity(hit)) GetEntityClassname(hit,classname,sizeof(classname));
+    PrintToServer("CT_SITE_FIRE bot=%N weapon=%s hit=%s ent=%d eye=%.0f,%.0f,%.0f point=%.0f,%.0f,%.0f",
+        client,weapon,classname,hit,eye[0],eye[1],eye[2],point[0],point[1],point[2]);
 }
+
+public bool IgnoreShooter(int ent,int contents,any shooter) { return ent!=shooter; }
 
 int SiteFor(const float pos[3], bool horizontal)
 {
@@ -290,7 +308,14 @@ public Action Observe(Handle timer)
         GetClientAbsOrigin(client,pos);
         float dist = GetVectorDistance(pos,g_goal[row]);
         if (dist < g_nearest[row]) g_nearest[row] = dist;
-        if (!BotCTTactics_GetOrder(client,current,route) || GetVectorDistance(current,g_goal[row]) > 55.0) g_reassigned[row]++;
+        bool hasOrder = BotCTTactics_GetOrder(client,current,route);
+        if (!hasOrder || GetVectorDistance(current,g_goal[row]) > 55.0)
+        {
+            if (!g_reassigned[row] && FindCommandLineParam("-openingtrace"))
+                PrintToServer("CT_SITE_FIRST_CHANGE map=%s bot=%N t=%.1f order=%d at=%.0f,%.0f,%.0f target=%.0f,%.0f,%.0f",
+                    g_mapName, client, 0.5 * float(g_ticks + 1), hasOrder, pos[0],pos[1],pos[2],current[0],current[1],current[2]);
+            g_reassigned[row]++;
+        }
         if (dist <= g_radius[row] + 8.0)
         {
             g_atGoal[row]++;

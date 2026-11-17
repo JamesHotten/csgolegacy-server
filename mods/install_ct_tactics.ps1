@@ -1954,6 +1954,9 @@ if (-not $text.Contains('BEGIN CT_HOLD_READY_GUN')) {
     $text = Replace-Once $text 'float fCTReleaseRadius = fCTHoldRadius * 2.0;' 'float fCTReleaseRadius = fCTHoldRadius < 32.0 ? fCTHoldRadius : fCTHoldRadius * 2.0;' 'keep a precise inner guard inside its measured clearance'
 }
 
+. (Join-Path $PSScriptRoot "patch_ct_breakable_bridge.ps1")
+$text = Add-CTBreakableBridge -Source $text
+
 $candidateExperiencePlugin = Join-Path $buildDir "000_bot_tactical_experience.smx"
 
 try {

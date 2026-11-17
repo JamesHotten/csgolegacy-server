@@ -181,6 +181,7 @@ bool g_hasLook[MAXPLAYERS + 1];
 bool g_infernoPreciseOrder[MAXPLAYERS + 1];
 bool g_innerOrder[MAXPLAYERS + 1];
 bool g_overpassOpeningOrder[MAXPLAYERS + 1];
+float g_anubisBreakableUntil[MAXPLAYERS + 1];
 int g_plainFallTick[MAXPLAYERS + 1];
 float g_lastRouteFallAt[MAXPLAYERS + 1], g_lastRouteFallDistance[MAXPLAYERS + 1];
 bool g_combatReleased[MAXPLAYERS + 1];
@@ -213,6 +214,7 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errorMa
     CreateNative("BotCTTactics_ReportRouteDrive", Native_ReportRouteDrive);
     CreateNative("BotCTTactics_GetHoldRadius", Native_GetHoldRadius);
     CreateNative("BotCTTactics_ReportContact", Native_ReportContact);
+    CreateNative("BotCTTactics_ReportBreakable", Native_ReportBreakable);
 
     MarkNativeAsOptional("NavMesh_Exists");
     MarkNativeAsOptional("NavMesh_GetNearestArea");
@@ -278,9 +280,9 @@ public void OnPluginStart()
     g_cvNavigationStallTimeout = CreateConVar("sm_bot_ct_tactics_navigation_stall_timeout", "3.0", "Release a CT order to native AI after this many seconds without meaningful route progress.", _, true, 1.5, true, 8.0);
     g_cvMidReorganize = CreateConVar("sm_bot_ct_mid_reorganize_enable", "1", "Reinforce on two confirmed attackers; permit full rotation only against a strong confirmed execute.", _, true, 0.0, true, 1.0);
     g_cvOverpassTeamwork = CreateConVar("sm_bot_ct_overpass_teamwork", "1", "Overpass: cover-based reinforcement and reachable named retake routes.", _, true, 0.0, true, 1.0);
+    g_cvOverpassAOpening = CreateConVar("sm_bot_ct_overpass_a_crossfire", "1", "Overpass standard A opening: paired Lower Park/Restroom holds.", _, true, 0.0, true, 1.0);
     g_cvMirageCrossfire = CreateConVar("sm_bot_ct_mirage_crossfire", "1", "Mirage: opening partners cover each other and briefly support confirmed contact.", _, true, 0.0, true, 1.0);
     g_cvNukeRoutes = CreateConVar("sm_bot_ct_nuke_route_cover", "1", "Nuke: one bounded route correction and lower-site anchor backfill.", _, true, 0.0, true, 1.0);
-    g_cvOverpassAOpening = CreateConVar("sm_bot_ct_overpass_a_crossfire", "1", "Overpass standard A opening: paired Lower Park/Restroom holds.", _, true, 0.0, true, 1.0);
     g_cvProfiledRelief = CreateConVar("sm_bot_ct_profiled_relief", "1", "TEN Legacy maps: route-checked cover reinforcement for standard defenses.", _, true, 0.0, true, 1.0);
     g_cvProfiledRetake = CreateConVar("sm_bot_ct_profiled_retake", "1", "TEN Legacy maps: bounded map-specific staging entrances, with generic fallback.", _, true, 0.0, true, 1.0);
 
@@ -349,9 +351,10 @@ public void OnClientPutInServer(int client)
     g_plainFallTick[client] = 0;
     g_lastRouteFallAt[client] = 0.0;
     g_innerOrder[client] = false;
+    g_overpassOpeningOrder[client] = false;
+    g_anubisBreakableUntil[client] = 0.0;
     g_combatReleased[client] = false;
     g_guardSlot[client] = -1;
-    g_overpassOpeningOrder[client] = false;
     g_guardStalls[client] = 0;
     g_lastCombatAt[client] = -100.0;
     g_guardReleasedAt[client] = -100.0;
@@ -567,11 +570,11 @@ public any Native_GetHoldRadius(Handle plugin, int numParams)
 
 float GetCTHoldRadius(int client)
 {
-    if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && g_cvInnerHolds.BoolValue
-        && g_hasOrder[client] && g_innerOrder[client] && !g_combatReleased[client])
-        return 24.0;
     if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && g_hasOrder[client]
         && g_overpassOpeningOrder[client] && !g_combatReleased[client])
+        return 24.0;
+    if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && g_cvInnerHolds.BoolValue
+        && g_hasOrder[client] && g_innerOrder[client] && !g_combatReleased[client])
         return 24.0;
     if (client >= 1 && client <= MaxClients && g_phase == Phase_Initial && InfernoWatchEnabled()
         && g_hasOrder[client] && g_hasLook[client] && g_infernoPreciseOrder[client] && !g_combatReleased[client])
@@ -839,9 +842,35 @@ public void Event_Contact(Event event, const char[] name, bool dontBroadcast)
     if (IsUtilityWeaponFire(event))
         return; // Utility use must not release an otherwise valid CT position.
     int client = GetClientOfUserId(event.GetInt("userid"));
+    if (AnubisOpeningClearsBreakable(client)) return;
     if (g_phase == Phase_RetakeStage && IsCTBot(client))
         g_retakeContact = true;
     ReleaseOrder(client, "weapon contact");
+}
+
+bool AnubisOpeningClearsBreakable(int client)
+{
+    if (g_mapProfile != 9 || g_phase != Phase_Initial || g_plan != Plan_Standard || !IsCTBot(client)
+        || !g_hasOrder[client] || !NativeAvailable("BotStuff_HasVisibleEnemy") || BotStuff_HasVisibleEnemy(client))
+        return false;
+
+    float now = GetGameTime();
+    if (g_anubisBreakableUntil[client] <= now || now - g_lastCombatAt[client] < 2.0) return false;
+    DebugLog("Retained %N opening order during native breakable clearing.", client);
+    return true;
+}
+
+public any Native_ReportBreakable(Handle plugin, int numParams)
+{
+    int client = GetNativeCell(1);
+    // Capture the engine's intent, not the post-shot collision: the brush
+    // may already be gone or the firearm may hit the wall behind it.
+    if (g_mapProfile == 9 && g_roundLive && g_phase == Phase_Initial && g_plan == Plan_Standard
+        && IsCTBot(client) && g_hasOrder[client])
+        // A short burst can outlast the look request when the brush breaks
+        // on its first shot. Real sight/damage still releases immediately.
+        g_anubisBreakableUntil[client] = GetGameTime() + 2.0;
+    return 0;
 }
 
 bool IsUtilityWeaponFire(Event event)
@@ -1036,6 +1065,8 @@ void PlanInitialDefense()
     if (infernoProfile) ApplyInfernoOpeningAims(count, infernoAims);
     g_phase = Phase_Initial;
     if (g_plan == Plan_Standard && g_mapProfile >= 0) RefineStandardHolds();
+    if (g_plan == Plan_Standard && g_mapProfile == 5 && count >= 4 && g_cvOverpassAOpening.BoolValue)
+        OverpassPairOpening();
     if (g_plan == Plan_Standard && MirageCrossfireEnabled()) MirageBuildCrossfire();
     g_pressureReturnAt = 0.0;
     if (g_mapProfile == 2 && g_plan == Plan_Standard && count >= 4
@@ -1065,8 +1096,6 @@ void BeginPairedPressure()
     float goals[2][3], pressureLook[2][3];
     for (int slot = 0; slot < 2; slot++)
     {
-    if (g_plan == Plan_Standard && g_mapProfile == 5 && count >= 4 && g_cvOverpassAOpening.BoolValue)
-        OverpassPairOpening();
         int client = pair[slot];
         float direction[3], desired[3];
         MakeVectorFromPoints(g_orderGoal[client], g_orderLook[client], direction);
@@ -1400,35 +1429,6 @@ void CTInner_Assign(int site, const float objective[3], const float other[3], co
     DebugLog("Reserved inset %s hold for %N at %.0f %.0f %.0f.",site == 0 ? "A" : "B",owner,bestGoal[0],bestGoal[1],bestGoal[2]);
 }
 
-void BuildPushTargets(int count)
-{
-    bool pushA = GetRandomInt(0, 1) == 0;
-    g_planSite = pushA ? 0 : 1;
-    float pushSite[3], otherSite[3];
-    if (pushA)
-    {
-        CopyVector(g_siteA, pushSite);
-        CopyVector(g_siteB, otherSite);
-    }
-    else
-    {
-        CopyVector(g_siteB, pushSite);
-        CopyVector(g_siteA, otherSite);
-    }
-
-    int pushCount = count >= 5 ? 2 : 1;
-
-    float dirX = g_tSpawn[0] - pushSite[0];
-    float dirY = g_tSpawn[1] - pushSite[1];
-    Normalize2D(dirX, dirY);
-    BuildAround(pushSite, pushCount, 450.0, 950.0, true, dirX, dirY);
-
-    int remaining = count - pushCount;
-    int otherCount = remaining >= 2 ? 2 : remaining;
-    BuildDefensiveSiteTargets(pushA ? 1 : 0, otherCount, false);
-
-    int rotators = remaining - otherCount;
-    if (rotators > 0)
 // Two measured legacy Overpass A footprints: the inner anchor takes the
 // park swing; the second player holds the restroom exit with a shared line
 // into the park swing. These are only a proposal until BOTH fit the loaded
@@ -1527,6 +1527,35 @@ void OverpassPairOpening()
     ExperienceSignal("opening_crossfire", "overpass_a_park_restroom", 0, pair[1]);
 }
 
+void BuildPushTargets(int count)
+{
+    bool pushA = GetRandomInt(0, 1) == 0;
+    g_planSite = pushA ? 0 : 1;
+    float pushSite[3], otherSite[3];
+    if (pushA)
+    {
+        CopyVector(g_siteA, pushSite);
+        CopyVector(g_siteB, otherSite);
+    }
+    else
+    {
+        CopyVector(g_siteB, pushSite);
+        CopyVector(g_siteA, otherSite);
+    }
+
+    int pushCount = count >= 5 ? 2 : 1;
+
+    float dirX = g_tSpawn[0] - pushSite[0];
+    float dirY = g_tSpawn[1] - pushSite[1];
+    Normalize2D(dirX, dirY);
+    BuildAround(pushSite, pushCount, 450.0, 950.0, true, dirX, dirY);
+
+    int remaining = count - pushCount;
+    int otherCount = remaining >= 2 ? 2 : remaining;
+    BuildDefensiveSiteTargets(pushA ? 1 : 0, otherCount, false);
+
+    int rotators = remaining - otherCount;
+    if (rotators > 0)
     {
         float middle[3];
         for (int axis = 0; axis < 3; axis++)
@@ -3256,6 +3285,8 @@ void ClearOrders()
         g_hasLook[client] = false;
         g_infernoPreciseOrder[client] = false;
         g_innerOrder[client] = false;
+        g_overpassOpeningOrder[client] = false;
+        g_anubisBreakableUntil[client] = 0.0;
         g_lastRouteFallAt[client] = 0.0;
         g_orderExpires[client] = 0.0;
         g_orderLastProgressDistance[client] = 0.0;
@@ -3276,6 +3307,8 @@ void StartOrderProgress(int client)
 {
     g_infernoPreciseOrder[client] = false;
     g_innerOrder[client] = false;
+    g_overpassOpeningOrder[client] = false;
+    g_anubisBreakableUntil[client] = 0.0;
     g_lastRouteFallAt[client] = 0.0;
     g_nukeDetouring[client] = false;
     g_mirageTradeUntil[client] = 0.0;
@@ -3285,7 +3318,6 @@ void StartOrderProgress(int client)
     g_orderLastProgressAt[client] = GetGameTime();
     g_orderArrived[client] = false;
     CopyVector(position, g_orderLastProgressPosition[client]);
-        g_overpassOpeningOrder[client] = false;
 }
 
 void ReleaseStalledOrders()
@@ -3307,7 +3339,6 @@ void ReleaseStalledOrders()
                 StartOrderProgress(client);
                 g_innerOrder[client] = inner;
                 DebugLog("Nuke detour reached: %N resumes original hold.", client);
-    g_overpassOpeningOrder[client] = false;
             }
             else if (now - g_orderLastProgressAt[client] >= 6.0)
             {
