@@ -5,6 +5,7 @@
 `BetterBots T Tactical Director` 使用相同的可选桥接，但拥有独立状态、配置和开关；两方不会共享战术命令。
 
 Overpass 补防与命名回防入口、Mirage 开局补枪和 Nuke 卡路/B 区补位见 [三图 CT 专项](CT_MAP_REFINEMENT.md)。
+后续扩展至十图的补防与回防规则见 [十图 CT 补防和回防入口](CT_TEN_MAP_TEAMWORK.md)。
 
 ## 战术行为
 

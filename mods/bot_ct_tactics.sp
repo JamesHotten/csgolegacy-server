@@ -8,7 +8,7 @@
 #pragma semicolon 1
 #pragma newdecls required
 
-#define PLUGIN_VERSION "0.1.14"
+#define PLUGIN_VERSION "0.1.15"
 #define MAX_CANDIDATES 256
 #define ANCHORS_PER_SITE 2
 #define TEAM_ANY -2
@@ -135,6 +135,9 @@ ConVar g_cvRadioReport;
 ConVar g_cvNavigationStallTimeout;
 ConVar g_cvMidReorganize;
 ConVar g_cvOverpassTeamwork, g_cvMirageCrossfire, g_cvNukeRoutes;
+ConVar g_cvProfiledRelief, g_cvProfiledRetake;
+int g_contactEnemy[MAXPLAYERS + 1];
+float g_contactSeenAt[MAXPLAYERS + 1];
 int g_miragePartner[MAXPLAYERS + 1];
 float g_mirageTradeUntil[MAXPLAYERS + 1], g_mirageTradeAim[MAXPLAYERS + 1][3];
 bool g_nukeDetourUsed[MAXPLAYERS + 1];
@@ -275,6 +278,8 @@ public void OnPluginStart()
     g_cvOverpassTeamwork = CreateConVar("sm_bot_ct_overpass_teamwork", "1", "Overpass: cover-based reinforcement and reachable named retake routes.", _, true, 0.0, true, 1.0);
     g_cvMirageCrossfire = CreateConVar("sm_bot_ct_mirage_crossfire", "1", "Mirage: opening partners cover each other and briefly support confirmed contact.", _, true, 0.0, true, 1.0);
     g_cvNukeRoutes = CreateConVar("sm_bot_ct_nuke_route_cover", "1", "Nuke: one bounded route correction and lower-site anchor backfill.", _, true, 0.0, true, 1.0);
+    g_cvProfiledRelief = CreateConVar("sm_bot_ct_profiled_relief", "1", "TEN Legacy maps: route-checked cover reinforcement for standard defenses.", _, true, 0.0, true, 1.0);
+    g_cvProfiledRetake = CreateConVar("sm_bot_ct_profiled_retake", "1", "TEN Legacy maps: bounded map-specific staging entrances, with generic fallback.", _, true, 0.0, true, 1.0);
 
     g_cvEnabled.AddChangeHook(OnEnabledChanged);
     AutoExecConfig(true, "bot_ct_tactics");
@@ -356,6 +361,8 @@ public void OnClientPutInServer(int client)
     g_mirageTradeUntil[client] = 0.0;
     g_nukeDetouring[client] = false;
     g_nukeDetourUsed[client] = false;
+    g_contactEnemy[client] = 0;
+    g_contactSeenAt[client] = 0.0;
 }
 
 public void OnEnabledChanged(ConVar convar, const char[] oldValue, const char[] newValue)
@@ -576,12 +583,14 @@ public any Native_ReportContact(Handle plugin, int numParams)
 
     float enemyPosition[3];
     GetClientAbsOrigin(enemy, enemyPosition);
-    int site = NearestSite(enemyPosition);
+    int site = ProfiledReliefEnabled() && g_phase == Phase_Initial ? ProfiledReliefSite(enemyPosition) : NearestSite(enemyPosition);
     ExperienceSignal("first_sight", "visible_enemy", site, spotter);
     float now = GetGameTime();
     // Refresh even when site radio is on cooldown or this bot already yielded
     // its order. Otherwise it can be pulled back into formation mid-fight.
     g_lastCombatAt[spotter] = now;
+    g_contactEnemy[spotter] = GetClientUserId(enemy);
+    g_contactSeenAt[spotter] = now;
     if ((g_phase == Phase_Initial || g_phase == Phase_CarrierResponse) && IsBombCarrier(enemy))
     {
         // The spotter keeps fighting. Every other available CT abandons the
@@ -593,6 +602,7 @@ public any Native_ReportContact(Handle plugin, int numParams)
     float siteDistance = Distance2D(enemyPosition, site == 0 ? g_siteA : g_siteB);
     float otherDistance = Distance2D(enemyPosition, site == 0 ? g_siteB : g_siteA);
     bool credibleSite = siteDistance <= 900.0 && otherDistance >= siteDistance + 300.0;
+    if (ProfiledReliefEnabled() && g_phase == Phase_Initial) credibleSite = ProfiledReliefCredible(enemyPosition, site);
     bool localTrade;
     if (credibleSite && g_phase == Phase_Initial)
     {
@@ -608,7 +618,11 @@ public any Native_ReportContact(Handle plugin, int numParams)
     ReportEnemy(spotter, enemyPosition, site);
     if (g_cvReinforceOnContact.BoolValue && credibleSite && !localTrade && !g_reorganizedSite[site]
         && g_phase != Phase_CarrierResponse)
-        RequestReinforcement(enemyPosition, site, spotter, "enemy contact");
+    {
+        if (ProfiledReliefEnabled() && g_phase == Phase_Initial && ProfiledContactHasCover(spotter, enemy, enemyPosition))
+            ExperienceSignal("reinforce_skip", "already_supported", site, spotter);
+        else RequestReinforcement(enemyPosition, site, spotter, "enemy contact");
+    }
     return true;
 }
 
@@ -701,7 +715,7 @@ void TryReorganizeDefense(int site, const float contactPosition[3], int spotter,
     int reinforcement = RequestReinforcement(contactPosition, site, spotter, "confirmed multi-enemy site pressure", g_lastReinforcement[site]);
     // A report with no eligible Overpass helper must not use up the site's
     // reorganization. Leave subsequent contact/casualty reports actionable.
-    if (OverpassTeamworkEnabled() && reinforcement == 0) return;
+    if ((OverpassTeamworkEnabled() || ProfiledReliefEnabled()) && reinforcement == 0) return;
     g_reorganizedSite[site] = true;
     ExperienceSignal("reorganize", "multi_enemy_pressure", site, 0);
     DebugLog("Mid-round CT defense reorganized toward %s; opposite-site anchor retained.", site == 0 ? "A" : "B");
@@ -916,8 +930,10 @@ public void Event_PlayerDeath(Event event, const char[] name, bool dontBroadcast
         {
             float deathPosition[3];
             GetClientAbsOrigin(client, deathPosition);
-            int deathSite = NearestSite(deathPosition);
-            if (!g_fullRotateSite[deathSite] && g_phase != Phase_CarrierResponse)
+            bool profiled = ProfiledReliefEnabled() && g_phase == Phase_Initial;
+            int deathSite = profiled ? ProfiledReliefSite(deathPosition) : NearestSite(deathPosition);
+            if (!g_fullRotateSite[deathSite] && g_phase != Phase_CarrierResponse
+                && (!profiled || ProfiledReliefCredible(deathPosition, deathSite)))
                 RequestReinforcement(deathPosition, deathSite, client, "CT casualty");
         }
         g_hasOrder[client] = false;
@@ -1842,12 +1858,16 @@ void PlanRetake(bool commit)
         BuildAround(g_bombPosition, count, 40.0, 260.0, false, 0.0, 0.0);
     else
     {
-        if (RetakeRolesEnabled()) AppendRetakeEntrances(count, bots);
-        if (OverpassTeamworkEnabled()) namedLanes = g_targetCount;
-        BuildAround(g_bombPosition, count - g_targetCount, 350.0, 900.0, false, 0.0, 0.0);
+        if (RetakeRolesEnabled() || ProfiledRetakeEnabled()) AppendRetakeEntrances(count, bots);
+        if (OverpassTeamworkEnabled() || ProfiledRetakeEnabled()) namedLanes = g_targetCount;
+        // Greedy matching may use the only bot able to reach a later lane.
+        // Keep fallback goals for every survivor, not just unreserved slots.
+        int fallback = ProfiledRetakeEnabled() ? count : count - g_targetCount;
+        BuildAround(g_bombPosition, fallback, 350.0, 900.0, false, 0.0, 0.0);
     }
 
-    FillMissingTargetsAt(count, g_bombPosition);
+    int needed = count + (!commit && ProfiledRetakeEnabled() ? namedLanes : 0);
+    FillMissingTargetsAt(needed <= sizeof(g_targets) ? needed : sizeof(g_targets), g_bombPosition);
     AssignTargets(bots, count, (commit || namedLanes > 0) ? Route_Fastest : Route_Safest, -1, false, namedLanes);
     g_phase = commit ? Phase_RetakeCommit : Phase_RetakeStage;
     g_phaseStarted = GetGameTime();
@@ -1920,6 +1940,14 @@ bool RetakeRolesEnabled()
 {
     // Inferno, Mirage and Nuke in the shared profile order.
     return g_cvRetakeRoles.BoolValue && (g_mapProfile == 0 || g_mapProfile == 2 || g_mapProfile == 3 || OverpassTeamworkEnabled())
+        && NativeAvailable("NavMesh_BuildPath") && NativeAvailable("NavMeshArea_GetCostSoFar")
+        && NativeAvailable("NavMeshArea_GetPlaceCanonical");
+}
+
+bool ProfiledRetakeEnabled()
+{
+    return g_mapProfile >= 0 && g_cvRetakeRoles.BoolValue && g_cvProfiledRetake.BoolValue
+        && (g_mapProfile != 5 || OverpassTeamworkEnabled())
         && NativeAvailable("NavMesh_BuildPath") && NativeAvailable("NavMeshArea_GetCostSoFar")
         && NativeAvailable("NavMeshArea_GetPlaceCanonical");
 }
@@ -2218,10 +2246,18 @@ void AppendRetakeEntrances(int count, const int bots[MAXPLAYERS + 1])
     int bombArea = NavMesh_GetNearestArea(g_bombPosition, false, 180.0, false, true, TEAM_ANY);
     if (bombArea < 0) return;
     char lanes[3][32];
-    bool overpass = OverpassTeamworkEnabled();
-    if (overpass)
+    bool bounded = OverpassTeamworkEnabled() || ProfiledRetakeEnabled();
+    if (bounded)
     {
-        for (int lane = 0; lane < 3; lane++) TacticalMap_GetWatchPlace(g_mapProfile, site, lane, true, lanes[lane], sizeof(lanes[]));
+        if (g_mapProfile == 7)
+        {
+            // Cache's embedded NAV exposes closer CT-side entries than the
+            // T post-plant watch list. Do not retune that independent list.
+            strcopy(lanes[0], sizeof(lanes[]), site == 0 ? "Truck" : "Rafters");
+            strcopy(lanes[1], sizeof(lanes[]), site == 0 ? "ARamp" : "Back");
+            strcopy(lanes[2], sizeof(lanes[]), site == 0 ? "Catwalk" : "CTSpawn");
+        }
+        else for (int lane = 0; lane < 3; lane++) TacticalMap_GetWatchPlace(g_mapProfile, site, lane, true, lanes[lane], sizeof(lanes[]));
     }
     else if (g_mapProfile == 2)
     {
@@ -2255,7 +2291,7 @@ void AppendRetakeEntrances(int count, const int bots[MAXPLAYERS + 1])
     StringMap seen = new StringMap();
     float goals[3][3], scores[3] = {999999.0, 999999.0, 999999.0};
     int starts[MAXPLAYERS + 1], direct[MAXPLAYERS + 1];
-    if (overpass)
+    if (bounded)
         for (int b = 0; b < count; b++)
         {
             float from[3];
@@ -2278,10 +2314,10 @@ void AppendRetakeEntrances(int count, const int bots[MAXPLAYERS + 1])
         for (int lane = 0; lane < 3; lane++)
         {
             float score = FloatAbs(distance - 510.0);
-            if ((!overpass && score >= scores[lane]) || !StrEqual(place, lanes[lane], false)) continue;
+            if (score >= scores[lane] || !StrEqual(place, lanes[lane], false)) continue;
             int closest;
             if (!NavMesh_BuildPath(area, bombArea, g_bombPosition, RetakeTravelCost, 2200, closest, 0.0, 0.0)) continue;
-            if (overpass)
+            if (bounded)
             {
                 float foot[3];
                 if (!ObjectiveCover_Floor(point, foot)) continue;
@@ -2593,6 +2629,13 @@ void AssignTargets(const int bots[MAXPLAYERS + 1], int botCount, RouteType route
             g_orderRoute[client] = view_as<int>(route);
             g_orderExpires[client] = 0.0;
             StartOrderProgress(client);
+            if (target < namedRetake)
+            {
+                char lane[32];
+                NavMeshArea_GetPlaceCanonical(goalArea, lane, sizeof(lane));
+                DebugLog("CT profiled retake assigned site=%d lane=%s bot=%N", RetakeSite(), lane, client);
+                ExperienceSignal("retake_lane_assigned", lane, RetakeSite(), client);
+            }
             DebugLog("Assigned %N to %.0f %.0f %.0f", client, g_orderGoal[client][0], g_orderGoal[client][1], g_orderGoal[client][2]);
         }
     }
@@ -2853,12 +2896,62 @@ void ReportEnemy(int spotter, const float enemyPosition[3], int site)
     DebugLog("%N reported enemy contact near %s.", spotter, location);
 }
 
-int OverpassReinforce(const float contact[3], int site, int excluded, const char[] reason,
+bool ProfiledReliefEnabled()
+{
+    return g_mapProfile >= 0 && g_plan == Plan_Standard && g_cvProfiledRelief.BoolValue
+        && (g_mapProfile != 5 || OverpassTeamworkEnabled())
+        && NativeAvailable("NavMesh_BuildPath") && NativeAvailable("NavMeshArea_GetCostSoFar")
+        && NativeAvailable("NavMeshArea_GetPlaceCanonical");
+}
+
+int ProfiledReliefSite(const float position[3])
+{
+    float a[3], b[3];
+    TacticalMap_PlantGround(g_mapProfile, 0, a);
+    TacticalMap_PlantGround(g_mapProfile, 1, b);
+    return GetVectorDistance(position, a) <= GetVectorDistance(position, b) ? 0 : 1;
+}
+
+bool ProfiledReliefCredible(const float position[3], int site)
+{
+    float anchor[3], other[3];
+    TacticalMap_PlantGround(g_mapProfile, site, anchor);
+    TacticalMap_PlantGround(g_mapProfile, 1 - site, other);
+    float near = GetVectorDistance(position, anchor);
+    return near <= 940.0 && FloatAbs(position[2] - anchor[2]) < 230.0
+        && GetVectorDistance(position, other) >= near + 220.0;
+}
+
+bool ProfiledContactHasCover(int spotter, int enemy, const float enemyPosition[3])
+{
+    if (!NativeAvailable("BotStuff_HasVisibleEnemy")) return false;
+    float from[3], shot[3];
+    GetClientAbsOrigin(spotter, from);
+    CopyVector(enemyPosition, shot);
+    shot[2] += 54.0;
+    float now = GetGameTime();
+    int reportedEnemy = GetClientUserId(enemy);
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        // Seeing some enemy is not enough to withhold support. The nearby
+        // teammate must also have independently reported this same player.
+        if (client == spotter || g_contactEnemy[client] != reportedEnemy || now - g_contactSeenAt[client] > 1.5
+            || !IsCTBot(client) || g_blindUntil[client] > now || !BotStuff_HasVisibleEnemy(client)) continue;
+        float eye[3], foot[3];
+        GetClientAbsOrigin(client, foot);
+        if (GetVectorDistance(from, foot) > 480.0 || FloatAbs(foot[2] - from[2]) > 110.0) continue;
+        GetClientEyePosition(client, eye);
+        if (GetVectorDistance(eye, shot) <= 1150.0 && ObjectiveCover_Shot(eye, shot)) return true;
+    }
+    return false;
+}
+
+int ProfiledReinforce(const float contact[3], int site, int excluded, const char[] reason,
     int additionalExcluded, bool allowEmptyOther, bool onlyOther)
 {
     float anchor[3], weak[3], shot[3];
-    TacticalMap_PlantGround(5, site, anchor);
-    TacticalMap_PlantGround(5, 1 - site, weak);
+    TacticalMap_PlantGround(g_mapProfile, site, anchor);
+    TacticalMap_PlantGround(g_mapProfile, 1 - site, weak);
     CopyVector(contact, shot);
     shot[2] += 50.0;
     int base = NavMesh_GetNearestArea(anchor, false, 150.0, false, true, TEAM_ANY);
@@ -2886,7 +2979,7 @@ int OverpassReinforce(const float contact[3], int site, int excluded, const char
     }
     if (!donorCount) return 0;
 
-    ArrayList lanes = ObjectiveWatch_Collect(5, site, false, anchor);
+    ArrayList lanes = ObjectiveWatch_Collect(g_mapProfile, site, false, anchor);
     ArrayStack areas = new ArrayStack();
     NavMesh_CollectSurroundingAreas(areas, base, 720.0, 24.0, 48.0);
     int selected, visited, tested;
@@ -2934,7 +3027,7 @@ int OverpassReinforce(const float contact[3], int site, int excluded, const char
     g_lastReinforcement[site] = selected;
     StartOrderProgress(selected);
     ExperienceSignal("reinforce", reason, site, selected);
-    DebugLog("Overpass covered relief site=%d bot=%N goal=%.0f %.0f %.0f", site, selected, bestGoal[0], bestGoal[1], bestGoal[2]);
+    DebugLog("CT profiled relief site=%d bot=%N goal=%.0f %.0f %.0f", site, selected, bestGoal[0], bestGoal[1], bestGoal[2]);
     return selected;
 }
 
@@ -2944,8 +3037,8 @@ int RequestReinforcement(const float contactPosition[3], int site, int excludedC
     // Once loose C4 is confirmed, site reports/casualties must not overwrite
     // its cached guard goals. Individual combat still releases immediately.
     if (g_phase == Phase_GuardLooseBomb) return 0;
-    if (OverpassTeamworkEnabled() && g_phase == Phase_Initial)
-        return OverpassReinforce(contactPosition, site, excludedClient, reason, additionalExcluded, allowEmptyOtherSite, onlyOtherSite);
+    if ((OverpassTeamworkEnabled() || ProfiledReliefEnabled()) && g_phase == Phase_Initial)
+        return ProfiledReinforce(contactPosition, site, excludedClient, reason, additionalExcluded, allowEmptyOtherSite, onlyOtherSite);
     float sitePosition[3], otherSite[3];
     if (site == 0)
     {
@@ -3233,6 +3326,8 @@ void ClearCombatReleases()
         g_combatReleased[client] = false;
         g_lastCombatAt[client] = -100.0;
         g_blindUntil[client] = 0.0;
+        g_contactEnemy[client] = 0;
+        g_contactSeenAt[client] = 0.0;
     }
 }
 
