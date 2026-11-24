@@ -1919,6 +1919,9 @@ if (-not $text.Contains('BEGIN TACTICAL_PLANT_DRIVE_FIX')) {
     $text = Replace-Once $text $old $block 'watch a carrier traveling outside the plant zone, not a BOT executing a plant'
 }
 
+$legacySafeKnifeGate = 'if (!bCTGuardWithGun && g_bIsProBot[iClient] && !g_bDontSwitch[iClient] && !BotIsHiding(iClient))'
+$contactSafeKnifeGate = 'if (!bCTGuardWithGun && !bEnemyVisible && g_bIsProBot[iClient] && !g_bDontSwitch[iClient] && !BotIsHiding(iClient))'
+$threatSafeKnifeGate = 'if (!bCTGuardWithGun && !bEnemyVisible && GetEntData(iClient, g_iBotNearbyEnemiesOffset) == 0 && g_bIsProBot[iClient] && !g_bDontSwitch[iClient] && !BotIsHiding(iClient))'
 if (-not $text.Contains('BEGIN CT_HOLD_READY_GUN')) {
     $safeTravelPattern = '(?s)if \(IsSafe\(iClient\)\)\s*\{\s*iButtons &= ~IN_SPEED;\s*if\s*\(g_bIsProBot\[iClient\] && !g_bDontSwitch\[iClient\] && !BotIsHiding\(iClient\)\)\s*SwitchWeapon\(iClient, GetPlayerWeaponSlot\(iClient, CS_SLOT_KNIFE\)\);\s*\}'
     $holdReady = @(
@@ -1945,13 +1948,63 @@ if (-not $text.Contains('BEGIN CT_HOLD_READY_GUN')) {
         '    if (IsSafe(iClient))',
         '    {',
         '        iButtons &= ~IN_SPEED;',
-        '        if (!bCTGuardWithGun && g_bIsProBot[iClient] && !g_bDontSwitch[iClient] && !BotIsHiding(iClient))',
+        "        $threatSafeKnifeGate",
         '            SwitchWeapon(iClient, GetPlayerWeaponSlot(iClient, CS_SLOT_KNIFE));',
         '    }',
         '    // END CT_HOLD_READY_GUN'
     ) -join $newline
     $text = Replace-RegexOnce $text $safeTravelPattern $holdReady 'keep the gun out on a settled quiet CT hold'
     $text = Replace-Once $text 'float fCTReleaseRadius = fCTHoldRadius * 2.0;' 'float fCTReleaseRadius = fCTHoldRadius < 32.0 ? fCTHoldRadius : fCTHoldRadius * 2.0;' 'keep a precise inner guard inside its measured clearance'
+}
+elseif (-not $text.Contains($threatSafeKnifeGate) -and -not $text.Contains('BEGIN BOT_GUN_READY_THREAT_POLICY')) {
+    # A threat can release the quiet hold before there is direct sight. Do
+    # not let the independent safe-travel timer put the gun away in that gap.
+    $oldGate = if ($text.Contains($contactSafeKnifeGate)) { $contactSafeKnifeGate } else { $legacySafeKnifeGate }
+    $text = Replace-Once $text $oldGate $threatSafeKnifeGate 'keep the gun out when a threat is detected during safe travel'
+}
+
+if (-not $text.Contains('BEGIN BOT_GUN_READY_APPROACH')) {
+    $old = 'bool bCTGuardWithGun = bHoldInitialCTPosition && g_iAliveCountT > 0 && !bEnemyVisible'
+    $readyApproach = @(
+        '// BEGIN BOT_GUN_READY_APPROACH',
+        '    // Start the normal draw before entering an assigned contact position.',
+        '    int iGunReadySide = GetClientTeam(iClient);',
+        '    bool bApproachingGunPosition = bHasTacticalOrder && !g_bBombPlanted',
+        '        && ((iGunReadySide == CS_TEAM_CT && bHasTacticalAim) || (iGunReadySide == CS_TEAM_T && bShouldHoldTAttackStage))',
+        '        && GetTask(iClient) != PLANT_BOMB && GetVectorDistance(g_fBotOrigin[iClient], fTacticalGoal) <= 512.0;',
+        '    // END BOT_GUN_READY_APPROACH',
+        '    bool bCTGuardWithGun = (bHoldInitialCTPosition || bApproachingGunPosition)',
+        '        && (iGunReadySide == CS_TEAM_CT ? g_iAliveCountT > 0 : g_iAliveCountCT > 0) && !bEnemyVisible'
+    ) -join $newline
+    $text = Replace-Once $text $old $readyApproach 'draw a loaded gun before entering an assigned opening position'
+}
+
+if (-not $text.Contains('BEGIN BOT_GUN_READY_THREAT_POLICY')) {
+    $watchGunPolicy = @(
+        'bool bCTGuardWithGun = (bHoldInitialCTPosition || bApproachingGunPosition)',
+        '        && (iGunReadySide == CS_TEAM_CT ? g_iAliveCountT > 0 : g_iAliveCountCT > 0) && !bEnemyVisible',
+        '        && GetEntData(iClient, g_iEnemyVisibleOffset) == 0 && GetEntData(iClient, g_iBotNearbyEnemiesOffset) == 0',
+        '        && !g_bThrowGrenade[iClient] && g_iDoingSmokeNum[iClient] == -1 && !BotMimic_IsPlayerMimicing(iClient)',
+        '        && GetEntityMoveType(iClient) != MOVETYPE_LADDER && GetTask(iClient) != ESCAPE_FROM_FLAMES',
+        '        && GetTask(iClient) != ESCAPE_FROM_BOMB && GetTask(iClient) != DEFUSE_BOMB',
+        '        && eItems_GetWeaponSlotByDefIndex(iDefIndex) != CS_SLOT_GRENADE;'
+    ) -join $newline
+    $splitGunPolicy = @(
+        '// BEGIN BOT_GUN_READY_THREAT_POLICY',
+        '    bool bGunSwitchActionFree = !g_bThrowGrenade[iClient] && g_iDoingSmokeNum[iClient] == -1 && !BotMimic_IsPlayerMimicing(iClient)',
+        '        && GetEntityMoveType(iClient) != MOVETYPE_LADDER && GetTask(iClient) != ESCAPE_FROM_FLAMES',
+        '        && GetTask(iClient) != ESCAPE_FROM_BOMB && GetTask(iClient) != DEFUSE_BOMB && GetTask(iClient) != PLANT_BOMB',
+        '        && eItems_GetWeaponSlotByDefIndex(iDefIndex) != CS_SLOT_GRENADE',
+        '        && g_iActiveWeapon[iClient] != GetPlayerWeaponSlot(iClient, CS_SLOT_C4);',
+        '    // Nearby contact blocks drawing a knife, not drawing a gun on an assigned approach.',
+        '    bool bCTGuardWithGun = (bHoldInitialCTPosition || bApproachingGunPosition) && bGunSwitchActionFree',
+        '        && (iGunReadySide == CS_TEAM_CT ? g_iAliveCountT > 0 : g_iAliveCountCT > 0) && !bEnemyVisible',
+        '        && GetEntData(iClient, g_iEnemyVisibleOffset) == 0',
+        '        && (bApproachingGunPosition || GetEntData(iClient, g_iBotNearbyEnemiesOffset) == 0);',
+        '    // END BOT_GUN_READY_THREAT_POLICY'
+    ) -join $newline
+    $text = Replace-Once $text $watchGunPolicy $splitGunPolicy 'separate early gun draw from safe knife travel during nearby contact'
+    $text = Replace-Once $text $threatSafeKnifeGate ($threatSafeKnifeGate.Replace('if (!bCTGuardWithGun', 'if (bGunSwitchActionFree && !bCTGuardWithGun')) 'protect active utility and objective actions from the knife shortcut'
 }
 
 . (Join-Path $PSScriptRoot "patch_ct_breakable_bridge.ps1")
